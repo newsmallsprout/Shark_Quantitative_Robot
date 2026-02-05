@@ -36,23 +36,23 @@
 
 ```mermaid
 graph TD
-    User[用户/终端] --> Frontend[前端 Dashboard (React)]
-    Frontend --> API[Control API (FastAPI)]
+    User["用户/终端"] --> Frontend["前端 Dashboard (React)"]
+    Frontend --> API["Control API (FastAPI)"]
     
     subgraph Core_System [核心交易系统]
-        API --> StateMachine[状态机 (State Machine)]
+        API --> StateMachine["状态机 (State Machine)"]
         
         StateMachine --> StrategyManager[策略管理器]
         
         subgraph Strategies
-            CoreStrat[核心策略 (闭源+AI优化)]
-            UserStrat[用户自定义策略 (开放)]
+            CoreStrat["核心策略 (闭源+AI优化)"]
+            UserStrat["用户自定义策略 (开放)"]
         end
         
         StrategyManager --> CoreStrat
         StrategyManager --> UserStrat
         
-        StrategyManager --> Risk[风控引擎 (Risk Engine)]
+        StrategyManager --> Risk["风控引擎 (Risk Engine)"]
         Risk -- 熔断指令 --> Execution[执行层]
         
         License[License Manager] -- 授权校验 --> StateMachine
@@ -184,18 +184,18 @@ AI 模块会根据实盘数据和最新市场行情，对 **核心策略** 进�
 ```mermaid
 graph TD
     App[App Container] --> Sidebar[Sidebar Navigation]
-    App --> Header[Global Header <br/> (Status Badge / Wallet)]
+    App --> Header["Global Header\n(Status Badge / Wallet)"]
     App --> Main[Main Content Area]
     
     Main --> DashboardView
-    DashboardView --> StatusCard[StatusCard <br/> (Mode / PnL / DailyRisk)]
-    DashboardView --> RiskGauge[RiskGauge <br/> (D3.js / Recharts)]
+    DashboardView --> StatusCard["StatusCard\n(Mode / PnL / DailyRisk)"]
+    DashboardView --> RiskGauge["RiskGauge\n(D3.js / Recharts)"]
     DashboardView --> ActivePositions[ActivePositions Table]
     DashboardView --> QuickActions[Quick Action Bar]
     
     Main --> ControlView
     ControlView --> ModeSwitch[Mode Switcher]
-    ControlView --> AttackPanel[Attack Mode Panel <br/> (Protected UI)]
+    ControlView --> AttackPanel["Attack Mode Panel\n(Protected UI)"]
     
     Main --> AnalyticsView
     AnalyticsView --> PnLChart[PnL Curve Chart]
