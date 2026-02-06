@@ -80,8 +80,13 @@ class MockGateExchange(GateExchange):
         return self.balance
         
     async def fetch_ticker(self, symbol):
-        # Return empty data instead of mock
-        return {'last': 0.0, 'vol': 0.0}
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            self.market_data[symbol] = ticker
+            return ticker
+        except Exception as e:
+            log.error(f"Error fetching ticker for {symbol}: {e}")
+            return None
 
     async def create_order(self, symbol, type, side, amount, price=None, params={}):
         log.info(f"MOCK ORDER: {side} {amount} {symbol}")

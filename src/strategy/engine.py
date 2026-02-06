@@ -10,8 +10,22 @@ class StrategyEngine:
         self.exchange = exchange
         self.state_machine = state_machine
         self.running = False
+        self.paused = False
         self.strategies = []
         self._load_strategies()
+
+    @property
+    def is_running(self):
+        return self.running and not self.paused
+
+    def pause(self):
+        self.paused = True
+        log.info("Strategy Engine Paused by User")
+
+    def resume(self):
+        self.paused = False
+        log.info("Strategy Engine Resumed by User")
+
 
     def _load_strategies(self):
         # 1. Load Core Strategies
@@ -41,6 +55,9 @@ class StrategyEngine:
         log.info("Strategy Engine Stopping...")
 
     async def tick(self):
+        if self.paused:
+            return
+
         # Reload config if needed (or assume ConfigManager handles it)
         global_config = config_manager.get_config()
         
@@ -48,13 +65,19 @@ class StrategyEngine:
         # Loop through configured symbols
         for symbol in global_config.strategy.symbols:
             ticker = await self.exchange.fetch_ticker(symbol)
-            balance = await self.exchange.fetch_balance()
+            balance_data = await self.exchange.fetch_balance()
             
             if not ticker:
                 continue
 
+            # Extract total equity for Risk Manager (float)
+            # Support structure: {'total': {'USDT': 100.0}, ...}
+            total_equity = 0.0
+            if isinstance(balance_data, dict):
+                total_equity = balance_data.get('total', {}).get('USDT', 0.0)
+
             # 2. Update State Machine
-            self.state_machine.update(balance, {symbol: ticker})
+            self.state_machine.update(total_equity, {symbol: ticker})
             current_state = self.state_machine.state
             
             # 3. Execute based on State
@@ -99,4 +122,4 @@ class StrategyEngine:
                     if strategy.name == "CoreAttack" and current_state != SystemState.ATTACK:
                         continue
                         
-                    await strategy.on_tick(self.exchange, symbol, ticker, balance)
+                    await strategy.on_tick(self.exchange, symbol, ticker, balance_data)

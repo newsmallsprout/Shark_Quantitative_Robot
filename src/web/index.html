@@ -125,27 +125,29 @@
         <el-container class="min-h-screen">
             <!-- Header -->
             <el-header>
-                <div class="flex items-center">
-                    <el-icon class="mr-2 text-blue-500" :size="24"><Monitor /></el-icon>
-                    <span class="text-lg font-bold tracking-wide mr-4">GATE ATTACK QUANT</span>
-                    <el-tag effect="dark" type="info" size="small" class="tracking-wider">PRO TERMINAL</el-tag>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <!-- Status Indicator -->
-                    <div class="flex items-center px-3 py-1 bg-opacity-10 rounded border border-gray-700" :class="status.status === 'running' ? 'bg-green-900 border-green-800' : 'bg-red-900 border-red-800'">
-                        <span class="status-dot" :class="status.status === 'running' ? 'status-running' : 'status-stopped'"></span>
-                        <span class="text-xs font-bold" :class="status.status === 'running' ? 'text-green-400' : 'text-red-400'">
-                            {{ status.status === 'running' ? t('running') : t('stopped') }}
-                        </span>
+                <div class="flex items-center justify-between h-full">
+                    <div class="flex items-center">
+                        <el-icon class="mr-2 text-blue-500" :size="24"><Monitor /></el-icon>
+                        <span class="text-lg font-bold tracking-wide mr-4">GATE ATTACK QUANT</span>
+                        <el-tag effect="dark" type="info" size="small" class="tracking-wider">PRO TERMINAL</el-tag>
                     </div>
-                    
-                    <el-divider direction="vertical"></el-divider>
-                    
-                    <span class="cursor-pointer text-gray-400 hover:text-white text-sm transition-colors" @click="toggleLanguage">
-                        {{ currentLang === 'en' ? 'EN / 中文' : '中文 / EN' }}
-                    </span>
-                    
-                    <el-button type="primary" :icon="Refresh" circle size="small" @click="refreshData"></el-button>
+                    <div class="flex items-center space-x-4">
+                        <!-- Status Indicator -->
+                        <div class="flex items-center px-3 py-1 bg-opacity-10 rounded border border-gray-700" :class="status.status === 'running' ? 'bg-green-900 border-green-800' : 'bg-red-900 border-red-800'">
+                            <span class="status-dot" :class="status.status === 'running' ? 'status-running' : 'status-stopped'"></span>
+                            <span class="text-xs font-bold" :class="status.status === 'running' ? 'text-green-400' : 'text-red-400'">
+                                {{ status.status === 'running' ? t('running') : t('stopped') }}
+                            </span>
+                        </div>
+                        
+                        <el-divider direction="vertical"></el-divider>
+                        
+                        <span class="cursor-pointer text-gray-400 hover:text-white text-sm transition-colors" @click="toggleLanguage">
+                            {{ currentLang === 'en' ? 'EN / 中文' : '中文 / EN' }}
+                        </span>
+                        
+                        <el-button type="primary" :icon="Refresh" circle size="small" @click="refreshData"></el-button>
+                    </div>
                 </div>
             </el-header>
             
@@ -299,6 +301,28 @@
 
                         <!-- Right Column: AI & Signals -->
                         <el-col :span="8">
+                             <!-- Market Overview -->
+                             <el-card class="mb-4">
+                                <template #header>
+                                    <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                        <el-icon class="mr-1"><Trend-Charts /></el-icon> {{ t('marketOverview') }}
+                                    </span>
+                                </template>
+                                <div style="height: 300px; overflow-y: auto;">
+                                    <div v-for="(quote, idx) in marketQuotes" :key="idx" class="flex items-center justify-between text-xs border-b border-gray-800 py-2 last:border-0 hover:bg-gray-800 px-2 rounded transition-colors">
+                                        <div class="font-bold text-gray-300 w-24">{{ quote.symbol }}</div>
+                                        <div class="text-right flex-1 mr-4 font-mono">{{ quote.price }}</div>
+                                        <div class="text-right w-16 font-mono" :class="quote.change_pct >= 0 ? 'text-green-500' : 'text-red-500'">
+                                            {{ quote.change_pct >= 0 ? '+' : '' }}{{ quote.change_pct ? quote.change_pct.toFixed(2) : '0.00' }}%
+                                        </div>
+                                    </div>
+                                    <div v-if="marketQuotes.length === 0" class="text-center text-gray-500 py-4">
+                                        <span v-if="!dataLoaded">Loading...</span>
+                                        <span v-else>No market data available</span>
+                                    </div>
+                                </div>
+                            </el-card>
+
                             <!-- AI Analysis -->
                             <el-card class="mb-4">
                                 <template #header>
@@ -475,6 +499,7 @@
         const i18n = {
             en: {
                 dashboard: "Dashboard",
+                marketOverview: "Market Overview",
                 settings: "Settings",
                 running: "RUNNING",
                 stopped: "STOPPED",
@@ -528,6 +553,7 @@
             },
             zh: {
                 dashboard: "监控仪表盘",
+                marketOverview: "市场行情概览",
                 settings: "参数配置",
                 running: "运行中",
                 stopped: "已停止",
@@ -598,10 +624,12 @@
                 const account = reactive({ balance: 0, daily_pnl: 0, win_rate: 0 });
                 
                 const recentSignals = ref([]);
+                const marketQuotes = ref([]);
                 const systemLogs = ref([]);
                 const positions = ref([]);
                 const orders = ref([]);
                 const logContainer = ref(null);
+                const dataLoaded = ref(false);
 
                 const t = (key) => i18n[currentLang.value][key] || key;
                 
@@ -654,12 +682,13 @@
 
                 const fetchData = async () => {
                     try {
-                        const [configRes, statusRes, analysisRes, signalsRes, accountRes] = await Promise.all([
+                        const [configRes, statusRes, analysisRes, signalsRes, accountRes, quotesRes] = await Promise.all([
                             axios.get('/api/config'),
                             axios.get('/api/status'),
                             axios.get('/api/market_analysis'),
                             axios.get('/api/recent_signals'),
-                            axios.get('/api/account_info')
+                            axios.get('/api/account_info'),
+                            axios.get('/api/market_quotes')
                         ]);
                         
                         Object.assign(config, configRes.data);
@@ -668,8 +697,10 @@
                         Object.assign(account, accountRes.data); 
                         
                         recentSignals.value = signalsRes.data;
+                        marketQuotes.value = quotesRes.data;
                         positions.value = accountRes.data.positions || [];
                         orders.value = accountRes.data.orders || [];
+                        dataLoaded.value = true;
                         
                         ElMessage.success({ message: currentLang.value === 'zh' ? '数据已更新' : 'Data updated', grouping: true, type: 'success' });
                         fetchLogs();
@@ -710,8 +741,27 @@
                     } catch (e) { ElMessage.error('Error'); }
                 };
 
-                const startBot = () => { status.status = 'running'; ElMessage.success('Bot Started'); };
-                const stopBot = () => { status.status = 'stopped'; ElMessage.warning('Bot Stopped'); };
+                const startBot = async () => {
+                    try {
+                        await axios.post('/api/control', { action: 'START' });
+                        status.status = 'running';
+                        ElMessage.success(currentLang.value === 'zh' ? '机器人已启动' : 'Bot Started');
+                        fetchData();
+                    } catch (e) {
+                        ElMessage.error(currentLang.value === 'zh' ? '启动失败' : 'Failed to start');
+                    }
+                };
+                
+                const stopBot = async () => {
+                    try {
+                        await axios.post('/api/control', { action: 'STOP' });
+                        status.status = 'stopped';
+                        ElMessage.warning(currentLang.value === 'zh' ? '机器人已暂停' : 'Bot Paused');
+                        fetchData();
+                    } catch (e) {
+                        ElMessage.error(currentLang.value === 'zh' ? '停止失败' : 'Failed to stop');
+                    }
+                };
                 
                 const handleLicenseSuccess = () => ElMessage.success('License Uploaded');
                 const handleLicenseError = () => ElMessage.error('Upload Failed');
@@ -724,7 +774,7 @@
                 return {
                     activeTab, currentLang, securityAlertVisible,
                     config, status, analysis, account,
-                    recentSignals, systemLogs, positions, orders, logContainer,
+                    marketQuotes, recentSignals, systemLogs, positions, orders, logContainer,
                     t, toggleLanguage, formatCurrency, getScoreColor, translateLog, translateSignalType,
                     refreshData: fetchData, fetchLogs,
                     saveExchangeConfig, saveRiskConfig, saveStrategyConfig,

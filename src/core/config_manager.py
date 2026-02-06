@@ -1,5 +1,6 @@
 import json
 import os
+import yaml
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from src.utils.logger import log
@@ -15,6 +16,8 @@ class ExchangeConfig(BaseModel):
     api_key: str = ""
     api_secret: str = ""
     sandbox_mode: bool = False
+    data_sources: List[str] = ["gateio", "binance", "okx"]
+    execution_exchange: str = "gateio"
 
 class StrategyParams(BaseModel):
     neutral_rsi_buy: int = 30
@@ -36,7 +39,7 @@ class GlobalConfig(BaseModel):
 
 class ConfigManager:
     _instance = None
-    _config_path = "user_data/settings.json"
+    _config_path = "config/settings.yaml"
     
     def __new__(cls):
         if cls._instance is None:
@@ -49,8 +52,13 @@ class ConfigManager:
         if os.path.exists(self._config_path):
             try:
                 with open(self._config_path, 'r') as f:
-                    data = json.load(f)
-                    self.config = GlobalConfig(**data)
+                    if self._config_path.endswith('.yaml') or self._config_path.endswith('.yml'):
+                        data = yaml.safe_load(f)
+                    else:
+                        data = json.load(f)
+                    # Handle empty file or None
+                    if data:
+                         self.config = GlobalConfig(**data)
                 log.info(f"Configuration loaded from {self._config_path}")
             except Exception as e:
                 log.error(f"Failed to load config: {e}. Using defaults.")
@@ -62,14 +70,19 @@ class ConfigManager:
         try:
             os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
             with open(self._config_path, 'w') as f:
-                f.write(self.config.model_dump_json(indent=2))
+                if self._config_path.endswith('.yaml') or self._config_path.endswith('.yml'):
+                    # Convert model to dict first, then dump to yaml
+                    yaml.dump(self.config.model_dump(), f, default_flow_style=False)
+                else:
+                    f.write(self.config.model_dump_json(indent=2))
             log.info("Configuration saved.")
         except Exception as e:
             log.error(f"Failed to save config: {e}")
 
-    def update_exchange_config(self, api_key: str, api_secret: str):
+    def update_exchange_config(self, api_key: str, api_secret: str, sandbox_mode: bool = False):
         self.config.exchange.api_key = api_key
         self.config.exchange.api_secret = api_secret
+        self.config.exchange.sandbox_mode = sandbox_mode
         self.save_config()
 
     def update_risk_config(self, **kwargs):
