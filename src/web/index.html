@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gate Attack Quant Bot - Professional Terminal</title>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Element Plus -->
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+    <script src="https://unpkg.com/element-plus"></script>
+    <!-- Axios -->
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Icons -->
+    <script src="https://unpkg.com/@element-plus/icons-vue"></script>
+    
+    <style>
+        :root {
+            --bg-dark: #0b1121;
+            --bg-card: #151e32;
+            --border-color: #2a3755;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --accent-color: #3b82f6;
+            --success-color: #10b981;
+            --danger-color: #ef4444;
+            --warning-color: #f59e0b;
+        }
+
+        body { 
+            background-color: var(--bg-dark); 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            color: var(--text-primary); 
+            margin: 0;
+        }
+
+        /* Element Plus Dark Theme Overrides */
+        .el-header { 
+            background-color: var(--bg-card); 
+            border-bottom: 1px solid var(--border-color); 
+            height: 60px;
+        }
+        
+        .el-card { 
+            background-color: var(--bg-card); 
+            border: 1px solid var(--border-color); 
+            color: var(--text-primary); 
+            margin-bottom: 0; /* Reset margin, handle with grid gutter */
+            height: 100%;
+        }
+        
+        .el-card__header { 
+            border-bottom: 1px solid var(--border-color); 
+            padding: 12px 20px;
+        }
+        
+        .el-card__body {
+            padding: 15px;
+        }
+
+        /* Inputs & Form Elements */
+        .el-input__wrapper, .el-textarea__inner, .el-input-number__decrease, .el-input-number__increase { 
+            background-color: #0f172a !important; 
+            box-shadow: 0 0 0 1px var(--border-color) inset !important; 
+        }
+        .el-input__inner { color: var(--text-primary) !important; }
+        
+        /* Tables */
+        .el-table { 
+            background-color: var(--bg-card); 
+            --el-table-header-bg-color: #0f172a; 
+            --el-table-border-color: var(--border-color); 
+            --el-table-tr-bg-color: var(--bg-card); 
+            --el-table-row-hover-bg-color: #1e293b;
+            color: var(--text-primary);
+        }
+        .el-table th, .el-table tr, .el-table td { 
+            background-color: transparent !important; 
+            border-bottom: 1px solid var(--border-color) !important; 
+        }
+        
+        /* Tabs */
+        .el-tabs__item { color: var(--text-secondary); }
+        .el-tabs__item.is-active { color: var(--accent-color); }
+        .el-tabs__nav-wrap::after { background-color: var(--border-color); }
+
+        /* Custom Components */
+        .status-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .status-running { background-color: var(--success-color); box-shadow: 0 0 8px var(--success-color); }
+        .status-stopped { background-color: var(--danger-color); }
+
+        .log-container { 
+            background: #020617; 
+            color: #22d3ee; 
+            padding: 12px; 
+            height: 300px; 
+            overflow-y: auto; 
+            font-family: 'JetBrains Mono', 'Consolas', monospace; 
+            font-size: 12px; 
+            border-radius: 4px; 
+            border: 1px solid var(--border-color); 
+            white-space: pre-wrap;
+        }
+        
+        .stat-value { font-size: 20px; font-weight: 700; color: #fff; }
+        .stat-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .help-icon { color: var(--text-secondary); margin-left: 4px; cursor: help; font-size: 14px; }
+        
+        /* Grid Adjustments */
+        .mb-4 { margin-bottom: 1rem; }
+        .h-full { height: 100%; }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-dark); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <el-container class="min-h-screen">
+            <!-- Header -->
+            <el-header>
+                <div class="flex items-center">
+                    <el-icon class="mr-2 text-blue-500" :size="24"><Monitor /></el-icon>
+                    <span class="text-lg font-bold tracking-wide mr-4">GATE ATTACK QUANT</span>
+                    <el-tag effect="dark" type="info" size="small" class="tracking-wider">PRO TERMINAL</el-tag>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <!-- Status Indicator -->
+                    <div class="flex items-center px-3 py-1 bg-opacity-10 rounded border border-gray-700" :class="status.status === 'running' ? 'bg-green-900 border-green-800' : 'bg-red-900 border-red-800'">
+                        <span class="status-dot" :class="status.status === 'running' ? 'status-running' : 'status-stopped'"></span>
+                        <span class="text-xs font-bold" :class="status.status === 'running' ? 'text-green-400' : 'text-red-400'">
+                            {{ status.status === 'running' ? t('running') : t('stopped') }}
+                        </span>
+                    </div>
+                    
+                    <el-divider direction="vertical"></el-divider>
+                    
+                    <span class="cursor-pointer text-gray-400 hover:text-white text-sm transition-colors" @click="toggleLanguage">
+                        {{ currentLang === 'en' ? 'EN / 中文' : '中文 / EN' }}
+                    </span>
+                    
+                    <el-button type="primary" :icon="Refresh" circle size="small" @click="refreshData"></el-button>
+                </div>
+            </el-header>
+            
+            <el-main>
+                <!-- Alert Area -->
+                <el-alert v-if="securityAlertVisible" :title="t('securityWarning')" type="warning" show-icon close-text="Got it" @close="securityAlertVisible = false" class="mb-4"></el-alert>
+
+                <!-- Navigation Tabs -->
+                <el-tabs v-model="activeTab" class="mb-4">
+                    <el-tab-pane :label="t('dashboard')" name="dashboard"></el-tab-pane>
+                    <el-tab-pane :label="t('settings')" name="settings"></el-tab-pane>
+                </el-tabs>
+
+                <!-- DASHBOARD VIEW -->
+                <div v-if="activeTab === 'dashboard'">
+                    <!-- Top Metrics Row -->
+                    <el-row :gutter="16" class="mb-4">
+                        <el-col :xs="12" :sm="6" :md="6" :lg="6">
+                            <el-card shadow="hover" :body-style="{ padding: '15px' }">
+                                <div class="flex justify-between items-start">
+                                    <div>
+                                        <div class="stat-label">{{ t('totalBalance') }}</div>
+                                        <div class="stat-value mt-1">{{ formatCurrency(account.balance) }}</div>
+                                    </div>
+                                    <el-icon class="text-blue-500" :size="20"><Wallet /></el-icon>
+                                </div>
+                            </el-card>
+                        </el-col>
+                        <el-col :xs="12" :sm="6" :md="6" :lg="6">
+                            <el-card shadow="hover" :body-style="{ padding: '15px' }">
+                                <div class="flex justify-between items-start">
+                                    <div>
+                                        <div class="stat-label">{{ t('dailyPnl') }}</div>
+                                        <div class="stat-value mt-1" :class="account.daily_pnl >= 0 ? 'text-green-500' : 'text-red-500'">
+                                            {{ account.daily_pnl >= 0 ? '+' : '' }}{{ formatCurrency(account.daily_pnl) }}
+                                        </div>
+                                    </div>
+                                    <el-icon class="text-green-500" :size="20"><Trend-Charts /></el-icon>
+                                </div>
+                            </el-card>
+                        </el-col>
+                        <el-col :xs="12" :sm="6" :md="6" :lg="6">
+                            <el-card shadow="hover" :body-style="{ padding: '15px' }">
+                                <div class="flex justify-between items-start">
+                                    <div>
+                                        <div class="stat-label">{{ t('winRate') }}</div>
+                                        <div class="stat-value mt-1 text-yellow-500">{{ account.win_rate }}%</div>
+                                    </div>
+                                    <el-icon class="text-yellow-500" :size="20"><Trophy /></el-icon>
+                                </div>
+                            </el-card>
+                        </el-col>
+                        <el-col :xs="12" :sm="6" :md="6" :lg="6">
+                            <el-card shadow="hover" :body-style="{ padding: '15px' }">
+                                <div class="flex justify-between items-center h-full">
+                                    <div>
+                                        <div class="stat-label">{{ t('control') }}</div>
+                                        <div class="mt-2">
+                                            <el-button v-if="status.status !== 'running'" type="success" size="small" @click="startBot">{{ t('start') }}</el-button>
+                                            <el-button v-else type="danger" size="small" @click="stopBot">{{ t('stop') }}</el-button>
+                                        </div>
+                                    </div>
+                                    <div class="text-right">
+                                        <div class="text-xs text-gray-500">{{ t('mode') }}</div>
+                                        <el-tag size="small" :type="config.exchange.sandbox_mode ? 'warning' : 'danger'" effect="dark">
+                                            {{ config.exchange.sandbox_mode ? 'SANDBOX' : 'LIVE REAL' }}
+                                        </el-tag>
+                                    </div>
+                                </div>
+                            </el-card>
+                        </el-col>
+                    </el-row>
+
+                    <!-- Main Content Grid -->
+                    <el-row :gutter="16">
+                        <!-- Left Column: Tables -->
+                        <el-col :span="16">
+                            <!-- Active Positions -->
+                            <el-card class="mb-4">
+                                <template #header>
+                                    <div class="flex justify-between items-center">
+                                        <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                            <el-icon class="mr-1"><List /></el-icon> {{ t('positions') }}
+                                        </span>
+                                        <el-tag size="small" type="info">{{ positions.length }}</el-tag>
+                                    </div>
+                                </template>
+                                <el-table :data="positions" style="width: 100%" size="small" empty-text="No active positions">
+                                    <el-table-column prop="symbol" :label="t('symbol')"></el-table-column>
+                                    <el-table-column prop="side" :label="t('side')" width="80">
+                                        <template #default="scope">
+                                            <span :class="scope.row.side === 'long' ? 'text-green-500' : 'text-red-500'">{{ scope.row.side.toUpperCase() }}</span>
+                                        </template>
+                                    </el-table-column>
+                                    <el-table-column prop="size" :label="t('size')"></el-table-column>
+                                    <el-table-column prop="entry_price" :label="t('entryPrice')"></el-table-column>
+                                    <el-table-column prop="unrealized_pnl" :label="t('pnl')">
+                                        <template #default="scope">
+                                            <span :class="scope.row.unrealized_pnl >= 0 ? 'text-green-500' : 'text-red-500'">
+                                                {{ scope.row.unrealized_pnl }} ({{ scope.row.pnl_percent }}%)
+                                            </span>
+                                        </template>
+                                    </el-table-column>
+                                </el-table>
+                            </el-card>
+
+                            <!-- Open Orders -->
+                            <el-card class="mb-4">
+                                <template #header>
+                                    <div class="flex justify-between items-center">
+                                        <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                            <el-icon class="mr-1"><Tickets /></el-icon> {{ t('openOrders') }}
+                                        </span>
+                                        <el-tag size="small" type="info">{{ orders.length }}</el-tag>
+                                    </div>
+                                </template>
+                                <el-table :data="orders" style="width: 100%" size="small" empty-text="No open orders">
+                                    <el-table-column prop="symbol" :label="t('symbol')"></el-table-column>
+                                    <el-table-column prop="side" :label="t('side')" width="80">
+                                        <template #default="scope">
+                                            <span :class="scope.row.side === 'buy' ? 'text-green-500' : 'text-red-500'">{{ scope.row.side.toUpperCase() }}</span>
+                                        </template>
+                                    </el-table-column>
+                                    <el-table-column prop="type" :label="t('type')"></el-table-column>
+                                    <el-table-column prop="price" :label="t('price')"></el-table-column>
+                                    <el-table-column prop="amount" :label="t('amount')"></el-table-column>
+                                    <el-table-column prop="status" :label="t('status')"></el-table-column>
+                                </el-table>
+                            </el-card>
+
+                             <!-- Operation Logs -->
+                             <el-card>
+                                <template #header>
+                                    <div class="flex justify-between items-center">
+                                        <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                            <el-icon class="mr-1"><Cpu /></el-icon> {{ t('botLogs') }}
+                                        </span>
+                                        <div class="flex items-center">
+                                            <el-tooltip :content="t('botLogsTip')" placement="top">
+                                                <el-icon class="help-icon mr-2"><question-filled /></el-icon>
+                                            </el-tooltip>
+                                            <el-button size="small" link @click="fetchLogs">{{ t('refresh') }}</el-button>
+                                        </div>
+                                    </div>
+                                </template>
+                                <div class="log-container" ref="logContainer">
+                                    <div v-for="(log, index) in systemLogs" :key="index" class="log-entry">{{ translateLog(log) }}</div>
+                                </div>
+                            </el-card>
+                        </el-col>
+
+                        <!-- Right Column: AI & Signals -->
+                        <el-col :span="8">
+                            <!-- AI Analysis -->
+                            <el-card class="mb-4">
+                                <template #header>
+                                    <div class="flex items-center justify-between">
+                                        <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                            <el-icon class="mr-1"><Data-Analysis /></el-icon> {{ t('aiAnalysis') }}
+                                        </span>
+                                        <el-tag size="small" effect="plain">{{ analysis.symbol }}</el-tag>
+                                    </div>
+                                </template>
+                                <div class="text-center py-4">
+                                    <el-progress type="dashboard" :percentage="analysis.ai_score" :color="getScoreColor" :width="120">
+                                        <template #default="{ percentage }">
+                                            <span class="block text-2xl font-bold text-white">{{ percentage }}</span>
+                                            <span class="block text-xs text-gray-500">Score</span>
+                                        </template>
+                                    </el-progress>
+                                    <div class="mt-4 flex justify-between px-4">
+                                        <div class="text-left">
+                                            <div class="text-xs text-gray-500">{{ t('regime') }}</div>
+                                            <div class="font-bold text-blue-400">{{ analysis.regime }}</div>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="text-xs text-gray-500">Trend</div>
+                                            <div class="font-bold text-green-400">BULLISH</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </el-card>
+
+                            <!-- Recent Signals -->
+                            <el-card>
+                                <template #header>
+                                    <span class="font-bold text-sm uppercase tracking-wide flex items-center">
+                                        <el-icon class="mr-1"><Bell /></el-icon> {{ t('recentSignals') }}
+                                    </span>
+                                </template>
+                                <div class="space-y-3">
+                                    <div v-for="(signal, idx) in recentSignals" :key="idx" class="flex items-start text-xs border-b border-gray-800 pb-2 last:border-0">
+                                        <div class="w-16 text-gray-500">{{ signal.time.split(' ')[1] || signal.time }}</div>
+                                        <div class="flex-1">
+                                            <div class="flex justify-between mb-1">
+                                                <span class="font-bold text-gray-300">{{ signal.symbol }}</span>
+                                                <span :class="signal.type === 'REJECTED' ? 'text-gray-500' : 'text-green-400'">{{ translateSignalType(signal.type) }}</span>
+                                            </div>
+                                            <div class="text-gray-500 truncate">{{ signal.reason }}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </el-card>
+                        </el-col>
+                    </el-row>
+                </div>
+
+                <!-- SETTINGS VIEW -->
+                <div v-if="activeTab === 'settings'">
+                    <el-row :gutter="20">
+                        <el-col :span="24">
+                            <el-alert :title="t('settingsNote')" type="info" show-icon class="mb-4" :closable="false"></el-alert>
+                        </el-col>
+                        
+                        <!-- Exchange Config -->
+                        <el-col :md="12" :xs="24" class="mb-4">
+                            <el-card>
+                                <template #header>
+                                    <span class="font-bold">{{ t('exchangeApi') }}</span>
+                                    <el-tooltip :content="t('exchangeApiTip')" placement="top"><el-icon class="help-icon"><question-filled /></el-icon></el-tooltip>
+                                </template>
+                                <el-form :model="config.exchange" label-width="100px" size="default">
+                                    <el-form-item :label="t('apiKey')">
+                                        <el-input v-model="config.exchange.api_key" show-password></el-input>
+                                    </el-form-item>
+                                    <el-form-item :label="t('apiSecret')">
+                                        <el-input v-model="config.exchange.api_secret" show-password></el-input>
+                                    </el-form-item>
+                                    <el-form-item :label="t('mode')">
+                                        <el-switch v-model="config.exchange.sandbox_mode" :active-text="t('sandbox')" :inactive-text="t('live')"></el-switch>
+                                    </el-form-item>
+                                    <el-button type="primary" class="w-full" @click="saveExchangeConfig">{{ t('saveConfig') }}</el-button>
+                                </el-form>
+                            </el-card>
+                        </el-col>
+
+                        <!-- Risk Config -->
+                        <el-col :md="12" :xs="24" class="mb-4">
+                            <el-card>
+                                <template #header>
+                                    <span class="font-bold">{{ t('riskMgmt') }}</span>
+                                    <el-tooltip :content="t('riskMgmtTip')" placement="top"><el-icon class="help-icon"><question-filled /></el-icon></el-tooltip>
+                                </template>
+                                <el-form :model="config.risk" label-position="top">
+                                    <el-row :gutter="20">
+                                        <el-col :span="12">
+                                            <el-form-item :label="t('maxSingleRisk')">
+                                                <el-input-number v-model="config.risk.max_single_risk" :step="0.01" :max="0.05" style="width: 100%"></el-input-number>
+                                            </el-form-item>
+                                        </el-col>
+                                        <el-col :span="12">
+                                            <el-form-item :label="t('dailyDrawdown')">
+                                                <el-input-number v-model="config.risk.daily_drawdown_limit" :step="0.01" :max="0.20" style="width: 100%"></el-input-number>
+                                            </el-form-item>
+                                        </el-col>
+                                    </el-row>
+                                    <el-form-item :label="t('maxLeverage')">
+                                        <el-slider v-model="config.risk.max_leverage" :min="1" :max="20" show-input></el-slider>
+                                    </el-form-item>
+                                    <el-button type="primary" class="w-full" @click="saveRiskConfig">{{ t('save') }}</el-button>
+                                </el-form>
+                            </el-card>
+                        </el-col>
+                        
+                        <!-- Strategy Config -->
+                        <el-col :span="24">
+                            <el-card>
+                                <template #header>
+                                    <span class="font-bold">{{ t('stratParams') }}</span>
+                                    <el-tooltip :content="t('stratParamsTip')" placement="top"><el-icon class="help-icon"><question-filled /></el-icon></el-tooltip>
+                                </template>
+                                <el-form :model="config.strategy.params" label-width="180px">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div>
+                                            <h3 class="text-sm font-bold text-blue-400 mb-4 uppercase tracking-wider">Neutral Strategy (RSI)</h3>
+                                            <el-form-item :label="t('rsiBuy')">
+                                                <el-input-number v-model="config.strategy.params.neutral_rsi_buy" :min="10" :max="40"></el-input-number>
+                                            </el-form-item>
+                                            <el-form-item :label="t('rsiSell')">
+                                                <el-input-number v-model="config.strategy.params.neutral_rsi_sell" :min="60" :max="90"></el-input-number>
+                                            </el-form-item>
+                                        </div>
+                                        <div>
+                                            <h3 class="text-sm font-bold text-purple-400 mb-4 uppercase tracking-wider">AI Thresholds</h3>
+                                            <el-form-item :label="t('neutralAi')">
+                                                <el-slider v-model="config.strategy.params.neutral_ai_threshold" show-input></el-slider>
+                                            </el-form-item>
+                                            <el-form-item :label="t('attackAi')">
+                                                <el-slider v-model="config.strategy.params.attack_ai_threshold" show-input></el-slider>
+                                            </el-form-item>
+                                        </div>
+                                    </div>
+                                    <el-divider></el-divider>
+                                    <el-button type="primary" class="w-full" @click="saveStrategyConfig">{{ t('save') }}</el-button>
+                                </el-form>
+                            </el-card>
+                        </el-col>
+                        
+                        <!-- License -->
+                         <el-col :span="24" class="mt-4">
+                            <el-card>
+                                <template #header>
+                                    <span class="font-bold">{{ t('licenseMgmt') }}</span>
+                                </template>
+                                <el-upload
+                                    class="upload-demo"
+                                    drag
+                                    action="/api/license/upload"
+                                    :on-success="handleLicenseSuccess"
+                                    :on-error="handleLicenseError">
+                                    <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+                                    <div class="el-upload__text">{{ t('dropLicense') }}</div>
+                                </el-upload>
+                            </el-card>
+                        </el-col>
+                    </el-row>
+                </div>
+            </el-main>
+        </el-container>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, reactive } = Vue;
+        const { ElMessage } = ElementPlus;
+        const { Refresh, UploadFilled, QuestionFilled, InfoFilled, Monitor, Wallet, TrendCharts, Trophy, List, Tickets, Cpu, DataAnalysis, Bell } = ElementPlusIconsVue;
+
+        const i18n = {
+            en: {
+                dashboard: "Dashboard",
+                settings: "Settings",
+                running: "RUNNING",
+                stopped: "STOPPED",
+                totalBalance: "Total Balance",
+                dailyPnl: "Daily PnL",
+                winRate: "Win Rate",
+                control: "Control",
+                start: "START BOT",
+                stop: "STOP BOT",
+                mode: "MODE",
+                positions: "Active Positions",
+                openOrders: "Open Orders",
+                botLogs: "Bot Operation Logs",
+                botLogsTip: "Real-time logs showing strategy decisions, state changes, and order executions.",
+                refresh: "Refresh",
+                aiAnalysis: "AI Market Analysis",
+                regime: "Regime",
+                recentSignals: "Recent Signals",
+                symbol: "Symbol",
+                side: "Side",
+                size: "Size",
+                entryPrice: "Entry Price",
+                pnl: "PnL",
+                type: "Type",
+                price: "Price",
+                amount: "Amount",
+                status: "Status",
+                settingsNote: "All configurations are stored locally. Remote servers have NO access to your keys.",
+                exchangeApi: "Exchange API Keys",
+                exchangeApiTip: "Keys are encrypted locally.",
+                apiKey: "API Key",
+                apiSecret: "API Secret",
+                sandbox: "Sandbox",
+                live: "Live Real",
+                saveConfig: "Save Exchange Config",
+                riskMgmt: "Risk Management",
+                riskMgmtTip: "Global hard limits.",
+                maxSingleRisk: "Max Single Risk %",
+                dailyDrawdown: "Daily Drawdown Limit %",
+                maxLeverage: "Max Leverage",
+                save: "Save Configuration",
+                stratParams: "Strategy Parameters",
+                stratParamsTip: "Adjust strategy behavior dynamically.",
+                rsiBuy: "RSI Buy (<)",
+                rsiSell: "RSI Sell (>)",
+                neutralAi: "Neutral AI Score >",
+                attackAi: "Attack AI Score >",
+                licenseMgmt: "License Activation",
+                dropLicense: "Drop license.key file here",
+                securityWarning: "Security Warning: All configurations (API Keys) are stored LOCALLY in user_data/settings.json. Please keep your local machine secure."
+            },
+            zh: {
+                dashboard: "监控仪表盘",
+                settings: "参数配置",
+                running: "运行中",
+                stopped: "已停止",
+                totalBalance: "账户总权益",
+                dailyPnl: "今日盈亏",
+                winRate: "胜率",
+                control: "系统控制",
+                start: "启动机器人",
+                stop: "停止运行",
+                mode: "运行模式",
+                positions: "当前持仓",
+                openOrders: "活动挂单",
+                botLogs: "机器人操作日志",
+                botLogsTip: "实时显示机器人的策略决策、状态变更和订单执行记录。",
+                refresh: "刷新",
+                aiAnalysis: "AI 市场分析",
+                regime: "市场状态",
+                recentSignals: "最新信号",
+                symbol: "币种",
+                side: "方向",
+                size: "仓位",
+                entryPrice: "开仓价",
+                pnl: "未实现盈亏",
+                type: "类型",
+                price: "价格",
+                amount: "数量",
+                status: "状态",
+                settingsNote: "所有配置均保存在本地。远程服务器无法获取您的私钥。",
+                exchangeApi: "交易所 API 设置",
+                exchangeApiTip: "密钥仅在本地加密存储。",
+                apiKey: "API Key",
+                apiSecret: "API Secret",
+                sandbox: "沙箱测试",
+                live: "实盘交易",
+                saveConfig: "保存交易所配置",
+                riskMgmt: "风控管理",
+                riskMgmtTip: "全局硬性风控限制。",
+                maxSingleRisk: "单笔最大风控 %",
+                dailyDrawdown: "每日回撤熔断 %",
+                maxLeverage: "最大杠杆限制",
+                save: "保存配置",
+                stratParams: "策略参数微调",
+                stratParamsTip: "动态调整策略行为。",
+                rsiBuy: "RSI 买入阈值 (<)",
+                rsiSell: "RSI 卖出阈值 (>)",
+                neutralAi: "震荡策略 AI 门槛 >",
+                attackAi: "进攻策略 AI 门槛 >",
+                licenseMgmt: "授权激活",
+                dropLicense: "拖拽 license.key 文件到此处激活",
+                securityWarning: "安全警告：所有配置（API Key等）均加密保存在您本地的 user_data/settings.json 文件中，请妥善保管本地设备。"
+            }
+        };
+
+        const app = createApp({
+            setup() {
+                const activeTab = ref('dashboard');
+                const currentLang = ref(localStorage.getItem('locale') || 'zh');
+                const securityAlertVisible = ref(true);
+                
+                const config = reactive({
+                    exchange: { api_key: '', api_secret: '', sandbox_mode: false },
+                    risk: { max_single_risk: 0.02, daily_drawdown_limit: 0.08, max_leverage: 10 },
+                    strategy: { params: { neutral_rsi_buy: 30, neutral_rsi_sell: 70, neutral_ai_threshold: 40, attack_ai_threshold: 60 } }
+                });
+
+                const status = reactive({ status: 'stopped', state: 'UNKNOWN' });
+                const analysis = reactive({ symbol: '-', regime: '-', ai_score: 0 });
+                const account = reactive({ balance: 0, daily_pnl: 0, win_rate: 0 });
+                
+                const recentSignals = ref([]);
+                const systemLogs = ref([]);
+                const positions = ref([]);
+                const orders = ref([]);
+                const logContainer = ref(null);
+
+                const t = (key) => i18n[currentLang.value][key] || key;
+                
+                const toggleLanguage = () => {
+                    currentLang.value = currentLang.value === 'en' ? 'zh' : 'en';
+                    localStorage.setItem('locale', currentLang.value);
+                };
+                
+                const formatCurrency = (val) => {
+                    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
+                };
+
+                const getScoreColor = (percentage) => {
+                    if (percentage < 40) return '#f56c6c';
+                    if (percentage < 70) return '#e6a23c';
+                    return '#67c23a';
+                };
+
+                const translateLog = (log) => {
+                    if (currentLang.value === 'en') return log;
+                    if (!log) return '';
+                    let text = log;
+                    text = text.replace(/Signal APPROVED/g, "信号已批准");
+                    text = text.replace(/Signal REJECTED/g, "信号已拒绝");
+                    text = text.replace(/ATTACK Signal/g, "进攻信号");
+                    text = text.replace(/Score/g, "评分");
+                    text = text.replace(/Regime/g, "状态");
+                    text = text.replace(/Exchange config updated via API/g, "交易所配置已通过API更新");
+                    text = text.replace(/Risk config updated via API/g, "风控配置已通过API更新");
+                    text = text.replace(/Strategy config updated via API/g, "策略配置已通过API更新");
+                    text = text.replace(/INFO/g, "信息");
+                    text = text.replace(/WARNING/g, "警告");
+                    text = text.replace(/ERROR/g, "错误");
+                    return text;
+                };
+
+                const translateSignalType = (type) => {
+                    if (currentLang.value === 'en') return type;
+                    const map = {
+                        'REJECTED': '已拒绝',
+                        'ATTACK_BUY': '进攻买入',
+                        'ATTACK_SELL': '进攻卖出',
+                        'buy': '买入',
+                        'sell': '卖出',
+                        'limit': '限价单',
+                        'market': '市价单'
+                    };
+                    return map[type] || type;
+                };
+
+                const fetchData = async () => {
+                    try {
+                        const [configRes, statusRes, analysisRes, signalsRes, accountRes] = await Promise.all([
+                            axios.get('/api/config'),
+                            axios.get('/api/status'),
+                            axios.get('/api/market_analysis'),
+                            axios.get('/api/recent_signals'),
+                            axios.get('/api/account_info')
+                        ]);
+                        
+                        Object.assign(config, configRes.data);
+                        Object.assign(status, statusRes.data);
+                        Object.assign(analysis, analysisRes.data);
+                        Object.assign(account, accountRes.data); 
+                        
+                        recentSignals.value = signalsRes.data;
+                        positions.value = accountRes.data.positions || [];
+                        orders.value = accountRes.data.orders || [];
+                        
+                        ElMessage.success({ message: currentLang.value === 'zh' ? '数据已更新' : 'Data updated', grouping: true, type: 'success' });
+                        fetchLogs();
+                    } catch (error) {
+                        console.error(error);
+                        ElMessage.error(currentLang.value === 'zh' ? '连接后端失败' : 'Connection failed');
+                    }
+                };
+                
+                const fetchLogs = async () => {
+                    try {
+                        const res = await axios.get('/api/logs');
+                        systemLogs.value = res.data.logs;
+                        setTimeout(() => {
+                            if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight;
+                        }, 100);
+                    } catch (e) { console.error(e); }
+                }
+
+                const saveExchangeConfig = async () => {
+                    try {
+                        await axios.post('/api/config/exchange', config.exchange);
+                        ElMessage.success(currentLang.value === 'zh' ? '配置已保存' : 'Config saved');
+                    } catch (e) { ElMessage.error('Error'); }
+                };
+                
+                const saveRiskConfig = async () => {
+                    try {
+                        await axios.post('/api/config/risk', config.risk);
+                        ElMessage.success(currentLang.value === 'zh' ? '配置已保存' : 'Config saved');
+                    } catch (e) { ElMessage.error('Error'); }
+                };
+                
+                const saveStrategyConfig = async () => {
+                    try {
+                        await axios.post('/api/config/strategy', { params: config.strategy.params });
+                        ElMessage.success(currentLang.value === 'zh' ? '配置已保存' : 'Config saved');
+                    } catch (e) { ElMessage.error('Error'); }
+                };
+
+                const startBot = () => { status.status = 'running'; ElMessage.success('Bot Started'); };
+                const stopBot = () => { status.status = 'stopped'; ElMessage.warning('Bot Stopped'); };
+                
+                const handleLicenseSuccess = () => ElMessage.success('License Uploaded');
+                const handleLicenseError = () => ElMessage.error('Upload Failed');
+
+                onMounted(() => {
+                    fetchData();
+                    setInterval(fetchLogs, 5000);
+                });
+
+                return {
+                    activeTab, currentLang, securityAlertVisible,
+                    config, status, analysis, account,
+                    recentSignals, systemLogs, positions, orders, logContainer,
+                    t, toggleLanguage, formatCurrency, getScoreColor, translateLog, translateSignalType,
+                    refreshData: fetchData, fetchLogs,
+                    saveExchangeConfig, saveRiskConfig, saveStrategyConfig,
+                    startBot, stopBot, handleLicenseSuccess, handleLicenseError,
+                    Refresh, UploadFilled, QuestionFilled, InfoFilled, Monitor, Wallet, TrendCharts, Trophy, List, Tickets, Cpu, DataAnalysis, Bell
+                };
+            }
+        });
+
+        app.use(ElementPlus);
+        for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+            app.component(key, component)
+        }
+        app.mount('#app');
+    </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+venv/
+env/
+logs/
+data/
+license/
+frontend/node_modules/
+frontend/dist/
+config/settings.yaml
