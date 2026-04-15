@@ -919,6 +919,32 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             return None
         return dict(row)
 
+    def _entry_group_feasible_subset(
+        self,
+        cfg: Any,
+        sigs: List[Dict[str, Any]],
+        lev_g: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        组开 EV 预检：严格模式须全过；放松模式只保留通过的腿（仍共用 lev_g）。
+        返回 None 表示本组放弃；非空 list 为可开仓信号顺序。
+        """
+        if not sigs:
+            return None
+        strict = bool(getattr(cfg, "entry_group_require_all_feasible", False))
+        min_need = min(
+            len(sigs),
+            max(1, int(getattr(cfg, "entry_group_min_feasible", 1) or 1)),
+        )
+        if strict:
+            if not all(self._pair_entry_feasible(s, forced_leverage=lev_g) for s in sigs):
+                return None
+            return list(sigs)
+        good = [s for s in sigs if self._pair_entry_feasible(s, forced_leverage=lev_g)]
+        if len(good) < min_need:
+            return None
+        return good
+
     def _pair_entry_feasible(self, sig: Dict[str, Any], *, forced_leverage: Optional[int] = None) -> bool:
         """_open_pair 在发单前的检查（不落库、不发单），用于同 tick 组开多腿预检。"""
         cfg = self._cfg()
@@ -1435,9 +1461,10 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                 if blocked or len(sigs) != gs:
                     continue
                 lev_g = self._group_entry_leverage([str(s["alt"]) for s in sigs])
-                if not all(self._pair_entry_feasible(s, forced_leverage=lev_g) for s in sigs):
+                to_open = self._entry_group_feasible_subset(cfg, sigs, lev_g)
+                if not to_open:
                     continue
-                for s in sigs:
+                for s in to_open:
                     self._open_pair(s, lev_g)
         else:
             # score_batch：按候选分数从高到低，每波凑满 gs 个且 EV 全过则同 tick 连发；可在一 tick 内开多波直至上限
@@ -1463,7 +1490,8 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                 if len(batch) < gs:
                     break
                 lev_g = self._group_entry_leverage([str(s["alt"]) for s in batch])
-                if not all(self._pair_entry_feasible(s, forced_leverage=lev_g) for s in batch):
+                to_open = self._entry_group_feasible_subset(cfg, batch, lev_g)
+                if not to_open:
                     break
-                for s in batch:
+                for s in to_open:
                     self._open_pair(s, lev_g)

@@ -327,6 +327,10 @@ class BetaNeutralHFConfig(BaseModel):
     # symbol_adjacent=配置顺序相邻 N 个为一组（严）；score_batch=每 tick 从高分候选里凑 N 个同发（易填满多仓）
     entry_group_mode: str = "score_batch"
     entry_score_batch_max_waves: int = Field(default=10, ge=1, le=64)
+    # True=组内 EV 预检须全过才开仓（严）；False=只开通过预检的腿，组内仍共用 lev_g
+    entry_group_require_all_feasible: bool = False
+    # 放松模式下至少几条通过才触发本组（通常 1）
+    entry_group_min_feasible: int = Field(default=1, ge=1, le=32)
     # exchange_group_min_max：组内统一杠杆 = 各 ALT 与锚的交易所 leverage_max 的最小值；单开取 min(该 ALT, 锚)。dynamic=旧版按信号/AI 缩放，组内取各腿有效杠杆的最小值
     entry_leverage_mode: str = "exchange_group_min_max"
     # 开仓 EV：期望 TP(USDT) 需 > 圆桌双边费 × 该倍数；调低以放开震荡市高频小单
