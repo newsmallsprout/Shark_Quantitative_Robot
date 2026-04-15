@@ -18,7 +18,24 @@
     ],
     "symbols": [
       "BTC/USDT",
-      "ETH/USDT"
+      "ETH/USDT",
+      "SOL/USDT",
+      "DOGE/USDT",
+      "PEPE/USDT",
+      "XRP/USDT",
+      "BNB/USDT",
+      "AVAX/USDT",
+      "LINK/USDT",
+      "ADA/USDT",
+      "SUI/USDT",
+      "WIF/USDT",
+      "ORDI/USDT",
+      "APT/USDT",
+      "NEAR/USDT",
+      "DOT/USDT",
+      "LTC/USDT",
+      "TRX/USDT",
+      "FIL/USDT"
     ],
     "allocations": {
       "core_neutral": 0.5,

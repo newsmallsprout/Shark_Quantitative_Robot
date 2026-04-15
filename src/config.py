@@ -6,6 +6,7 @@ class SystemState(str, Enum):
     OBSERVE = "OBSERVE"
     NEUTRAL = "NEUTRAL"
     ATTACK = "ATTACK"
+    BERSERKER = "BERSERKER"
     COOL_DOWN = "COOL_DOWN"
     LICENSE_LOCKED = "LICENSE_LOCKED"
 

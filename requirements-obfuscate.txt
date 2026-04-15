@@ -1,0 +1,2 @@
+# Optional: release-time bytecode / script protection (see README — Source protection)
+pyarmor>=8.5,<10

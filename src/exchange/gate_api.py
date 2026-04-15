@@ -70,7 +70,7 @@ class GateExchange:
 # Simple Mock for testing without API Keys
 class MockGateExchange(GateExchange):
     def __init__(self):
-        self.balance = 10000.0
+        self.balance = 100.0
         self.market_data = {}
         
     async def initialize(self):

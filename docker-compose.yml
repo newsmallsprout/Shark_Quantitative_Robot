@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  shark-quant:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    image: shark-quant:latest
+    container_name: shark-quant-bot
+    restart: unless-stopped
+    ports:
+      - "8002:8002"  # Dashboard and API
+    volumes:
+      # rw：Darwin 补丁与仪表盘「保存配置」会写回 settings.yaml；若用 :ro 会报 Errno 30 Read-only file system
+      - ./config/settings.yaml:/app/config/settings.yaml
+      - ./logs:/app/logs  # Persist logs
+      - ./license:/app/license:ro # Mount license
+    environment:
+      - TZ=UTC
+      - NODE_ENV=production
+      # Paper / dev: set to 1 if license file is expired but you only need mainnet feed + dashboard
+      - SKIP_LICENSE_CHECK=1
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - quant_net
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: shark-quant-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - quant_net
+
+volumes:
+  redis_data:
+
+networks:
+  quant_net:
+    driver: bridge
