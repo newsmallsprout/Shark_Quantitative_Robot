@@ -12,6 +12,7 @@ import type {
   ISeriesApi,
   UTCTimestamp,
 } from 'lightweight-charts';
+import { apiFetch } from '../../apiClient';
 import { useStore } from '../../store/useStore';
 import { CandlestickChart, RefreshCw } from 'lucide-react';
 
@@ -109,7 +110,7 @@ export const StarshipCandleChart: React.FC = () => {
         interval,
         limit: '300',
       });
-      const res = await fetch(`/api/candles?${q}`);
+      const res = await apiFetch(`/api/candles?${q}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as unknown[];
       if (!Array.isArray(data) || data.length === 0) {

@@ -1,5 +1,9 @@
-"""单测默认关闭「开仓必须带止盈止损限价」，避免大量纸面用例被拒。"""
+"""单测：须在导入策略引擎之前关闭商业强校验（仓库默认 COMMERCIAL_DISTRIBUTION=True）。"""
 import os
+
+import src.shark_build_profile as _shark_build_profile
+
+_shark_build_profile.COMMERCIAL_DISTRIBUTION = False
 
 import pytest
 

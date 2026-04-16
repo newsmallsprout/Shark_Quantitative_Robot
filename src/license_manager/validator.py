@@ -67,8 +67,8 @@ class LicenseValidator:
                 log.error("License expired")
                 return False
             
-            # 3. Fingerprint Check
-            current_fp = MachineFingerprint.get_fingerprint()
+            # 3. Fingerprint Check（Docker 等场景可用 SHARK_LICENSE_FINGERPRINT 与签发时指纹对齐）
+            current_fp = MachineFingerprint.get_fingerprint_for_validation()
             if license_obj.machine_fingerprint != current_fp:
                 log.error(f"Device fingerprint mismatch. License: {license_obj.machine_fingerprint}, Current: {current_fp}")
                 return False

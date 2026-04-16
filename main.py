@@ -9,6 +9,7 @@ from uvicorn import Config, Server
 
 from src.utils.logger import setup_logger, log
 from src.core.config_manager import config_manager
+from src.core.license_gate import skip_license_check
 from src.license_manager.validator import LicenseValidator
 from src.exchange.gate_gateway import GateFuturesGateway
 from src.core.state_machine import StateMachine
@@ -28,9 +29,12 @@ from src.ai.regime import MarketRegime
 
 async def start_api_server():
     """Runs the FastAPI server as an async task in the same loop"""
-    config = Config(app=api_app, host="0.0.0.0", port=8002, log_level="warning")
+    from src.api.security import get_api_bind_host
+
+    host = get_api_bind_host()
+    config = Config(app=api_app, host=host, port=8002, log_level="warning")
     server = Server(config)
-    log.info("API Server starting at http://localhost:8002")
+    log.info(f"API Server starting at http://{host}:8002 (set SHARK_API_HOST=0.0.0.0 to listen on all interfaces)")
     await server.serve()
 
 def run_ai_worker():
@@ -131,7 +135,7 @@ async def run_bot(trading_ready: Optional[asyncio.Event] = None):
     if not os.path.exists("license/public.pem"):
         log.critical(f"Public key not found at license/public.pem")
 
-    skip_lic = os.environ.get("SKIP_LICENSE_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
+    skip_lic = skip_license_check()
     validator = LicenseValidator("license/public.pem", config.license_path)
     if skip_lic:
         log.warning("SKIP_LICENSE_CHECK enabled — not for production; strategy IP is exposed.")

@@ -4,6 +4,11 @@ Build obfuscated copies of selected packages for distribution.
 
 Requires: pip install -r requirements-obfuscate.txt
 
+若需「商业发行」整包（含许可证强制、COMMERCIAL_DISTRIBUTION=True），请用:
+  python scripts/build_commercial_release.py
+
+本脚本仅做部分目录递归混淆，适合轻量保护。
+
 Example:
   python scripts/obfuscate_release.py -O dist/obfuscated
 """

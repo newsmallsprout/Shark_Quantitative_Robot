@@ -1,7 +1,9 @@
-import platform
-import uuid
 import hashlib
+import os
+import platform
 import subprocess
+import uuid
+
 import psutil
 
 class MachineFingerprint:
@@ -51,6 +53,17 @@ class MachineFingerprint:
         """
         raw_data = f"{cls.get_cpu_id()}|{cls.get_mac_address()}|{cls.get_system_uuid()}"
         return hashlib.sha256(raw_data.encode()).hexdigest()
+
+    @classmethod
+    def get_fingerprint_for_validation(cls) -> str:
+        """
+        校验许可证时使用：若设置 SHARK_LICENSE_FINGERPRINT（如 Docker 内指纹与签发机不同），
+        则与该值比对，须与 license.key 内 machine_fingerprint 字段一致。
+        """
+        override = (os.environ.get("SHARK_LICENSE_FINGERPRINT") or "").strip()
+        if override:
+            return override
+        return cls.get_fingerprint()
 
 if __name__ == "__main__":
     print(f"Fingerprint: {MachineFingerprint.get_fingerprint()}")

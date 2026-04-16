@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../apiClient';
 import { ScrollText, RefreshCw } from 'lucide-react';
 
 type TradeHistoryRow = {
@@ -110,9 +111,9 @@ export const BattleReportDeck: React.FC = () => {
     setError(null);
     try {
       const [historyRes, logsRes, resoRes] = await Promise.all([
-        fetch('/api/trade_history?limit=24&offset=0'),
-        fetch('/api/logs?limit=12&offset=0'),
-        fetch('/api/resonance_metrics'),
+        apiFetch('/api/trade_history?limit=24&offset=0'),
+        apiFetch('/api/logs?limit=12&offset=0'),
+        apiFetch('/api/resonance_metrics'),
       ]);
 
       const historyText = await historyRes.text();

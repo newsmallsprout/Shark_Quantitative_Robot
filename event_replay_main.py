@@ -40,6 +40,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 os.chdir(str(ROOT))
 os.environ.setdefault("SHARK_CONFIG_PATH", str(ROOT / "config" / "settings.yaml"))
+# 须在导入 StrategyEngine（会触发许可证）之前；发行版 COMMERCIAL_DISTRIBUTION=True 时无效
+os.environ.setdefault("SKIP_LICENSE_CHECK", "1")
 
 from src.core import event_replay_time as replay_time  # noqa: E402
 from src.core.config_manager import config_manager  # noqa: E402
@@ -476,7 +478,6 @@ def main() -> None:
         help="跳过全市场 sync_usdt_futures_physics_matrix（仅依赖各 symbol 的 quanto 预热；本地缺依赖时可加快启动）",
     )
     args = ap.parse_args()
-    os.environ.setdefault("SKIP_LICENSE_CHECK", "1")
     raise SystemExit(asyncio.run(_run(args)))
 
 

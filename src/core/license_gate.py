@@ -17,6 +17,16 @@ from src.utils.logger import log
 
 
 def skip_license_check() -> bool:
+    """
+    发行版（COMMERCIAL_DISTRIBUTION=True）下永不跳过，忽略 SKIP_LICENSE_CHECK。
+    """
+    try:
+        from src.shark_build_profile import COMMERCIAL_DISTRIBUTION
+
+        if COMMERCIAL_DISTRIBUTION:
+            return False
+    except Exception:
+        pass
     return os.environ.get("SKIP_LICENSE_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -84,6 +94,7 @@ def license_status_payload() -> Dict[str, Any]:
         "message": msg,
         "hint_zh": (
             "本终端需要创作者签发的许可证（license/license.key）与公钥 license/public.pem。"
-            "若您从源码克隆运行，请联系创作者获取授权；开发者可设置 SKIP_LICENSE_CHECK=1。"
+            "Docker 内设备指纹与宿主机不同：可在环境变量设置 SHARK_LICENSE_FINGERPRINT=许可证内 machine_fingerprint 字段值。"
+            "开发者可设置 SKIP_LICENSE_CHECK=1。"
         ),
     }

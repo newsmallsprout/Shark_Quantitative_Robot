@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, UploadFile, File, WebSocket, WebSocketDisconnect, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from starlette.requests import Request
 from src.core.config_manager import config_manager
 from src.utils.logger import log
 from src.ai.scorer import ai_scorer
@@ -10,6 +11,7 @@ from src.config import SystemState
 from src.core.risk_engine import berserker_max_leverage_for_symbol, risk_engine
 from src.strategy.tuner import strategy_auto_tuner
 import os
+import re
 import shutil
 import json
 import asyncio
@@ -17,6 +19,16 @@ import time
 import math
 from typing import Optional, Any, List, Tuple, Dict
 from collections import Counter
+
+from src.api.security import (
+    get_expected_api_token,
+    redact_sensitive_config,
+    sanitize_dir_for_api,
+    validate_candle_interval,
+    validate_perp_symbol,
+)
+
+_MAX_LICENSE_UPLOAD_BYTES = 64 * 1024
 
 
 def _json_safe(obj):
@@ -40,6 +52,34 @@ class SafeJSONResponse(JSONResponse):
 
 
 app = FastAPI(title="Gate Attack Bot Config Center", default_response_class=SafeJSONResponse)
+
+
+@app.middleware("http")
+async def shark_api_auth_middleware(request: Request, call_next):
+    """
+    若设置 SHARK_API_TOKEN，则所有 /api/* 请求需带 Authorization: Bearer（/api/health 与 OPTIONS 除外）。
+    与前端 apiFetch / VITE_SHARK_API_TOKEN 配合。
+    """
+    tok = get_expected_api_token()
+    if not tok:
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    p = request.url.path
+    if p == "/api/health":
+        return await call_next(request)
+    if not p.startswith("/api"):
+        return await call_next(request)
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer ") or auth[7:].strip() != tok:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/api/health")
+async def api_health():
+    """负载均衡 / 探活；不要求 Bearer。"""
+    return {"ok": True}
 
 
 def _system_state_to_ui_mode(state: SystemState) -> str:
@@ -76,6 +116,10 @@ ws_manager = ConnectionManager()
 
 @app.websocket("/ws/market_data")
 async def websocket_endpoint(websocket: WebSocket):
+    tok = get_expected_api_token()
+    if tok and websocket.query_params.get("token") != tok:
+        await websocket.close(code=1008)
+        return
     await ws_manager.connect(websocket)
     try:
         while True:
@@ -606,7 +650,7 @@ async def get_fee_schedule(symbol: Optional[str] = Query(None)):
         "With symbol=, resolved_* uses Gate contract_specs_cache after sync.",
     }
     if symbol and str(symbol).strip():
-        sym = str(symbol).strip()
+        sym = validate_perp_symbol(str(symbol).strip())
         tk, mk = paper_engine._fee_rates_for_symbol(sym)
         base["symbol"] = sym
         base["resolved_taker_fee_rate"] = tk
@@ -618,14 +662,15 @@ async def get_fee_schedule(symbol: Optional[str] = Query(None)):
 
 @app.get("/api/config")
 async def get_config():
-    """Get current configuration"""
-    return config_manager.get_config().model_dump()
+    """Get current configuration (secrets redacted — never returns raw API keys)."""
+    raw = config_manager.get_config().model_dump()
+    return redact_sensitive_config(raw)
 
 @app.post("/api/config/exchange")
 async def update_exchange(
-    api_key: str = Body(..., embed=True), 
+    api_key: str = Body(..., embed=True),
     api_secret: str = Body(..., embed=True),
-    sandbox_mode: bool = Body(False, embed=True)
+    sandbox_mode: bool = Body(False, embed=True),
 ):
     """Update Exchange API Keys"""
     try:
@@ -665,16 +710,18 @@ async def update_strategy(strategy_settings: dict):
 async def upload_license(file: UploadFile = File(...)):
     """Upload new license file"""
     try:
-        # Ensure directory exists
         os.makedirs("license", exist_ok=True)
         file_path = "license/license.key"
-        
+        data = await file.read(_MAX_LICENSE_UPLOAD_BYTES + 1)
+        if len(data) > _MAX_LICENSE_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="License file too large")
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
+            buffer.write(data)
+
         log.info("New license uploaded via API")
-        # Here you might want to trigger a reload/re-validation
         return {"status": "success", "message": "License uploaded successfully. Please restart bot."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -790,7 +837,9 @@ async def get_candles(
     exchange = bot_context.get_exchange()
     if not exchange or not hasattr(exchange, "fetch_candlesticks"):
         return []
-    return await exchange.fetch_candlesticks(symbol, interval=interval, limit=limit)
+    sym = validate_perp_symbol(symbol)
+    iv = validate_candle_interval(interval)
+    return await exchange.fetch_candlesticks(sym, interval=iv, limit=limit)
 
 
 @app.get("/api/footprint")
@@ -805,12 +854,13 @@ async def get_footprint(
     """
     from src.core import l1_fast_loop
 
-    return l1_fast_loop.footprint_snapshot(symbol, max_bars=bars, max_levels_per_bar=levels)
+    sym = validate_perp_symbol(symbol)
+    return l1_fast_loop.footprint_snapshot(sym, max_bars=bars, max_levels_per_bar=levels)
 
 
 @app.get("/api/resonance_metrics")
 async def get_resonance_metrics(
-    symbol: str | None = Query(None, description="Dashboard active symbol, e.g. BTC/USDT"),
+    symbol: Optional[str] = Query(None, description="Dashboard active symbol, e.g. BTC/USDT"),
 ):
     """Get Real-time Resonance and Risk Metrics for the Dashboard"""
     engine = bot_context.get_strategy_engine()
@@ -885,7 +935,8 @@ async def get_resonance_metrics(
         return metrics
 
     sym_list = config_manager.get_config().strategy.symbols
-    sym0 = symbol or (sym_list[0] if sym_list else "")
+    raw_sym = (symbol or (sym_list[0] if sym_list else "")).strip()
+    sym0 = validate_perp_symbol(raw_sym) if raw_sym else ""
 
     # 1. Fetch OBI & Tech from CoreAttackStrategy if active
     attack_strategy = next((s for s in engine.strategies if s.name == "CoreAttack"), None)
@@ -947,7 +998,7 @@ async def get_resonance_metrics(
 
 @app.get("/api/market_analysis")
 async def get_market_analysis(
-    symbol: str | None = Query(None, description="e.g. BTC/USDT; defaults to first configured symbol"),
+    symbol: Optional[str] = Query(None, description="e.g. BTC/USDT; defaults to first configured symbol"),
 ):
     """Get Real-time AI Analysis"""
     exchange = bot_context.get_exchange()
@@ -956,6 +1007,7 @@ async def get_market_analysis(
 
     syms = config_manager.get_config().strategy.symbols
     symbol = symbol or (syms[0] if syms else "BTC/USDT")
+    symbol = validate_perp_symbol(symbol)
     ticker = await exchange.fetch_ticker(symbol)
     
     if not ticker:
@@ -1038,7 +1090,7 @@ async def get_trade_history(
         total = int(summary.get("total_count") or 0)
         return {
             "items": items,
-            "source_dir": d,
+            "source_dir": sanitize_dir_for_api(d),
             "summary": summary,
             "offset": offset,
             "limit": limit,
@@ -1063,8 +1115,11 @@ async def get_trade_history(
             "limit": 0,
             "total_count": 0,
             "has_more": False,
-            "detail": f"Internal Server Error: {e}",
+            "detail": "trade_history_unavailable",
         }
+
+
+_TRADE_HISTORY_FILENAME = re.compile(r"^[\w.-]+\.json$", re.UNICODE)
 
 
 @app.get("/api/trade_history/detail")
@@ -1072,7 +1127,7 @@ async def get_trade_history_detail(file: str = Query(..., min_length=1, max_leng
     """单条战报全文（含 entry_snapshot）；file 仅允许 basename。"""
 
     safe = os.path.basename(file)
-    if not safe.endswith(".json") or ".." in file:
+    if not _TRADE_HISTORY_FILENAME.match(safe):
         raise HTTPException(status_code=400, detail="invalid file")
     d = config_manager.get_config().darwin.autopsy_dir
     path = os.path.join(d, safe)
@@ -1086,7 +1141,7 @@ async def get_trade_history_detail(file: str = Query(..., min_length=1, max_leng
     row = _autopsy_item_from_raw(raw, safe, include_heavy=True)
     if not row:
         raise HTTPException(status_code=404, detail="not a trade autopsy")
-    return {"item": row, "source_dir": d}
+    return {"item": row, "source_dir": sanitize_dir_for_api(d)}
 
 
 @app.get("/api/account_info")

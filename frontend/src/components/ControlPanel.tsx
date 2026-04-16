@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { apiFetch } from '../apiClient';
 import { useStore } from '../store/useStore';
 import type { SystemMode } from '../store/useStore';
 import { AlertOctagon, Settings2, ShieldCheck, Zap, ActivitySquare, AlertTriangle, Flame } from 'lucide-react';
@@ -10,7 +11,7 @@ const ControlPanel: React.FC = () => {
   const handleModeChange = async (newMode: SystemMode) => {
     if (newMode === mode || newMode === 'HALTED') return;
     try {
-      const res = await fetch('/api/control', {
+      const res = await apiFetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'SET_TRADING_MODE', mode: newMode }),

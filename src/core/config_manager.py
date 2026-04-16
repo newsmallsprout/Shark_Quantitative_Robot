@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import yaml
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
@@ -884,13 +885,22 @@ class ConfigManager:
 
     def save_config(self):
         try:
-            os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
-            with open(self._config_path, 'w') as f:
-                if self._config_path.endswith('.yaml') or self._config_path.endswith('.yml'):
-                    # Convert model to dict first, then dump to yaml
-                    yaml.dump(self.config.model_dump(), f, default_flow_style=False)
-                else:
-                    f.write(self.config.model_dump_json(indent=2))
+            dir_name = os.path.dirname(self._config_path) or "."
+            os.makedirs(dir_name, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix=".settings_", suffix=".tmp", dir=dir_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                    if self._config_path.endswith(".yaml") or self._config_path.endswith(".yml"):
+                        yaml.dump(self.config.model_dump(), f, default_flow_style=False)
+                    else:
+                        f.write(self.config.model_dump_json(indent=2))
+                os.replace(tmp_path, self._config_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
             log.info("Configuration saved.")
         except OSError as e:
             log.error(f"Failed to save config: {e}")

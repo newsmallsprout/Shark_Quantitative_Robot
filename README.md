@@ -95,13 +95,54 @@ npm run dev
 
 若缺少 `settings.yaml`，配置管理器会回退加载模板并记录日志。**切勿**将真实密钥提交公共仓库。
 
-## Docker
+## Docker（推荐：Nginx + 应用 + Redis）
+
+架构：**宿主机 → Nginx:80 → `shark-quant:8002`（FastAPI + 静态前端）**；Python 不映射到宿主机端口，仅内网 `expose`。Redis 仅容器网络内可访问。
 
 ```bash
+cp .env.example .env
+# 编辑 .env：生产务必设置 SHARK_API_TOKEN（openssl rand -hex 32），SKIP_LICENSE_CHECK=0
+cp config/settings.model.yaml config/settings.yaml
+# 编辑 settings.yaml：交易所密钥等
 docker compose up -d --build
 ```
 
-浏览器访问 **http://localhost:8002**；日志可用 `docker logs -f shark-quant-bot`，若已映射 `./logs/` 可在宿主机查看。
+- 构建镜像需要 **`license/public.pem`** 存在于项目目录（私钥勿提交；见 `.dockerignore`）。
+- **许可证指纹**：在**宿主机**签发的 `license.key` 与 **Docker 容器内**算出的设备指纹不同。解决：在 `.env` 设置 **`SHARK_LICENSE_FINGERPRINT=`** 为 `license.key` 里 **`machine_fingerprint` 字段**（与签发时机器一致），或改用 **`SKIP_LICENSE_CHECK=1`** 仅作开发。
+- 浏览器访问：**http://localhost**（或 `.env` 里 `SHARK_HTTP_PORT` 指定的端口），**不要**再访问 `:8002`。
+- 日志：`docker logs -f shark-quant-bot`；宿主机 `./logs/` 已映射。
+- **修改 `SHARK_API_TOKEN` 后需重新 `docker compose build --no-cache` 再 up**（令牌同时打进前端）。
+- 可选：在 `docker/nginx/default.conf` 上自行增加 `listen 443 ssl` 与证书挂载（HTTPS）。
+
+## 商业发行（混淆 / 强制许可证）
+
+仓库默认 **`src/shark_build_profile.py` 中 `COMMERCIAL_DISTRIBUTION=True`**：运行主程序时**不承认 `SKIP_LICENSE_CHECK`**（单测在 `tests/conftest.py` 内临时改回 `False`，仅 pytest 进程）。
+
+**完整交付说明**见 **`docs/客户交付手册.md`**（发行方与客户分工、GitHub Releases、许可证签发）。本地检查清单：**`delivery/本地发行检查清单.md`**。
+
+**生成混淆包**（需 PyArmor 正式许可或受试用限制；大项目试用可能报 `out of license`）：
+
+```bash
+pip install -r requirements-obfuscate.txt
+# 确保 PATH 含 pyarmor 可执行文件
+python scripts/build_commercial_release.py -O dist/commercial_obfuscated
+bash scripts/package_customer_release.sh
+```
+
+**Docker 一体镜像**：
+
+```bash
+docker build -f Dockerfile.commercial -t shark-quant:commercial .
+```
+
+说明：混淆与强校验无法做到绝对不可破解；私钥仅用于签发，切勿随镜像泄露。
+
+## 本地 API 与安全
+
+- **裸跑** `python main.py` 时默认仅绑定 **127.0.0.1:8002**；**Docker** 内由 **`SHARK_API_HOST=0.0.0.0`** 监听，对外仅经 **Nginx**。
+- **`GET /api/config`** 响应中的交易所密钥、LLM Key 等已 **脱敏**，不会返回明文。
+- 可选加固：设置 **`SHARK_API_TOKEN`**，并在前端配置 **`VITE_SHARK_API_TOKEN`**（与后端一致）。设置后 **所有 `/api/*`**（除 **`GET /api/health`** 探活）需在请求头携带 `Authorization: Bearer <token>`；WebSocket **`/ws/market_data`** 通过查询参数 **`?token=`** 传递同一令牌（由前端 `initWebSocket` 自动拼接）。
+- **`GET /api/health`**：无需鉴权，供负载均衡或探活使用。
 
 ## 策略控制面 — 术语与主参数
 

@@ -104,7 +104,9 @@ class StateMachine:
 
         # 1. License Check (High Priority)
         now = time.time()
-        skip_license = os.environ.get("SKIP_LICENSE_CHECK", "").lower() in ("1", "true", "yes")
+        from src.core.license_gate import skip_license_check
+
+        skip_license = skip_license_check()
         if skip_license:
             self.last_license_check = now
         elif now - self.last_license_check > 3600:  # Check every hour

@@ -1,0 +1,14 @@
+# 使用 HTTPS 时：准备 fullchain.pem / privkey.pem，在 docker-compose 的 nginx 服务中增加挂载：
+#   volumes:
+#     - ./docker/nginx/ssl/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
+#     - ./docker/nginx/ssl/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
+# 再将下面 server 块合并进 default.conf，或作为 conf.d/extra.conf 挂载。
+
+# server {
+#     listen 443 ssl;
+#     http2 on;
+#     ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+#     ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+#     ssl_protocols       TLSv1.2 TLSv1.3;
+#     # ... 其余 location 与 default.conf 中 listen 80 的 server 相同 ...
+# }

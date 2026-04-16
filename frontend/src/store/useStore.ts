@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { apiFetch } from '../apiClient';
 
 export type SystemMode = 'NEUTRAL' | 'ATTACK' | 'BERSERKER' | 'HALTED';
 
@@ -402,7 +403,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   fetchContractSpecs: async () => {
     try {
-      const response = await fetch('/api/contract_specs');
+      const response = await apiFetch('/api/contract_specs');
       const data = await response.json();
       if (!data || typeof data !== 'object') return;
       const merged: Record<string, ContractSpecRow> = { ...(get().contractSpecs || {}) };
@@ -430,12 +431,12 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const activeSym = encodeURIComponent(get().activeSymbol);
       const [cfgRes, accRes, specRes, resRes, statusRes, maRes] = await Promise.all([
-        fetch('/api/config'),
-        fetch('/api/account_info'),
-        fetch('/api/contract_specs'),
-        fetch(`/api/resonance_metrics?symbol=${activeSym}`),
-        fetch('/api/status'),
-        fetch(`/api/market_analysis?symbol=${activeSym}`),
+        apiFetch('/api/config'),
+        apiFetch('/api/account_info'),
+        apiFetch('/api/contract_specs'),
+        apiFetch(`/api/resonance_metrics?symbol=${activeSym}`),
+        apiFetch('/api/status'),
+        apiFetch(`/api/market_analysis?symbol=${activeSym}`),
       ]);
 
       const cfg = cfgRes.ok ? await cfgRes.json() : null;
@@ -748,7 +749,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     (async () => {
       try {
-        const response = await fetch('/api/config');
+        const response = await apiFetch('/api/config');
         const cfg = await response.json();
         const syms = cfg?.strategy?.symbols as string[] | undefined;
         if (syms?.length) {
@@ -765,7 +766,9 @@ export const useStore = create<AppState>((set, get) => ({
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const ws = new WebSocket(`${protocol}//${host}/ws/market_data`);
+    const tok = (import.meta.env.VITE_SHARK_API_TOKEN as string | undefined)?.trim();
+    const qs = tok ? `?token=${encodeURIComponent(tok)}` : '';
+    const ws = new WebSocket(`${protocol}//${host}/ws/market_data${qs}`);
     marketWs = ws;
 
     ws.onmessage = (event) => {
@@ -934,7 +937,7 @@ export const useStore = create<AppState>((set, get) => ({
         },
       }));
 
-      const response = await fetch('/api/control', {
+      const response = await apiFetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'KILL_SWITCH' }),

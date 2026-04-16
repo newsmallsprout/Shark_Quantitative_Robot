@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { apiFetch } from '../apiClient';
 import { History, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 
 export interface TradeHistoryRow {
@@ -99,7 +100,7 @@ const TradeHistoryPage: React.FC = () => {
     setError(null);
     try {
       const offset = pageIndex * PAGE_SIZE;
-      const res = await fetch(`/api/trade_history?limit=${PAGE_SIZE}&offset=${offset}&include_entry_snapshot=0`);
+      const res = await apiFetch(`/api/trade_history?limit=${PAGE_SIZE}&offset=${offset}&include_entry_snapshot=0`);
       const text = await res.text();
       let data: {
         items?: TradeHistoryRow[];
@@ -138,7 +139,7 @@ const TradeHistoryPage: React.FC = () => {
 
   const openDetail = useCallback(async (file: string) => {
     try {
-      const res = await fetch(`/api/trade_history/detail?file=${encodeURIComponent(file)}`);
+      const res = await apiFetch(`/api/trade_history/detail?file=${encodeURIComponent(file)}`);
       const data = (await res.json()) as { item?: TradeHistoryRow };
       if (data.item) {
         setDetailCache((p) => ({ ...p, [file]: data.item! }));

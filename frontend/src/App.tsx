@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiFetch } from './apiClient';
 import { StarshipDashboard } from './components/starship/StarshipDashboard';
 import TradeHistoryPage from './components/TradeHistoryPage';
 import { LicenseOverlay, type LicenseStatusPayload } from './components/LicenseOverlay';
@@ -14,7 +15,7 @@ function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const res = await fetch('/api/license/status');
+        const res = await apiFetch('/api/license/status');
         if (!res.ok) {
           setLicenseFetchError(`许可证接口返回 ${res.status}`);
           setLicensePayload(null);

@@ -1,0 +1,48 @@
+# 商业发行镜像：PyArmor 混淆整包 src + main.py（COMMERCIAL_DISTRIBUTION=True）
+# 构建: docker build -f Dockerfile.commercial -t shark-quant:commercial .
+# 发行版忽略 SKIP_LICENSE_CHECK，须有效 license.key
+#
+# 运行示例见 README「商业发行」；需挂载 config/settings.yaml、license/
+
+FROM python:3.11-slim AS obfuscator
+WORKDIR /build
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    libzmq3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements-obfuscate.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-obfuscate.txt
+
+COPY main.py ./
+COPY src ./src
+COPY scripts/build_commercial_release.py ./scripts/
+RUN mkdir -p /out && python scripts/build_commercial_release.py -O /out
+
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    libzmq3-dev \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir "pyarmor>=8.5,<10"
+
+COPY --from=obfuscator /out/ ./
+COPY config/ ./config/
+COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+RUN mkdir -p license logs
+COPY license/public.pem /app/license/public.pem
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+EXPOSE 8002 5555
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["python3", "main.py"]
