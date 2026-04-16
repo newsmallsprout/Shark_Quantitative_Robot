@@ -1833,15 +1833,21 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         return
 
     def runtime_status(self) -> Dict[str, Any]:
-        anchor = str(self._cfg().anchor_symbol)
+        cfg = self._cfg()
+        anchor = str(cfg.anchor_symbol)
+        floor_tp = float(getattr(cfg, "leg_micro_dynamic_floor_usdt", getattr(cfg, "leg_micro_take_usdt", 1.0)) or 1.0)
+        loss_cap = float(getattr(cfg, "decoupled_margin_loss_cap", 0.8) or 0.8)
         return {
-            "enabled": bool(self._cfg().enabled),
+            "enabled": bool(cfg.enabled),
             "anchor_symbol": anchor,
+            "leg_micro_dynamic_floor_usdt": floor_tp,
+            "leg_micro_take_usdt": float(cfg.leg_micro_take_usdt),
+            "decoupled_margin_loss_cap": loss_cap,
             "anchor_notional_delta": float(self._anchor_notional_delta),
             "anchor_deadband_threshold": float(self._anchor_deadband_threshold),
             "anchor_rebalance_suppressed": bool(self._anchor_rebalance_suppressed),
             "last_expected_tp_vs_cost": float(self._last_expected_tp_vs_cost),
-            "configured_leverage": int(self._cfg().pair_leverage),
+            "configured_leverage": int(cfg.pair_leverage),
             "tracked_symbols": list(self._alpha_symbols()),
             "active_pairs": [
                 {
@@ -1854,7 +1860,13 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                     "corr": float(pair.get("corr", 0.0) or 0.0),
                     "effective_leverage": int(pair.get("effective_leverage", self._effective_pair_leverage(str(pair["alt"]), anchor))),
                     "net_pnl_usdt": float(pair.get("net_pnl_usdt", self._pair_net_pnl(pair)) or 0.0),
-                    "leg_micro_take_usdt": float(self._cfg().leg_micro_take_usdt),
+                    "leg_micro_take_usdt": float(cfg.leg_micro_take_usdt),
+                    "dynamic_take_profit_usdt": floor_tp,
+                    "profit_lock_floor_usdt": floor_tp,
+                    "dynamic_stop_loss_usdt": float(pair.get("pair_allocated_margin_usdt", 0.0) or 0.0) * loss_cap
+                    if float(pair.get("pair_allocated_margin_usdt", 0.0) or 0.0) > 0
+                    else float(cfg.pair_margin_usdt) * loss_cap,
+                    "dynamic_cost_threshold_usdt": float(pair.get("absolute_cost_usdt", 0.0) or 0.0),
                     "estimated_close_fee_usdt": float(pair.get("estimated_close_fee_usdt", 0.0) or 0.0),
                     "display_alt_tp_price": float(pair.get("display_alt_tp_price", 0.0) or 0.0),
                     "display_alt_sl_price": float(pair.get("display_alt_sl_price", 0.0) or 0.0),

@@ -100,6 +100,11 @@ export interface ResonanceMetrics {
     enabled: boolean;
     anchor_symbol: string;
     configured_leverage: number;
+    /** settings.yaml beta_neutral_hf.leg_micro_dynamic_floor_usdt */
+    leg_micro_dynamic_floor_usdt?: number;
+    leg_micro_take_usdt?: number;
+    /** 脱钩腿浮亏占保证金比例上限 */
+    decoupled_margin_loss_cap?: number;
     tracked_symbols: string[];
     active_pairs: Array<{
       pair_id: string;
@@ -111,10 +116,10 @@ export interface ResonanceMetrics {
       corr: number;
       effective_leverage: number;
       net_pnl_usdt: number;
-      dynamic_cost_threshold_usdt: number;
-      dynamic_take_profit_usdt: number;
-      dynamic_stop_loss_usdt: number;
-      profit_lock_floor_usdt: number;
+      dynamic_cost_threshold_usdt?: number;
+      dynamic_take_profit_usdt?: number;
+      dynamic_stop_loss_usdt?: number;
+      profit_lock_floor_usdt?: number;
       close_reason: string;
     }>;
     candidate_pairs: Array<{
@@ -353,6 +358,9 @@ export const useStore = create<AppState>((set, get) => ({
       enabled: false,
       anchor_symbol: 'BTC/USDT',
       configured_leverage: 0,
+      leg_micro_dynamic_floor_usdt: 0,
+      leg_micro_take_usdt: 0,
+      decoupled_margin_loss_cap: 0,
       tracked_symbols: [],
       active_pairs: [],
       candidate_pairs: [],
@@ -580,6 +588,9 @@ export const useStore = create<AppState>((set, get) => ({
                   enabled: Boolean(bn.enabled),
                   anchor_symbol: String(bn.anchor_symbol ?? 'BTC/USDT'),
                   configured_leverage: Number(bn.configured_leverage ?? 0),
+                  leg_micro_dynamic_floor_usdt: Number(bn.leg_micro_dynamic_floor_usdt ?? 0),
+                  leg_micro_take_usdt: Number(bn.leg_micro_take_usdt ?? 0),
+                  decoupled_margin_loss_cap: Number(bn.decoupled_margin_loss_cap ?? 0),
                   tracked_symbols: Array.isArray(bn.tracked_symbols) ? (bn.tracked_symbols as string[]) : [],
                   active_pairs: Array.isArray(bn.active_pairs)
                     ? (bn.active_pairs as ResonanceMetrics['beta_neutral_hf']['active_pairs'])

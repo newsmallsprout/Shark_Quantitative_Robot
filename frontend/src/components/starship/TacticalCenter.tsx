@@ -158,6 +158,18 @@ export const TacticalCenter: React.FC<{ compact?: boolean }> = ({ compact = fals
               {resonanceMetrics.beta_neutral_hf.anchor_target_contracts.toFixed(3)}
             </span>
           </div>
+          {(resonanceMetrics.beta_neutral_hf.leg_micro_dynamic_floor_usdt ?? 0) > 0 ||
+          (resonanceMetrics.beta_neutral_hf.decoupled_margin_loss_cap ?? 0) > 0 ? (
+            <p className="text-[10px] text-slate-600 mt-1.5 leading-snug">
+              配置：微利止盈净利地板 ≥{' '}
+              {(resonanceMetrics.beta_neutral_hf.leg_micro_dynamic_floor_usdt ??
+                resonanceMetrics.beta_neutral_hf.leg_micro_take_usdt ??
+                0
+              ).toFixed(2)}{' '}
+              USDT · 脱钩腿浮亏上限 ≈ 保证金 ×{' '}
+              {((resonanceMetrics.beta_neutral_hf.decoupled_margin_loss_cap ?? 0) * 100).toFixed(0)}%
+            </p>
+          ) : null}
           {resonanceMetrics.beta_neutral_hf.candidate_pairs.length > 0 ? (
             <div className="mt-2 space-y-1 text-[10px] font-mono">
               {resonanceMetrics.beta_neutral_hf.candidate_pairs.slice(0, compact ? 3 : 5).map((p) => (
@@ -176,6 +188,14 @@ export const TacticalCenter: React.FC<{ compact?: boolean }> = ({ compact = fals
                   持仓 {p.alt} · {p.effective_leverage}x · z {Number(p.live_zscore).toFixed(2)} · 净{' '}
                   {p.net_pnl_usdt >= 0 ? '+' : ''}
                   {Number(p.net_pnl_usdt).toFixed(3)}
+                  {(p.dynamic_take_profit_usdt != null && p.dynamic_take_profit_usdt > 0) ||
+                  (p.dynamic_stop_loss_usdt != null && p.dynamic_stop_loss_usdt > 0) ? (
+                    <>
+                      {' '}
+                      · 止盈≥{Number(p.dynamic_take_profit_usdt).toFixed(2)}U · 止损≈
+                      {Number(p.dynamic_stop_loss_usdt).toFixed(2)}U
+                    </>
+                  ) : null}
                 </div>
               ))}
             </div>
