@@ -11,3 +11,4 @@ license/*
 frontend/node_modules/
 frontend/dist/
 config/settings.yaml
+.ide/

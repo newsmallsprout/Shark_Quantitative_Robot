@@ -2,7 +2,7 @@
 
 # Shark Quantitative Robot
 
-### 机构级加密永续情报终端 · Gate.io USDT 永续
+###  Gate.io USDT 永续
 
 *分层风控 · 可配置编排 · 可观测状态*
 
