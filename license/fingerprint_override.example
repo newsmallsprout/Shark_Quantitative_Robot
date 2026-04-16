@@ -1,0 +1,5 @@
+# 用法：复制为同目录 fingerprint_override，删除所有以 # 开头的行，
+# 或只保留一行 64 位 hex（须与 license.key 的 machine_fingerprint、日志里 License: 后一致）。
+# Docker 挂载 ./license 时放入该文件即可，无需环境变量 SHARK_LICENSE_FINGERPRINT。
+
+8c8adcaec282d4a92fcfb66af1e011fac21aaaabaf5534893b390bb81cb8456b

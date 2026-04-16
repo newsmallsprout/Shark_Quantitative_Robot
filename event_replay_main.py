@@ -45,6 +45,10 @@ os.environ.setdefault("SKIP_LICENSE_CHECK", "1")
 
 from src.core import event_replay_time as replay_time  # noqa: E402
 from src.core.config_manager import config_manager  # noqa: E402
+from src.core.license_gate import assert_strategy_runtime_allowed  # noqa: E402
+
+assert_strategy_runtime_allowed()
+
 from src.core.globals import bot_context  # noqa: E402
 from src.core.l1_fast_loop import reset_buffers_for_replay  # noqa: E402
 from src.core.paper_engine import paper_engine  # noqa: E402

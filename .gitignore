@@ -8,6 +8,7 @@ logs/
 data/
 license/*
 !license/public.pem
+!license/fingerprint_override.example
 frontend/node_modules/
 frontend/dist/
 dist/
@@ -15,3 +16,4 @@ config/settings.yaml
 .ide/
 docs/
 delivery/
+tests/

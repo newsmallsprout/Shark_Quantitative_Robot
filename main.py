@@ -1,5 +1,4 @@
 import asyncio
-import sys
 import os
 import multiprocessing
 from pathlib import Path
@@ -9,11 +8,10 @@ from uvicorn import Config, Server
 
 from src.utils.logger import setup_logger, log
 from src.core.config_manager import config_manager
-from src.core.license_gate import skip_license_check
+from src.core.license_gate import assert_strategy_runtime_allowed, skip_license_check
 from src.license_manager.validator import LicenseValidator
 from src.exchange.gate_gateway import GateFuturesGateway
 from src.core.state_machine import StateMachine
-from src.strategy.engine import StrategyEngine
 from src.api.server import app as api_app
 from src.ai.analyzer import MarketAnalyzer, ai_context
 from src.core.globals import bot_context
@@ -122,29 +120,17 @@ async def run_bot(trading_ready: Optional[asyncio.Event] = None):
     setup_logger()
     log.info("Starting Gate Attack Quant Bot V2.4 (Isolated AI Process)...")
     
-    # 0. Load Config
+    # 0. Load Config + License（在导入 StrategyEngine 之前，避免无效许可证时仍加载巨大依赖）
     config = config_manager.get_config()
-    from src.core.paper_engine import paper_engine as paper_engine_singleton
-
-    paper_engine_singleton.apply_config_fees()
-
-    # 1. License Check
-    if not os.path.exists(config.license_path):
-        log.critical(f"License file not found at {config.license_path}")
-
-    if not os.path.exists("license/public.pem"):
-        log.critical(f"Public key not found at license/public.pem")
-
+    assert_strategy_runtime_allowed()
     skip_lic = skip_license_check()
     validator = LicenseValidator("license/public.pem", config.license_path)
     if skip_lic:
         log.warning("SKIP_LICENSE_CHECK enabled — not for production; strategy IP is exposed.")
-    elif not os.path.exists("license/public.pem") or not os.path.exists(config.license_path):
-        log.critical("License or public key missing. Place license/public.pem and license/license.key, or set SKIP_LICENSE_CHECK=1 for dev only.")
-        sys.exit(1)
-    elif not validator.validate():
-        log.critical("License validation failed (signature, expiry, or machine fingerprint).")
-        sys.exit(1)
+
+    from src.core.paper_engine import paper_engine as paper_engine_singleton
+
+    paper_engine_singleton.apply_config_fees()
 
     # 2. Initialize Risk Control Engine
     log.info("Risk Control Engine Initialized.")
@@ -167,7 +153,9 @@ async def run_bot(trading_ready: Optional[asyncio.Event] = None):
         testnet=testnet,
         use_paper_trading=True,
     )
-    
+
+    from src.strategy.engine import StrategyEngine
+
     strategy_engine = StrategyEngine(exchange, state_machine)
     
     exchange.on_tick = strategy_engine.process_ws_tick

@@ -38,9 +38,9 @@ from src.strategy.tuner import (
     strategy_auto_tuner,
 )
 from src.data.market_oracle import MarketOracle
-from src.core.license_gate import assert_strategy_runtime_allowed
 
-assert_strategy_runtime_allowed()
+# 许可证门禁在 main.py 于加载配置后、导入本模块前调用 assert_strategy_runtime_allowed()，
+# 避免导入副作用导致进程在健康检查前就退出（Docker 无限重启、无法 exec 排查）。
 
 
 def _norm_symbol_key(s: str) -> str:

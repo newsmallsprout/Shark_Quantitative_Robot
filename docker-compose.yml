@@ -6,6 +6,11 @@
 #   docker compose up -d --build
 #
 # 访问：http://localhost （经 Nginx，不要直连 8002）
+#
+# 排查（许可证失败时主进程退出 → 容器反复重启 → docker exec 报「restarting」）：
+#   docker logs shark-quant-bot --tail 150
+#   不启动 main、仅查看挂载（与 compose 相同卷）：
+#   docker compose run --rm --no-deps --entrypoint /bin/sh shark-quant -c "ls -la /app/license; wc -c /app/license/fingerprint_override 2>/dev/null || true"
 
 services:
   nginx:
@@ -27,7 +32,6 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # 与 SHARK_API_TOKEN 一致，打进前端包（改令牌后需重新 build）
         VITE_SHARK_API_TOKEN: ${SHARK_API_TOKEN:-}
     image: shark-quant:latest
     container_name: shark-quant-bot
@@ -43,7 +47,6 @@ services:
       SHARK_API_HOST: "0.0.0.0"
       SHARK_API_TOKEN: ${SHARK_API_TOKEN:-}
       SKIP_LICENSE_CHECK: ${SKIP_LICENSE_CHECK:-0}
-      # 与 license.key 内 machine_fingerprint 一致（宿主机签发、Docker 跑时必填）
       SHARK_LICENSE_FINGERPRINT: ${SHARK_LICENSE_FINGERPRINT:-}
       TZ: ${TZ:-UTC}
     depends_on:
