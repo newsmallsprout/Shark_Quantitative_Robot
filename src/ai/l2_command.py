@@ -46,6 +46,9 @@ def rank_universe_symbols(
     change_multiplier_cap: float = 3.0,
     funding_scale: float = 800.0,
     funding_cap_mult: float = 1.5,
+    hl_vol_weight: float = 0.0,
+    hl_vol_bps_divisor: float = 180.0,
+    hl_vol_score_cap: float = 2.2,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     以 24h 计价成交额 + 涨跌幅异动 为启发式排序（无历史快照时的「突增」代理）。
@@ -57,6 +60,9 @@ def rank_universe_symbols(
     ch_cap = max(float(change_multiplier_cap), 0.0)
     fscale = max(float(funding_scale), 0.0)
     fcap = max(float(funding_cap_mult), 0.0)
+    hl_w = max(float(hl_vol_weight), 0.0)
+    hl_div = max(float(hl_vol_bps_divisor), 1e-6)
+    hl_cap = max(float(hl_vol_score_cap), 0.0)
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -77,9 +83,26 @@ def rank_universe_symbols(
             fr = float(r.get("funding_rate", 0) or 0)
         except (TypeError, ValueError):
             fr = 0.0
-        # 高成交 + 波动更大者优先（参数可调，热门山寨可调小 divisor）
-        score = vq * (1.0 + min(abs(chg) / div, ch_cap)) * (1.0 + min(abs(fr) * fscale, fcap))
-        scored.append((score, sym, {"vq": vq, "chg": chg, "fr": fr}))
+        hl_bps = 0.0
+        hl_mult = 1.0
+        if hl_w > 1e-12:
+            try:
+                hi = float(r.get("high_24h", r.get("high_24h_quote", r.get("high", 0))) or 0.0)
+                lo = float(r.get("low_24h", r.get("low_24h_quote", r.get("low", 0))) or 0.0)
+                mark = float(r.get("mark_price", r.get("last", 0)) or 0)
+            except (TypeError, ValueError):
+                hi = lo = mark = 0.0
+            if mark > 0 and hi > lo >= 0:
+                hl_bps = (hi - lo) / mark * 1e4
+                hl_mult = 1.0 + hl_w * min(hl_bps / hl_div, hl_cap)
+        # 高成交 + 波动更大者优先；可选 24h 高低振幅加权（REST ticker 字段因所而异）
+        score = (
+            vq
+            * (1.0 + min(abs(chg) / div, ch_cap))
+            * (1.0 + min(abs(fr) * fscale, fcap))
+            * hl_mult
+        )
+        scored.append((score, sym, {"vq": vq, "chg": chg, "fr": fr, "hl_bps": hl_bps, "hl_mult": hl_mult}))
 
     scored.sort(key=lambda x: -x[0])
     picked_meta = scored[: max(1, top_n)]
@@ -104,7 +127,14 @@ def rank_universe_symbols(
         "picked": len(picked_meta),
         "symbols_out": len(out),
         "top_preview": [
-            {"symbol": s, "vq": m["vq"], "chg_pct": m["chg"], "funding": m["fr"]}
+            {
+                "symbol": s,
+                "vq": m["vq"],
+                "chg_pct": m["chg"],
+                "funding": m["fr"],
+                "hl_bps": m.get("hl_bps", 0.0),
+                "hl_mult": m.get("hl_mult", 1.0),
+            }
             for _sc, s, m in picked_meta[:8]
         ],
     }

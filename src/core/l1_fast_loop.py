@@ -236,6 +236,37 @@ def rolling_trade_vwap(symbol: str, window: float = 60.0, now: Optional[float] =
     return num / den
 
 
+def trade_flow_gross_contracts(symbol: str, window: float, now: Optional[float] = None) -> float:
+    """窗口内主动买+卖合约张数（绝对值之和），用于判断成交流是否足够可信。"""
+    now = now or time.time()
+    st = _st(symbol)
+    st.prune_trades(now)
+    return float(sum(abs(q) for t, q in st.trades if now - t <= window))
+
+
+def trade_flow_imbalance(symbol: str, window: float = 10.0, now: Optional[float] = None) -> float:
+    """
+    成交流失衡度（VPIN/CVD 的归一化形态）：(V_buy − V_sell) / (V_buy + V_sell)，∈[-1,1]。
+    与盘口 OBI 互补：反映真实成交倾斜，减轻假挂单 (Spoofing) 干扰。
+    """
+    now = now or time.time()
+    st = _st(symbol)
+    st.prune_trades(now)
+    vb = 0.0
+    vs = 0.0
+    for t, q in st.trades:
+        if now - t > window:
+            continue
+        if q > 0:
+            vb += q
+        else:
+            vs += abs(q)
+    tot = vb + vs
+    if tot <= 1e-18:
+        return 0.0
+    return float(vb - vs) / float(tot)
+
+
 def taker_sell_volume(symbol: str, window: float, now: Optional[float] = None) -> float:
     now = now or time.time()
     st = _st(symbol)
@@ -454,3 +485,10 @@ def cvd_compact(symbol: str) -> Dict[str, float]:
         "net_60s": round(c60, 6),
         "baseline_10s": round(bl, 6),
     }
+
+
+def reset_buffers_for_replay() -> None:
+    """清空 L1 滚动缓冲，供事件驱动回放冷启动。"""
+    _states.clear()
+    _fp_ws_last_tail_t.clear()
+    _fp_ws_last_push_mono.clear()

@@ -191,6 +191,31 @@ class RiskEngine:
         """Backward-compatible legacy wrapper."""
         self.update_account_snapshot(balance, 0.0)
 
+    def reset_for_event_replay(self, wallet_usdt: float) -> None:
+        """Risk 状态清零，与纸面钱包对齐。"""
+        w = float(wallet_usdt)
+        self.initial_balance = w
+        self.wallet_balance = w
+        self.unrealized_pnl = 0.0
+        self.total_equity = w
+        self.current_balance = w
+        self.daily_high = w
+        self.realized_pnl = 0.0
+        self.realized_high = 0.0
+        self.realized_drawdown_usdt = 0.0
+        self.realized_drawdown = 0.0
+        self.peak_to_trough_drawdown = 0.0
+        self.peak_to_trough_drawdown_usdt = 0.0
+        self.accumulated_fee = 0.0
+        self.accumulated_funding_fee = 0.0
+        self.order_timestamps.clear()
+        self.is_halted = False
+        self.halt_reason = ""
+        self.orphan_position_alerts.clear()
+        self.symbol_atr_pct.clear()
+        self._ten_min_ticks.clear()
+        self.symbol_10m_range_pct.clear()
+
     def _check_drawdown(self):
         """Internal check for drawdown limits.
         Drawdown is telemetry only; neither daily nor hard drawdown halts trading.

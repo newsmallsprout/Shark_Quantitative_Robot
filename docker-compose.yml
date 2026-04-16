@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   shark-quant:
     build: 
@@ -23,6 +21,25 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    networks:
+      - quant_net
+
+  # 独立批量回测（默认 beta_neutral_hf.symbols）；不随主 bot 重启
+  # 用法: docker compose --profile backtest run --rm backtest-worker
+  backtest-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shark-quant:latest
+    profiles: ["backtest"]
+    working_dir: /app
+    command: ["python3", "backtest_worker.py", "--days", "7", "--insecure"]
+    volumes:
+      - ./config/settings.yaml:/app/config/settings.yaml
+      - ./data:/app/data
+    environment:
+      - TZ=UTC
+      - BACKTEST_INSECURE_SSL=1
     networks:
       - quant_net
 

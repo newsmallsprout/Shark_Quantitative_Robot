@@ -15,7 +15,8 @@ import json
 import asyncio
 import time
 import math
-from typing import Optional
+from typing import Optional, Any, List, Tuple, Dict
+from collections import Counter
 
 
 def _json_safe(obj):
@@ -53,7 +54,7 @@ def _system_state_to_ui_mode(state: SystemState) -> str:
 # --- WebSocket Connection Manager ---
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: List[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -255,80 +256,188 @@ def _beta_neutral_hf_telemetry(engine) -> dict:
     }
 
 
-def _trade_history_items_and_summary(limit: Optional[int] = None) -> tuple[list, dict, str]:
-    d = config_manager.get_config().darwin.autopsy_dir
-    items = []
-    if not os.path.isdir(d):
-        return [], {"total_count": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_total": 0.0}, d
+def _compact_leaderboard_row(x: dict) -> dict:
+    """战报排行榜精简字段，避免把 entry_snapshot 等大对象塞进 JSON。"""
+    return {
+        "file": x.get("file"),
+        "closed_at": float(x.get("closed_at") or 0),
+        "symbol": x.get("symbol", ""),
+        "side": x.get("side", ""),
+        "net_pnl": float(x.get("net_pnl") or 0),
+        "gross_pnl": float(x.get("gross_pnl") or 0),
+        "fees": float(x.get("fees") or 0),
+        "exit_reason": x.get("exit_reason") or "",
+        "duration_sec": float(x.get("duration_sec") or 0),
+        "leverage": float(x.get("leverage") or 0),
+    }
 
-    for name in os.listdir(d):
+
+def _autopsy_item_from_raw(raw: dict, name: str, *, include_heavy: bool) -> Optional[dict]:
+    if raw.get("schema") not in ("darwin.trade_autopsy.v1", "darwin.trade_autopsy.v2"):
+        return None
+    pnl = raw.get("pnl") or {}
+    path_stats = raw.get("path_stats") or {}
+    exit_meta = raw.get("exit") or {}
+    entry_snapshot = raw.get("entry_snapshot") or {}
+    contract_size = float(raw.get("contract_size") or entry_snapshot.get("contract_size") or 1.0)
+    closed_size = float(raw.get("closed_size") or 0)
+    base_qty = float(raw.get("base_qty") or (closed_size * contract_size))
+    entry_price = float(raw.get("entry_price") or 0)
+    exit_price = float(raw.get("exit_price") or 0)
+    row = {
+        "file": name,
+        "closed_at": float(raw.get("closed_at") or 0),
+        "symbol": raw.get("symbol", ""),
+        "side": raw.get("side", ""),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "closed_size": closed_size,
+        "contract_size": contract_size,
+        "base_qty": base_qty,
+        "entry_notional_usdt": float(raw.get("entry_notional_usdt") or (base_qty * entry_price)),
+        "exit_notional_usdt": float(raw.get("exit_notional_usdt") or (base_qty * exit_price)),
+        "leverage": float(raw.get("leverage") or 0),
+        "margin_mode": raw.get("margin_mode", ""),
+        "gross_pnl": float(pnl.get("realized_gross") or 0),
+        "fees": float(pnl.get("fees_allocated") or 0),
+        "net_pnl": float(pnl.get("realized_net") or 0),
+        "exit_reason": exit_meta.get("reason", ""),
+        "trading_mode": exit_meta.get("trading_mode"),
+        "duration_sec": float(raw.get("duration_sec") or 0),
+        "max_favorable_unrealized": float(path_stats.get("max_favorable_unrealized") or 0),
+        "max_adverse_unrealized": float(path_stats.get("max_adverse_unrealized") or 0),
+        "schema": raw.get("schema"),
+    }
+    if include_heavy:
+        row["entry_snapshot"] = entry_snapshot
+        row["l1_at_signal"] = raw.get("l1_at_signal")
+    else:
+        row["entry_snapshot"] = {}
+        row["l1_at_signal"] = None
+    return row
+
+
+def _scan_trade_history_compacts(autopsy_dir: str) -> Tuple[List[dict], str]:
+    """全量扫描战报目录；单条不含 entry_snapshot 大字段，降低内存。"""
+    items: List[dict] = []
+    if not os.path.isdir(autopsy_dir):
+        return [], autopsy_dir
+    for name in os.listdir(autopsy_dir):
         if not name.endswith(".json"):
             continue
-        path = os.path.join(d, name)
+        path = os.path.join(autopsy_dir, name)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except Exception as e:
             log.warning(f"trade_history skip {name}: {e}")
             continue
-
-        if raw.get("schema") not in ("darwin.trade_autopsy.v1", "darwin.trade_autopsy.v2"):
-            continue
-
-        pnl = raw.get("pnl") or {}
-        path_stats = raw.get("path_stats") or {}
-        exit_meta = raw.get("exit") or {}
-        entry_snapshot = raw.get("entry_snapshot") or {}
-        contract_size = float(raw.get("contract_size") or entry_snapshot.get("contract_size") or 1.0)
-        closed_size = float(raw.get("closed_size") or 0)
-        base_qty = float(raw.get("base_qty") or (closed_size * contract_size))
-        entry_price = float(raw.get("entry_price") or 0)
-        exit_price = float(raw.get("exit_price") or 0)
-
-        items.append(
-            {
-                "file": name,
-                "closed_at": float(raw.get("closed_at") or 0),
-                "symbol": raw.get("symbol", ""),
-                "side": raw.get("side", ""),
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "closed_size": closed_size,
-                "contract_size": contract_size,
-                "base_qty": base_qty,
-                "entry_notional_usdt": float(raw.get("entry_notional_usdt") or (base_qty * entry_price)),
-                "exit_notional_usdt": float(raw.get("exit_notional_usdt") or (base_qty * exit_price)),
-                "leverage": float(raw.get("leverage") or 0),
-                "margin_mode": raw.get("margin_mode", ""),
-                "gross_pnl": float(pnl.get("realized_gross") or 0),
-                "fees": float(pnl.get("fees_allocated") or 0),
-                "net_pnl": float(pnl.get("realized_net") or 0),
-                "exit_reason": exit_meta.get("reason", ""),
-                "trading_mode": exit_meta.get("trading_mode"),
-                "duration_sec": float(raw.get("duration_sec") or 0),
-                "max_favorable_unrealized": float(path_stats.get("max_favorable_unrealized") or 0),
-                "max_adverse_unrealized": float(path_stats.get("max_adverse_unrealized") or 0),
-                "entry_snapshot": entry_snapshot,
-                "l1_at_signal": raw.get("l1_at_signal"),
-                "schema": raw.get("schema"),
-            }
-        )
-
+        row = _autopsy_item_from_raw(raw, name, include_heavy=False)
+        if row:
+            row["_path"] = path
+            items.append(row)
     items.sort(key=lambda x: x.get("closed_at") or 0, reverse=True)
+    return items, autopsy_dir
+
+
+def _trade_history_summary_from_compacts(items: List[dict]) -> dict:
     total_count = len(items)
     wins = sum(1 for x in items if float(x.get("net_pnl") or 0.0) > 0)
     losses = sum(1 for x in items if float(x.get("net_pnl") or 0.0) < 0)
     net_total = sum(float(x.get("net_pnl") or 0.0) for x in items)
-    summary = {
+    fees_total = sum(float(x.get("fees") or 0.0) for x in items)
+    gross_pos = sum(float(x.get("gross_pnl") or 0.0) for x in items if float(x.get("net_pnl") or 0.0) > 0)
+    losers = [x for x in items if float(x.get("net_pnl") or 0) < 0]
+    losers.sort(key=lambda x: float(x.get("net_pnl") or 0.0))
+    winners = [x for x in items if float(x.get("net_pnl") or 0) > 0]
+    winners.sort(key=lambda x: -float(x.get("net_pnl") or 0.0))
+    lb_n = 10
+    worst_sum = sum(float(x.get("net_pnl") or 0.0) for x in losers[:lb_n])
+    best_sum = sum(float(x.get("net_pnl") or 0.0) for x in winners[:lb_n])
+    loss_reasons = Counter(str(x.get("exit_reason") or "") for x in losers)
+    win_reasons = Counter(str(x.get("exit_reason") or "") for x in winners)
+    top_loss_reasons = [{"reason": r, "count": c} for r, c in loss_reasons.most_common(5)]
+    top_win_reasons = [{"reason": r, "count": c} for r, c in win_reasons.most_common(5)]
+    hints: List[str] = []
+    if total_count >= 8 and fees_total > 1e-9:
+        fn = fees_total / max(abs(net_total), fees_total, 1e-9)
+        if fn > 0.45 and net_total < gross_pos * 0.35:
+            hints.append("摩擦（手续费）相对净利偏高：Beta HF 微利平仓已默认限价；可检查是否仍有市价腿或提高 entry_ev_round_trip_mult 减少无效换手。")
+        if loss_reasons.get("exit_chandelier_trail", 0) + loss_reasons.get("exit_obi_preempt", 0) > max(3, total_count // 4):
+            hints.append("追踪/OBI 类止盈出场较多：若净利被手续费侵蚀，可适度放宽 leg_micro_dynamic_floor 或依赖限价止盈减少重复进出。")
+    summary: Dict[str, Any] = {
         "total_count": total_count,
         "wins": wins,
         "losses": losses,
         "win_rate": (wins / total_count) if total_count > 0 else 0.0,
         "net_total": net_total,
+        "fees_total": fees_total,
+        "gross_wins_sum": gross_pos,
+        "worst_losses": [_compact_leaderboard_row(x) for x in losers[:lb_n]],
+        "best_wins": [_compact_leaderboard_row(x) for x in winners[:lb_n]],
+        "worst_losses_top_sum": worst_sum,
+        "best_wins_top_sum": best_sum,
+        "top_loss_exit_reasons": top_loss_reasons,
+        "top_win_exit_reasons": top_win_reasons,
+        "strategy_hints": hints,
     }
-    if limit is not None:
-        items = items[:limit]
+    return summary
+
+
+def _hydrate_trade_history_rows(rows: List[dict], *, include_entry_snapshot: bool) -> List[dict]:
+    if not include_entry_snapshot:
+        out = []
+        for r in rows:
+            c = {k: v for k, v in r.items() if k != "_path"}
+            out.append(c)
+        return out
+    out = []
+    for r in rows:
+        path = r.get("_path")
+        name = str(r.get("file") or "")
+        if not path or not name:
+            c = {k: v for k, v in r.items() if k != "_path"}
+            out.append(c)
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            log.warning(f"trade_history hydrate {name}: {e}")
+            c = {k: v for k, v in r.items() if k != "_path"}
+            out.append(c)
+            continue
+        full = _autopsy_item_from_raw(raw, name, include_heavy=True)
+        if full:
+            out.append(full)
+        else:
+            c = {k: v for k, v in r.items() if k != "_path"}
+            out.append(c)
+    return out
+
+
+def _trade_history_items_and_summary(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    include_entry_snapshot: bool = False,
+) -> Tuple[List, dict, str]:
+    d = config_manager.get_config().darwin.autopsy_dir
+    compacts, d = _scan_trade_history_compacts(d)
+    summary = _trade_history_summary_from_compacts(compacts)
+    off = max(0, int(offset))
+    if limit <= 0:
+        return [], summary, d
+    page = compacts[off : off + int(limit)]
+    items = _hydrate_trade_history_rows(page, include_entry_snapshot=include_entry_snapshot)
     return items, summary, d
+
+
+def trade_history_summary_only() -> dict:
+    """供 WS / account_info：只算汇总，不构建分页 items。"""
+    d = config_manager.get_config().darwin.autopsy_dir
+    compacts, _ = _scan_trade_history_compacts(d)
+    return _trade_history_summary_from_compacts(compacts)
 
 
 # Background task: push live gateway ticks (mainnet WS) to dashboard clients
@@ -431,7 +540,7 @@ async def ws_push_loop():
                     positions = await _positions_for_ui(exchange)
                     beta_telemetry = _beta_neutral_hf_telemetry(engine)
 
-                    trade_summary = _trade_history_items_and_summary(limit=None)[1]
+                    trade_summary = trade_history_summary_only()
                     display_daily_pnl = float(trade_summary.get("net_total", 0.0) or 0.0)
                     fin = await _account_financial_breakdown_async(exchange)
                     payload["account"] = {
@@ -568,6 +677,14 @@ async def upload_license(file: UploadFile = File(...)):
         return {"status": "success", "message": "License uploaded successfully. Please restart bot."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/license/status")
+async def get_license_status():
+    """Runtime license snapshot for dashboard (RSA verify + optional device binding)."""
+    from src.core.license_gate import license_status_payload
+
+    return license_status_payload()
 
 @app.get("/api/status")
 async def get_status():
@@ -903,16 +1020,73 @@ async def get_recent_signals():
 
 
 @app.get("/api/trade_history")
-async def get_trade_history(limit: int = Query(200, ge=1, le=1000)):
+async def get_trade_history(
+    limit: int = Query(50, ge=0, le=500),
+    offset: int = Query(0, ge=0, le=500000),
+    include_entry_snapshot: bool = Query(False),
+):
     """
-    历史仓位：读取 Darwin Protocol 平仓战报（paper_engine 写入的 JSON）。
+    历史仓位：Darwin 平仓战报 JSON；summary 为全量统计。
+    limit=0 时仅返回 summary（适合战报卡片只拉汇总）；默认分页避免一次塞爆内存。
     """
     try:
-        items, summary, d = _trade_history_items_and_summary(limit=limit)
-        return {"items": items, "source_dir": d, "summary": summary}
+        items, summary, d = _trade_history_items_and_summary(
+            limit=limit,
+            offset=offset,
+            include_entry_snapshot=include_entry_snapshot,
+        )
+        total = int(summary.get("total_count") or 0)
+        return {
+            "items": items,
+            "source_dir": d,
+            "summary": summary,
+            "offset": offset,
+            "limit": limit,
+            "total_count": total,
+            "has_more": (offset + len(items)) < total if limit > 0 else False,
+        }
     except Exception as e:
         log.error(f"trade_history fatal: {e}")
-        return {"items": [], "source_dir": "", "summary": {"total_count": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_total": 0.0}, "detail": f"Internal Server Error: {e}"}
+        return {
+            "items": [],
+            "source_dir": "",
+            "summary": {
+                "total_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "net_total": 0.0,
+                "worst_losses": [],
+                "best_wins": [],
+            },
+            "offset": 0,
+            "limit": 0,
+            "total_count": 0,
+            "has_more": False,
+            "detail": f"Internal Server Error: {e}",
+        }
+
+
+@app.get("/api/trade_history/detail")
+async def get_trade_history_detail(file: str = Query(..., min_length=1, max_length=512)):
+    """单条战报全文（含 entry_snapshot）；file 仅允许 basename。"""
+
+    safe = os.path.basename(file)
+    if not safe.endswith(".json") or ".." in file:
+        raise HTTPException(status_code=400, detail="invalid file")
+    d = config_manager.get_config().darwin.autopsy_dir
+    path = os.path.join(d, safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    row = _autopsy_item_from_raw(raw, safe, include_heavy=True)
+    if not row:
+        raise HTTPException(status_code=404, detail="not a trade autopsy")
+    return {"item": row, "source_dir": d}
 
 
 @app.get("/api/account_info")
@@ -957,16 +1131,16 @@ async def get_account_info():
              log.error(f"Error processing orders: {e}")
 
         fin = await _account_financial_breakdown_async(exchange)
+        th = trade_history_summary_only()
+        net_disp = float(th.get("net_total", 0.0) or 0.0)
         return {
             "positions": positions,
             "orders": orders,
             "balance": total_balance,
             "daily_pnl": risk_engine.daily_pnl,
-            "display_daily_pnl": float(_trade_history_items_and_summary(limit=None)[1].get("net_total", 0.0) or 0.0),
+            "display_daily_pnl": net_disp,
             "display_daily_pnl_percent": (
-                float(_trade_history_items_and_summary(limit=None)[1].get("net_total", 0.0) or 0.0)
-                / float(risk_engine.initial_balance or total_balance)
-                * 100.0
+                float(net_disp) / float(risk_engine.initial_balance or total_balance) * 100.0
             )
             if float(risk_engine.initial_balance or total_balance) > 0
             else 0.0,
@@ -985,29 +1159,55 @@ async def get_account_info():
         log.error(f"Error in account_info: {e}")
         return {"positions": [], "orders": [], "balance": 0.0, "daily_pnl": 0.0, "win_rate": 0.0}
 
+def _read_log_tail_newest_first(path: str, limit: int, offset: int) -> Tuple[List[str], int]:
+    """大文件只读尾部约 4MB，避免整文件进内存；返回从新到旧行切片。"""
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    max_bytes = 4 * 1024 * 1024
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        sz = f.tell()
+        if sz <= max_bytes:
+            f.seek(0)
+            raw = f.read()
+        else:
+            f.seek(max(0, sz - max_bytes))
+            raw = f.read()
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    total = len(lines)
+    newest_first = list(reversed(lines))
+    chunk = newest_first[offset : offset + limit]
+    return chunk, total
+
+
 @app.get("/api/logs")
-async def get_logs():
-    """Get System Logs"""
-    # Use data_collector csv for strategy execution logs
-    # or read the structured logs from loguru
-    # Here we focus on 'bot operation logs' which might be the main log file
-    
+async def get_logs(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=500000),
+):
+    """系统日志（最新在前）；分页参数 limit/offset。"""
     try:
         log_dir = "logs"
         if not os.path.exists(log_dir):
-            return {"logs": []}
-            
+            return {"logs": [], "offset": offset, "limit": limit, "total_lines_in_window": 0, "file": ""}
+
         files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".log")]
         if not files:
-             return {"logs": []}
-             
+            return {"logs": [], "offset": offset, "limit": limit, "total_lines_in_window": 0, "file": ""}
+
         latest_file = max(files, key=os.path.getctime)
-        with open(latest_file, "r") as f:
-            lines = f.readlines()
-            # Filter for meaningful operation logs if needed
-            return {"logs": lines[-50:]} 
+        chunk, total = _read_log_tail_newest_first(latest_file, limit, offset)
+        return {
+            "logs": chunk,
+            "offset": offset,
+            "limit": limit,
+            "total_lines_in_window": total,
+            "file": os.path.basename(latest_file),
+            "has_more": (offset + len(chunk)) < total,
+        }
     except Exception as e:
-        return {"logs": [f"Error reading logs: {e}"]}
+        return {"logs": [f"Error reading logs: {e}"], "offset": 0, "limit": limit, "total_lines_in_window": 0, "file": ""}
 
 
 # Serve Static Files (Frontend)

@@ -4,10 +4,17 @@ import math
 import time
 import uuid
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from src.core.config_manager import config_manager
 from src.core.events import SignalEvent, TickEvent
+from src.core.trend_filter import (
+    feed_anchor_minute_close,
+    feed_symbol_minute_close,
+    get_anchor_trend_bias,
+    get_symbol_micro_trend,
+)
+from src.core.obi_micro import obi_from_orderbook_dict, taker_direction_allowed
 from src.core.paper_engine import MAKER_FEE_RATE, TAKER_FEE_RATE, paper_engine
 from src.ai.analyzer import ai_context
 from src.ai.regime import MarketRegime, regime_classifier
@@ -73,6 +80,11 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         self._last_anchor_suppressed_debug_ts: float = 0.0
         self._last_anchor_rebalance_log_ts: float = 0.0
         self._last_candidate_by_alt: Dict[str, Dict[str, Any]] = {}
+        # sym -> (minute_bucket, micro_close_count) 防 1m 内鬼畜刷单
+        self._bnhf_micro_minute: Dict[str, Tuple[int, int]] = {}
+        # inventory_cap 熔断日志限频（否则 on_tick 每跳刷屏）
+        self._inventory_cap_log_key: str = ""
+        self._inventory_cap_log_ts: float = 0.0
 
     def log_sync(self, message: str) -> None:
         try:
@@ -134,7 +146,18 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         by_equity = eq * cap_frac
         return max(0.0, min(by_slots, by_equity))
 
-    def _compute_pair_alt_notional_usdt(self, cfg: Any, lev: float, beta_abs: float) -> float:
+    def _vol_scale_for_alt(self, alt: str, cfg: Any) -> float:
+        """相对目标微观 ATR：高波动多配名义，死水缩仓。"""
+        if not bool(getattr(cfg, "vol_scaled_sizing_enabled", False)):
+            return 1.0
+        atr = max(1e-9, float(self._micro_atr_bps(alt)))
+        tgt = max(1e-6, float(getattr(cfg, "vol_target_micro_atr_bps", 12.0)))
+        lo = float(getattr(cfg, "vol_scale_min", 0.35))
+        hi = float(getattr(cfg, "vol_scale_max", 1.85))
+        raw = atr / tgt
+        return max(lo, min(hi, raw))
+
+    def _compute_pair_alt_notional_usdt(self, cfg: Any, lev: float, beta_abs: float, alt: str) -> float:
         """
         名义：alt_notional = alt_margin_cfg × lev，且双腿合计初始保证金 ≤ _pair_total_margin_budget。
         近似：margin_alt + margin_anchor ≈ alt_notional/lev + (alt_notional×β)/lev = alt_notional×(1+β)/lev。
@@ -146,7 +169,7 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             return 0.0
         denom = max(1e-9, 1.0 + beta_abs)
         alt_notional_cap = float(budget) * lev / denom
-        alt_notional_cfg = float(cfg.pair_margin_usdt) * lev
+        alt_notional_cfg = float(cfg.pair_margin_usdt) * lev * self._vol_scale_for_alt(alt, cfg)
         return max(0.0, min(alt_notional_cfg, alt_notional_cap))
 
     def _deque(self, symbol: str) -> Deque[float]:
@@ -248,6 +271,105 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             "trigger": trigger,
         }
 
+    def _deque_price_vol_bps(self, symbol: str) -> float:
+        """近窗价格 deque 上 log-return 波动（bps 口径），与 analyze 中 vol_1m_bps 同量纲近似。"""
+        dq = list(self._deque(symbol))
+        if len(dq) < 8:
+            return 0.0
+        xs: List[float] = []
+        for i in range(1, len(dq)):
+            if dq[i - 1] > 0 and dq[i] > 0:
+                xs.append(math.log(dq[i] / dq[i - 1]))
+        if len(xs) < 4:
+            return 0.0
+        mu = _mean(xs)
+        v = _variance(xs, mu)
+        return float(math.sqrt(max(v, 0.0)) * 1e4)
+
+    @staticmethod
+    def _exchange_funding_rate(symbol: str) -> float:
+        try:
+            from src.core.globals import bot_context
+
+            ex = bot_context.get_exchange()
+            if ex and getattr(ex, "contract_specs_cache", None):
+                return float((ex.contract_specs_cache.get(symbol) or {}).get("funding_rate", 0.0) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _alt_only_log_return_z(self, alt: str) -> float:
+        """仅山寨自身 log 收益 Z（剔 BTC 协方差），用于脱钩极端判定。"""
+        dq = list(self._deque(alt))
+        if len(dq) < 12:
+            return 0.0
+        xs: List[float] = []
+        for i in range(1, len(dq)):
+            if dq[i - 1] > 0 and dq[i] > 0:
+                xs.append(math.log(dq[i] / dq[i - 1]))
+        if len(xs) < 8:
+            return 0.0
+        m = _mean(xs)
+        sd = math.sqrt(max(_variance(xs, m), 1e-18))
+        return float((xs[-1] - m) / max(sd, 1e-18))
+
+    def _is_decoupled_alt(self, alt: str) -> bool:
+        """脱钩弑父：山寨微观波动 ≫ BTC 且（资金极端 或 单币收益 Z 极端）。"""
+        cfg = self._cfg()
+        if not bool(getattr(cfg, "dual_radar_enabled", True)):
+            return False
+        anchor = str(cfg.anchor_symbol)
+        if self._canonical_market_symbol(alt) == self._canonical_market_symbol(anchor):
+            return False
+        va = float(self._deque_price_vol_bps(alt))
+        vb = float(self._deque_price_vol_bps(anchor))
+        ratio = float(getattr(cfg, "decouple_vol_ratio_vs_btc", 3.0) or 3.0)
+        if va <= ratio * max(vb, 1e-6):
+            return False
+        fr = abs(float(self._exchange_funding_rate(alt)))
+        fz = float(getattr(cfg, "decouple_funding_rate_abs", 0.0005) or 0.0005)
+        zi = abs(float(self._alt_only_log_return_z(alt)))
+        z_thr = float(getattr(cfg, "decouple_zscore_abs", 4.0) or 4.0)
+        return bool(fr > fz or zi > z_thr)
+
+    def _signal_for_alt_momentum_only(self, alt: str) -> Optional[Dict[str, Any]]:
+        """狂暴雷达：仅 OBI 顺势；无盘口则放弃（不做 BTC 回归）。"""
+        cfg = self._cfg()
+        ob = paper_engine.orderbooks_cache.get(alt) or {}
+        obi = float(obi_from_orderbook_dict(ob if isinstance(ob, dict) else None))
+        thr = float(getattr(cfg, "decouple_momentum_obi_abs", 0.28) or 0.28)
+        if obi >= thr:
+            direction = "long_alt_short_btc"
+            z = -max(float(cfg.entry_zscore) + 3.0, 5.0)
+        elif obi <= -thr:
+            direction = "short_alt_long_btc"
+            z = max(float(cfg.entry_zscore) + 3.0, 5.0)
+        else:
+            return None
+        return {
+            "alt": alt,
+            "beta": 1.0,
+            "corr": 1.0,
+            "zscore": float(z),
+            "spread_bps": 0.0,
+            "spread_std_bps": 0.0,
+            "impulse_bps": obi * 1e4,
+            "impulse_std_bps": 0.0,
+            "impulse_zscore": 0.0,
+            "trigger": "momentum_decoupled",
+            "direction": direction,
+            "is_decoupled": True,
+        }
+
+    def _signal_for_alt_radar(self, alt: str) -> Optional[Dict[str, Any]]:
+        """双雷达：未脱钩用 BTC 协整残差；脱钩则仅动量 OBI，禁止均值回归。"""
+        cfg = self._cfg()
+        if not bool(getattr(cfg, "dual_radar_enabled", True)):
+            return self._signal_for_alt(alt)
+        if self._is_decoupled_alt(alt):
+            return self._signal_for_alt_momentum_only(alt)
+        return self._signal_for_alt(alt)
+
     def _raw_relative_snapshot(self, alt: str) -> Optional[Dict[str, Any]]:
         cfg = self._cfg()
         if self._is_hedge_leg_symbol(alt):
@@ -308,6 +430,8 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         anchor_move_bps = math.log(anchor_now / anchor_prev) * 1e4
         raws = []
         for alt in self._alpha_symbols():
+            if self._is_decoupled_alt(alt):
+                continue
             px = list(self._prices.get(alt) or [])
             if len(px) < lookback + 1:
                 continue
@@ -463,6 +587,111 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         cs = float(paper_engine._position_contract_size(pos, symbol))
         tk, _ = paper_engine._fee_rates_for_symbol(symbol)
         return float(sz * cs * max(px, 1e-12) * float(tk))
+
+    def _leg_maker_close_fee_usdt(self, symbol: str, pos: Dict[str, Any]) -> float:
+        """单腿限价 Maker 平仓的手续费（名义 × maker；返佣为负费率时可再调）。"""
+        sz = abs(float(pos.get("size", 0.0) or 0.0))
+        if sz <= 1e-12:
+            return 0.0
+        px = float(paper_engine.latest_prices.get(symbol, 0.0) or 0.0)
+        cs = float(paper_engine._position_contract_size(pos, symbol))
+        _tk, mk = paper_engine._fee_rates_for_symbol(symbol)
+        return float(sz * cs * max(px, 1e-12) * float(mk))
+
+    def _maker_micro_exit_limit_price(self, symbol: str, pos_side: str, raw_tp: float) -> Optional[float]:
+        """Post-Only 微利平仓价；无法错开价差则回退 None（改用市价）。"""
+        cfg = self._cfg()
+        off_bps = float(getattr(cfg, "leg_micro_maker_exit_offset_bps", 0.0) or 0.0) / 1e4
+        bb, ba = paper_engine._best_bid_ask(symbol)
+        ps = str(pos_side).lower()
+        raw = float(raw_tp)
+        if ps == "long":
+            px = raw * (1.0 + off_bps)
+            if ba and ba > 0:
+                px = min(px, float(ba) * (1.0 - 1e-7))
+            if bb and bb > 0:
+                px = max(px, float(bb) * (1.0 + 1e-7))
+            if (ba and px >= float(ba) * (1.0 - 1e-9)) or (bb and px <= float(bb)):
+                return None
+            return float(px)
+        if ps == "short":
+            px = raw * (1.0 - off_bps)
+            if bb and bb > 0:
+                px = max(px, float(bb) * (1.0 + 1e-7))
+            if ba and ba > 0:
+                px = min(px, float(ba) * (1.0 - 1e-7))
+            if (bb and px <= float(bb) * (1.0 + 1e-9)) or (ba and px >= float(ba)):
+                return None
+            return float(px)
+        return None
+
+    def _aggressive_limit_exit_price(self, symbol: str, pos_side: str, raw_tp: float) -> float:
+        """
+        限价止盈平仓价（非 Post-Only）：在动态 TP 与盘口之间取可尽快成交的限价，
+        避免微利场景用市价单吃掉利润侧手续费。
+        多平卖：min(TP, 卖一)；空平买：max(TP, 买一)；无盘口则回退 TP 或 last。
+        """
+        bb, ba = paper_engine._best_bid_ask(symbol)
+        ps = str(pos_side).lower()
+        raw = float(raw_tp)
+        if raw <= 0:
+            raw = float(paper_engine.latest_prices.get(symbol, 0.0) or 0.0)
+        lp = float(paper_engine.latest_prices.get(symbol, 0.0) or 0.0)
+        if ps == "long":
+            if ba and ba > 0:
+                return float(min(raw, float(ba))) if raw > 0 else float(ba)
+            return max(raw if raw > 0 else lp, 1e-12)
+        if ps == "short":
+            if bb and bb > 0:
+                return float(max(raw, float(bb))) if raw > 0 else float(bb)
+            return max(raw if raw > 0 else lp, 1e-12)
+        return max(lp, 1e-12)
+
+    def _leg_market_open_fee_usdt(self, symbol: str, pos: Dict[str, Any]) -> float:
+        """单腿开仓时已发生的 Taker 费等价估计：|张|×cs×entry×taker（与圆桌口径对齐）。"""
+        sz = abs(float(pos.get("size", 0.0) or 0.0))
+        if sz <= 1e-12:
+            return 0.0
+        ep = float(pos.get("entry_price", 0.0) or 0.0)
+        if ep <= 0:
+            return 0.0
+        cs = float(paper_engine._position_contract_size(pos, symbol))
+        tk, _ = paper_engine._fee_rates_for_symbol(symbol)
+        return float(sz * cs * ep * float(tk))
+
+    def _leg_roundtrip_micro_target_usdt(self, sym: str, fee_open: float, fee_close: float, cfg: Any) -> float:
+        """
+        极速微利门槛：净利目标 = 双边预估手续费 × AI dynamic_tp_fee_multiplier（再与配置地板取 max）。
+        取代固定 frac×费（如 0.5×）— 乘数由 DeepSeek 按波动/OBI 实时下发并钳制在 [1.1, 5.0]。
+        """
+        data = ai_context.get(sym)
+        try:
+            tp_fee_mult = float(data.get("dynamic_tp_fee_multiplier", 1.5) or 1.5)
+        except Exception:
+            tp_fee_mult = 1.5
+        tp_fee_mult = max(1.1, min(5.0, tp_fee_mult))
+        rt = float(fee_open) + float(fee_close)
+        floor_u = float(getattr(cfg, "leg_micro_dynamic_floor_usdt", 0.15) or 0.15)
+        return max(floor_u, rt * tp_fee_mult)
+
+    def _leg_micro_minute_allow(self, sym: str, now: float, cfg: Any) -> bool:
+        mx = int(getattr(cfg, "leg_micro_max_reload_per_1m_bar", 2) or 2)
+        if mx <= 0:
+            return True
+        mk = int(now // 60)
+        st = self._bnhf_micro_minute.get(sym)
+        if not st or st[0] != mk:
+            self._bnhf_micro_minute[sym] = (mk, 0)
+            return True
+        return st[1] < mx
+
+    def _leg_micro_minute_bump(self, sym: str, now: float) -> None:
+        mk = int(now // 60)
+        st = self._bnhf_micro_minute.get(sym)
+        if not st or st[0] != mk:
+            self._bnhf_micro_minute[sym] = (mk, 1)
+        else:
+            self._bnhf_micro_minute[sym] = (st[0], st[1] + 1)
 
     def _absolute_cost_usdt(self, alt: str, anchor: str, alt_contracts: float, anchor_contracts: float) -> float:
         """当前市价下的圆桌双边 Gate 手续费（无滑点项）；用于持仓内摩擦参考。"""
@@ -767,6 +996,11 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         quant_amount = self._quantize_contracts(symbol, amount, allow_zero=True)
         if quant_amount <= 0:
             return
+        if not reduce_only:
+            if self._directional_imbalance_blocks_new_leg(side):
+                return
+            if self._micro_trend_disallows_open(symbol, side):
+                return
         entry_ctx = {
             "pair_id": pair_id,
             "pair_role": role,
@@ -786,6 +1020,41 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                 if aggressive_open
                 else str(cfg.exit_order_type if reduce_only else cfg.entry_order_type).lower()
             )
+        # 激进 Taker：前 N 档 OBI 须与方向一致；无有效盘口时不挡单
+        if (
+            order_type == "market"
+            and aggressive_open
+            and not reduce_only
+            and bool(getattr(cfg, "obi_taker_gate_enabled", True))
+        ):
+            ob_cache = getattr(paper_engine, "orderbooks_cache", None) or {}
+            book = ob_cache.get(symbol) if isinstance(ob_cache, dict) else None
+            bids = (book or {}).get("bids") if isinstance(book, dict) else None
+            asks = (book or {}).get("asks") if isinstance(book, dict) else None
+            if bids and asks:
+                top_n = max(1, int(getattr(cfg, "obi_taker_top_levels", 5)))
+                obi = obi_from_orderbook_dict(book if isinstance(book, dict) else None, top_n=top_n)
+                min_abs = max(0.0, float(getattr(cfg, "obi_taker_min_abs", 0.28)))
+                if not taker_direction_allowed(obi, side, min_abs=min_abs):
+                    return
+        if (
+            order_type == "market"
+            and aggressive_open
+            and not reduce_only
+            and bool(getattr(cfg, "trade_flow_gate_enabled", False))
+        ):
+            try:
+                from src.core.l1_fast_loop import trade_flow_gross_contracts, trade_flow_imbalance
+
+                tw = max(0.5, float(getattr(cfg, "trade_flow_window_sec", 10.0)))
+                g = trade_flow_gross_contracts(symbol, tw)
+                if g >= max(0.0, float(getattr(cfg, "trade_flow_min_abs_contracts", 0.0))):
+                    imb = trade_flow_imbalance(symbol, tw)
+                    min_tf = max(0.0, float(getattr(cfg, "trade_flow_min_abs", 0.22)))
+                    if not taker_direction_allowed(imb, side, min_abs=min_tf):
+                        return
+            except Exception:
+                pass
         post_only = bool(post_only or (order_type == "limit" and not reduce_only))
         if order_type == "limit":
             entry_ctx["resting_quote"] = True
@@ -848,7 +1117,7 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         out: List[Dict[str, Any]] = []
         diagnostics = {"insufficient_samples": 0, "flat": 0, "live_candidates": 0, "entry_ready": 0, "impulse_ready": 0, "cross_section_ready": 0}
         for alt in self._alpha_symbols():
-            sig = self._signal_for_alt(alt)
+            sig = self._signal_for_alt_radar(alt)
             if not sig:
                 samples = len(self._pair_samples.get(alt) or [])
                 if samples < int(cfg.min_points):
@@ -875,7 +1144,9 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                     "trigger": str(sig.get("trigger", "")),
                     "score": abs(z) * max(float(sig["corr"]), 0.0),
                     "status": self._candidate_status(alt),
-                    "direction": "short_alt_long_btc" if z > 0 else "long_alt_short_btc",
+                    "direction": str(sig.get("direction"))
+                    if str(sig.get("direction", "")).strip()
+                    else ("short_alt_long_btc" if z > 0 else "long_alt_short_btc"),
                 }
             )
             if abs(z) <= float(cfg.rearm_zscore):
@@ -908,6 +1179,92 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                     self._rearm_ready[sym] = True
         self._last_candidate_by_alt = {str(r["alt"]): r for r in out}
         return out
+
+    def _trend_blocks_alt_open(self, alt_side: str) -> bool:
+        """锚定大级别趋势：强涨禁空山寨、强跌禁多山寨（仅 ALT 腿，不限制锚）。"""
+        cfg = self._cfg()
+        if not bool(getattr(cfg, "trend_filter_enabled", True)):
+            return False
+        bias = get_anchor_trend_bias(
+            fast_min=int(getattr(cfg, "trend_filter_fast_minutes", 15) or 15),
+            slow_min=int(getattr(cfg, "trend_filter_slow_minutes", 60) or 60),
+            strong_sep_bps=float(getattr(cfg, "trend_filter_strong_separation_bps", 28.0) or 28.0),
+            min_minutes=int(getattr(cfg, "trend_filter_min_minutes", 65) or 65),
+        )
+        if bias == "STRONG_UP" and str(alt_side).lower() == "sell":
+            self.log_sync("[BetaNeutralHF] trend_filter: STRONG_UP → block SHORT alts")
+            return True
+        if bias == "STRONG_DOWN" and str(alt_side).lower() == "buy":
+            self.log_sync("[BetaNeutralHF] trend_filter: STRONG_DOWN → block LONG alts")
+            return True
+        return False
+
+    def _bnhf_inventory_counts(self) -> Tuple[int, int]:
+        """当前 beta_neutral_hf 标记仓位：做多品种数 vs 做空品种数。"""
+        n_long = 0
+        n_short = 0
+        for _sym, pos in (paper_engine.positions or {}).items():
+            if float(pos.get("size", 0.0) or 0.0) <= 1e-12:
+                continue
+            ect = pos.get("entry_context") or {}
+            if not bool(ect.get("beta_neutral_hf")):
+                continue
+            ps = str(pos.get("side", "long")).lower()
+            if ps == "long":
+                n_long += 1
+            else:
+                n_short += 1
+        return int(n_long), int(n_short)
+
+    def _directional_imbalance_blocks_new_leg(self, side: str) -> bool:
+        """空单比多单多 ≥ cap → 熔断新开/续空；对称熔断开多。"""
+        cfg = self._cfg()
+        cap = max(1, int(getattr(cfg, "directional_imbalance_cap", 3) or 3))
+        nl, ns = self._bnhf_inventory_counts()
+        s = str(side).lower()
+        msg = ""
+        if s == "sell" and ns - nl >= cap:
+            msg = f"[BetaNeutralHF] inventory_cap: shorts={ns} longs={nl} (≥{cap} skew) → block SELL adds"
+        elif s == "buy" and nl - ns >= cap:
+            msg = f"[BetaNeutralHF] inventory_cap: longs={nl} shorts={ns} (≥{cap} skew) → block BUY adds"
+        if not msg:
+            return False
+        key = f"{s}:{nl}:{ns}:{cap}"
+        now = time.time()
+        if key != self._inventory_cap_log_key or (now - self._inventory_cap_log_ts) >= 12.0:
+            self._inventory_cap_log_key = key
+            self._inventory_cap_log_ts = now
+            self.log_sync(msg)
+        return True
+
+    def _micro_trend_disallows_open(self, symbol: str, side: str) -> bool:
+        """1m 微观趋势：涨势不送空、跌势不送多。"""
+        cfg = self._cfg()
+        if not bool(getattr(cfg, "micro_trend_filter_enabled", True)):
+            return False
+        tr = get_symbol_micro_trend(
+            str(symbol),
+            ema_minutes=int(getattr(cfg, "micro_trend_ema_minutes", 20) or 20),
+            lookback_minutes=int(getattr(cfg, "micro_trend_lookback_minutes", 15) or 15),
+            min_bars=int(getattr(cfg, "micro_trend_min_bars", 24) or 24),
+            bps_confirm=float(getattr(cfg, "micro_trend_bps_confirm", 8.0) or 8.0),
+        )
+        s = str(side).lower()
+        if tr == "UPTREND" and s == "sell":
+            self.log_sync(f"[BetaNeutralHF] micro_trend {symbol}=UPTREND → block new/refresh SHORT")
+            return True
+        if tr == "DOWNTREND" and s == "buy":
+            self.log_sync(f"[BetaNeutralHF] micro_trend {symbol}=DOWNTREND → block new/refresh LONG")
+            return True
+        return False
+
+    def _reload_leg_allowed(self, symbol: str, open_side: str) -> bool:
+        """微利续杯：须同时通过微观趋势与库存平衡。"""
+        if self._micro_trend_disallows_open(symbol, open_side):
+            return False
+        if self._directional_imbalance_blocks_new_leg(open_side):
+            return False
+        return True
 
     def _entry_signal_for_alt(self, alt: str) -> Optional[Dict[str, Any]]:
         """与 _refresh_candidates 产出一致；含截面 fallback 行。"""
@@ -945,6 +1302,11 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             return None
         return good
 
+    @staticmethod
+    def _entry_ev_round_trip_mult_effective(cfg: Any) -> float:
+        """期望 TP 须 > 来回费 × 倍数；倍数强制 ≥1.2（覆盖配置文件中的低值如 0.22）。"""
+        return max(1.2, float(getattr(cfg, "entry_ev_round_trip_mult", 1.2) or 1.2))
+
     def _pair_entry_feasible(self, sig: Dict[str, Any], *, forced_leverage: Optional[int] = None) -> bool:
         """_open_pair 在发单前的检查（不落库、不发单），用于同 tick 组开多腿预检。"""
         cfg = self._cfg()
@@ -972,8 +1334,14 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         else:
             alt_side = "sell" if z > 0 else "buy"
             anchor_side = "buy" if alt_side == "sell" else "sell"
+        decoup_fe = bool(sig.get("is_decoupled")) or str(sig.get("trigger", "")) == "momentum_decoupled"
+        if not decoup_fe:
+            if self._trend_blocks_alt_open(alt_side):
+                return False
+            if self._micro_trend_disallows_open(alt, alt_side):
+                return False
         lev = self._resolve_open_leverage(alt, anchor, sig, forced_leverage)
-        alt_notional = self._compute_pair_alt_notional_usdt(cfg, float(lev), beta_abs)
+        alt_notional = self._compute_pair_alt_notional_usdt(cfg, float(lev), beta_abs, alt)
         if alt_notional <= 0:
             return False
         alt_contracts = self._quantize_contracts(
@@ -987,11 +1355,13 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         round_trip = self._gate_round_trip_fee_usdt(
             alt, anchor, float(alt_contracts), 0.0, float(alt_entry_px), float(anchor_entry_px)
         )
-        rt_mult = float(getattr(cfg, "entry_ev_round_trip_mult", 0.22) or 0.22)
+        rt_mult = self._entry_ev_round_trip_mult_effective(cfg)
         ev_need = round_trip * max(1e-6, rt_mult)
         expected_take_profit_usdt = self._expected_pair_take_profit_usdt(
             alt, anchor, alt_contracts, 0.0, alt_entry_px, anchor_entry_px, tp_sl
         )
+        if decoup_fe:
+            return bool(expected_take_profit_usdt > round_trip * 1.05)
         return bool(expected_take_profit_usdt > ev_need)
 
     def _open_pair(self, sig: Dict[str, Any], forced_leverage: Optional[int] = None) -> None:
@@ -1021,8 +1391,16 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         else:
             alt_side = "sell" if z > 0 else "buy"
             anchor_side = "buy" if alt_side == "sell" else "sell"
+        decoup = bool(sig.get("is_decoupled")) or str(sig.get("trigger", "")) == "momentum_decoupled"
+        if not decoup:
+            if self._trend_blocks_alt_open(alt_side):
+                return
+            if self._micro_trend_disallows_open(alt, alt_side):
+                return
+        if self._directional_imbalance_blocks_new_leg(alt_side):
+            return
         lev = self._resolve_open_leverage(alt, anchor, sig, forced_leverage)
-        alt_notional = self._compute_pair_alt_notional_usdt(cfg, float(lev), beta_abs)
+        alt_notional = self._compute_pair_alt_notional_usdt(cfg, float(lev), beta_abs, alt)
         if alt_notional <= 0:
             return
         alt_contracts = self._quantize_contracts(
@@ -1037,7 +1415,7 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         round_trip = self._gate_round_trip_fee_usdt(
             alt, anchor, float(alt_contracts), 0.0, float(alt_entry_px), float(anchor_entry_px)
         )
-        rt_mult = float(getattr(cfg, "entry_ev_round_trip_mult", 0.22) or 0.22)
+        rt_mult = self._entry_ev_round_trip_mult_effective(cfg)
         ev_need = round_trip * max(1e-6, rt_mult)
         expected_take_profit_usdt = self._expected_pair_take_profit_usdt(
             alt,
@@ -1048,11 +1426,13 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             anchor_entry_px,
             tp_sl,
         )
-        self._last_expected_tp_vs_cost = float(expected_take_profit_usdt / max(ev_need, 1e-12))
-        if expected_take_profit_usdt <= ev_need:
+        min_ev_gate = round_trip * 1.05 if decoup else ev_need
+        self._last_expected_tp_vs_cost = float(expected_take_profit_usdt / max(min_ev_gate, 1e-12))
+        if expected_take_profit_usdt <= min_ev_gate:
             log.info(
                 f"[Signal Blocked] Symbol: {alt}, Expected PnL: {expected_take_profit_usdt:.4f} USDT, "
-                f"Gate Round-Trip Fee: {round_trip:.4f} USDT. (Need EV > {ev_need:.4f} = fee×{rt_mult:.3f})"
+                f"Gate Round-Trip Fee: {round_trip:.4f} USDT. (Need EV > {min_ev_gate:.4f}"
+                f"{' decoupled×1.05 fee' if decoup else f' = fee×{rt_mult:.3f}'})"
             )
             return
         absolute_cost = round_trip
@@ -1088,6 +1468,7 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             "pair_allocated_margin_usdt": float(pair_alloc),
             "close_reason": "",
             "_bnhf_leg_reload_until": {},
+            "decoupled_momentum": bool(decoup),
         }
         ctx = {
             "beta_anchor_symbol": anchor,
@@ -1104,6 +1485,7 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             "beta_micro_atr_bps": float(tp_sl["pair_atr_bps"]),
             "beta_tp_atr_multiplier": float(tp_sl["tp_bps"] / max(tp_sl["pair_atr_bps"], 1e-9)),
             "beta_sl_atr_multiplier": float(tp_sl["sl_bps"] / max(tp_sl["pair_atr_bps"], 1e-9)),
+            "beta_hf_decoupled_momentum": bool(decoup),
         }
         pair_intent = self._pair_order_intent(
             pair_id=pair_id,
@@ -1150,8 +1532,10 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         reason: str,
         allow_reload: bool = True,
     ) -> None:
-        """单腿微利市价平仓；震荡模式 allow_reload 则同向同量立即续杯。"""
+        """单腿微利平仓：可选 Post-Only 限价 Maker 挂在动态 TP；否则市价。续杯受 instant_reload 与 maker 跳过开关约束。"""
         cfg = self._cfg()
+        if bool(pair.get("decoupled_momentum")):
+            return
         amt = float(pos.get("size", 0.0) or 0.0)
         if amt <= 1e-12:
             return
@@ -1167,24 +1551,78 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
             "beta_hf_reload_phase": "close",
             "exit_reason": reason,
             "beta_pair_alt": alt_sym,
+            "beta_leg_micro_take": True,
+            "micro_take_closed_side": str(pos_side),
         }
         ctx_open = {
             "beta_hf_instant_reload": True,
             "beta_hf_reload_phase": "open",
             "beta_pair_alt": alt_sym,
         }
-        self._emit_leg(
-            pair_id=pid,
-            symbol=symbol,
-            side=close_side,
-            price=0.0,
-            amount=amt,
-            leverage=lev,
-            reduce_only=True,
-            role=role,
-            ctx_extra=ctx_close,
-        )
+        use_maker_exit = bool(getattr(cfg, "leg_micro_maker_exit_enabled", False)) and symbol == alt_sym
+        exit_limit: Optional[float] = None
+        if use_maker_exit:
+            sig_m = self._signal_for_alt_radar(alt_sym)
+            a_side = str(pair.get("alt_side", "buy"))
+            h_side = str(pair.get("anchor_side", "sell"))
+            tp_sl_m = self._dynamic_pair_tp_sl(alt_sym, str(pair["anchor"]), a_side, h_side, dict(sig_m or {}))
+            exit_limit = self._maker_micro_exit_limit_price(symbol, pos_side, float(tp_sl_m["alt_tp_price"]))
+        if use_maker_exit and exit_limit is not None and exit_limit > 0:
+            ctx_close["beta_hf_maker_micro_exit"] = True
+            ctx_close["beta_micro_exit_limit_px"] = float(exit_limit)
+            self._emit_leg(
+                pair_id=pid,
+                symbol=symbol,
+                side=close_side,
+                price=float(exit_limit),
+                amount=amt,
+                leverage=lev,
+                reduce_only=True,
+                post_only=True,
+                role=role,
+                ctx_extra=ctx_close,
+            )
+            if bool(getattr(cfg, "leg_micro_maker_exit_skip_instant_reload", True)):
+                return
+        elif str(getattr(cfg, "exit_order_type", "market") or "market").lower() == "limit":
+            sig_m = self._signal_for_alt_radar(alt_sym)
+            a_side = str(pair.get("alt_side", "buy"))
+            h_side = str(pair.get("anchor_side", "sell"))
+            tp_sl_m = self._dynamic_pair_tp_sl(alt_sym, str(pair["anchor"]), a_side, h_side, dict(sig_m or {}))
+            lim_px = self._aggressive_limit_exit_price(symbol, pos_side, float(tp_sl_m["alt_tp_price"]))
+            ctx_close["beta_hf_limit_take_profit_exit"] = True
+            ctx_close["beta_hf_limit_exit_px"] = float(lim_px)
+            self._emit_leg(
+                pair_id=pid,
+                symbol=symbol,
+                side=close_side,
+                price=float(lim_px),
+                amount=amt,
+                leverage=lev,
+                reduce_only=True,
+                post_only=False,
+                role=role,
+                ctx_extra=ctx_close,
+            )
+        else:
+            self._emit_leg(
+                pair_id=pid,
+                symbol=symbol,
+                side=close_side,
+                price=0.0,
+                amount=amt,
+                leverage=lev,
+                reduce_only=True,
+                role=role,
+                ctx_extra=ctx_close,
+            )
         if not allow_reload or not bool(getattr(cfg, "instant_reload_enabled", True)):
+            return
+        if not self._reload_leg_allowed(symbol, open_side):
+            self.log_sync(
+                f"[BetaNeutralHF] micro_reload SKIP sym={symbol} open={open_side} "
+                f"(micro_trend or inventory fuse)"
+            )
             return
         self._emit_leg(
             pair_id=pid,
@@ -1258,8 +1696,8 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         cfg = self._cfg()
         now = time.time()
         to_delete: List[str] = []
-        micro_u = float(getattr(cfg, "leg_micro_take_usdt", 1.0) or 1.0)
         cool = max(0.05, float(getattr(cfg, "reload_cooldown_sec", 0.35) or 0.35))
+        micro_cd = max(cool, float(getattr(cfg, "leg_micro_live_cooldown_sec", 10.0) or 10.0))
         for alt, pair in list(self._active_pairs.items()):
             alt_sym = str(pair["alt"])
             pos_alt = paper_engine.positions.get(alt_sym)
@@ -1286,36 +1724,74 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                 if not pos or float(pos.get("size", 0.0) or 0.0) <= 1e-12:
                     continue
                 stance = self._leg_stance(sym, pos)
-                # 顺势 ride 不再「只挂追踪不平仓」：净利达标一样秒平；仅 scalp 允许续杯
+                mr_sym = self._matrix_regime_str(sym)
+                ps_sym = str(pos.get("side", "long")).lower()
+                if bool(pair.get("decoupled_momentum")):
+                    act_roe = max(
+                        1e-6,
+                        float(getattr(cfg, "trend_trailing_activation_roe", cfg.trend_trailing_activation_roe) or 0.008),
+                    )
+                    cb_roe = max(1e-6, float(getattr(cfg, "trend_trailing_callback_roe", cfg.trend_trailing_callback_roe) or 0.004))
+                    paper_engine.attach_high_conviction_trailing(
+                        sym,
+                        act_roe,
+                        cb_roe,
+                        extra_ctx={"beta_hf_decoupled_ride": True},
+                    )
+                    continue
+                ride_trail = (mr_sym == "TRENDING_UP" and ps_sym == "long") or (
+                    mr_sym == "TRENDING_DOWN" and ps_sym == "short"
+                )
+                if ride_trail:
+                    act_roe = max(
+                        1e-6,
+                        float(getattr(cfg, "ride_trailing_activation_roe", cfg.trend_trailing_activation_roe) or 0.5),
+                    )
+                    paper_engine.attach_high_conviction_trailing(
+                        sym,
+                        act_roe,
+                        0.0,
+                        extra_ctx={"beta_hf_ride_trailing": True},
+                    )
+                    continue
                 paper_engine.clear_high_conviction_trailing(sym)
                 if now < float(lock.get(sym, 0.0) or 0.0):
+                    continue
+                if not self._leg_micro_minute_allow(sym, now, cfg):
                     continue
                 last_px = float(paper_engine.latest_prices.get(sym, 0.0) or 0.0)
                 if last_px <= 0:
                     continue
-                # 必须用「平仓后预估净利」口径：含已扣 accumulated_fees + 本笔平仓 taker；
-                # 仅用 unrealized − 单次费会高估净利，导致平完仍亏（尸检里摩擦 > 毛利）。
-                net_leg = float(paper_engine.estimate_flat_net_pnl(sym, pos, last_px))
                 gross = float(pos.get("unrealized_pnl", 0.0) or 0.0)
-                acc = float(pos.get("accumulated_fees", 0.0) or 0.0)
-                fee_close = self._leg_market_close_fee_usdt(sym, pos)
-                if net_leg <= micro_u:
+                fee_open = self._leg_market_open_fee_usdt(sym, pos)
+                exit_limit_mode = str(getattr(cfg, "exit_order_type", "market") or "market").lower() == "limit"
+                fee_close = (
+                    self._leg_maker_close_fee_usdt(sym, pos)
+                    if bool(getattr(cfg, "leg_micro_maker_exit_enabled", False)) or exit_limit_mode
+                    else self._leg_market_close_fee_usdt(sym, pos)
+                )
+                # 圆桌开火：净利 = 毛 − 开仓费 − 平仓预估费；阈值与摩擦挂钩
+                real_net = gross - fee_open - fee_close
+                target = self._leg_roundtrip_micro_target_usdt(sym, fee_open, fee_close, cfg)
+                if real_net <= target + 1e-12:
                     continue
                 allow_reload = stance == "scalp"
                 self._emit_micro_take_and_reload(
                     pair,
                     sym,
                     pos,
-                    reason=f"beta_leg_micro_take_flat_net={net_leg:.4f}",
+                    reason=f"beta_leg_micro_take_roundtrip_net={real_net:.4f}>target={target:.4f}",
                     allow_reload=allow_reload,
                 )
-                lock[sym] = now + cool
+                self._leg_micro_minute_bump(sym, now)
+                lock[sym] = now + micro_cd
+                acc = float(pos.get("accumulated_fees", 0.0) or 0.0)
                 self.log_sync(
-                    f"[BetaNeutralHF] LEG_MICRO sym={sym} uPnl={gross:.4f} acc_fees={acc:.4f} "
-                    f"est_close_fee={fee_close:.4f} flat_net_est={net_leg:.4f} thr={micro_u:.4f} "
+                    f"[BetaNeutralHF] LEG_MICRO sym={sym} gross={gross:.4f} acc_fees={acc:.4f} "
+                    f"fee_open={fee_open:.4f} fee_close={fee_close:.4f} real_net={real_net:.4f} thr={target:.4f} "
                     f"reload={allow_reload} pair={pair.get('id')}"
                 )
-            sig = self._signal_for_alt(alt)
+            sig = self._signal_for_alt_radar(alt)
             live_z = float(sig["zscore"]) if sig is not None else 0.0
             pair["net_pnl_usdt"] = float(self._pair_net_pnl(pair))
             pair["live_zscore"] = float(live_z)
@@ -1387,6 +1863,8 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
                     "close_reason": str(pair.get("close_reason", "") or ""),
                     "matrix_regime_alt": self._matrix_regime_str(str(pair["alt"])),
                     "matrix_regime_anchor": self._matrix_regime_str(anchor),
+                    "decoupled_momentum": bool(pair.get("decoupled_momentum")),
+                    "decoupled_monitor": bool(self._is_decoupled_alt(str(pair["alt"]))),
                 }
                 for pair in self._active_pairs.values()
             ],
@@ -1405,10 +1883,12 @@ class BetaNeutralHFScalpStrategy(BaseStrategy):
         px = _last_price(event.ticker or {})
         if px <= 0:
             return
+        feed_symbol_minute_close(str(event.symbol), px, time.time())
         self._deque(event.symbol).append(px)
         anchor = str(cfg.anchor_symbol)
         ev_c = self._canonical_market_symbol(event.symbol)
         if ev_c == self._canonical_market_symbol(anchor):
+            feed_anchor_minute_close(anchor, px, time.time())
             for alt in self._alpha_symbols():
                 alt_px = float(paper_engine.latest_prices.get(alt, 0.0) or (self._prices.get(alt)[-1] if self._prices.get(alt) else 0.0) or 0.0)
                 if alt_px > 0:

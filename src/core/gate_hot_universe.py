@@ -42,9 +42,10 @@ async def _fetch_rank_apply(
     if not hu.enabled:
         return False, "disabled"
     cfg = config_manager.get_config()
-    if bool(cfg.beta_neutral_hf.enabled) and (
+    bnhf_active = bool(cfg.beta_neutral_hf.enabled) and (
         "beta_neutral_hf" in list(cfg.strategy.active_strategies or [])
-    ):
+    )
+    if bnhf_active and not bool(getattr(hu, "apply_to_beta_neutral_hf", False)):
         return False, "beta_neutral_owned_symbols"
 
     if not _l2_conflict_logged and config_manager.get_config().l2_command.enabled:
@@ -64,10 +65,33 @@ async def _fetch_rank_apply(
         change_multiplier_cap=float(hu.change_score_cap),
         funding_scale=float(hu.funding_score_scale),
         funding_cap_mult=float(hu.funding_score_cap_mult),
+        hl_vol_weight=float(getattr(hu, "hl_vol_weight", 0.0)),
+        hl_vol_bps_divisor=float(getattr(hu, "hl_vol_bps_divisor", 180.0)),
+        hl_vol_score_cap=float(getattr(hu, "hl_vol_score_cap", 2.2)),
     )
     if not syms:
         _snapshot["error"] = "empty symbol list after rank"
         return False, "empty"
+
+    if bnhf_active and bool(getattr(hu, "apply_to_beta_neutral_hf", False)):
+        anchor = str(cfg.beta_neutral_hf.anchor_symbol or "").strip()
+        alt_cap = max(1, int(getattr(hu, "beta_neutral_hf_alt_cap", 20)))
+        alts = [s for s in syms if s and s != anchor][:alt_cap]
+        if not alts:
+            _snapshot["error"] = "empty alt list for beta_neutral_hf"
+            return False, "empty"
+        config_manager.config.beta_neutral_hf.symbols = list(alts)
+        sub = [anchor, *alts] if anchor else list(alts)
+        # 与面板 / analyzer / 其它读 strategy.symbols 的路径一致
+        config_manager.config.strategy.symbols = list(sub)
+        if hasattr(exchange, "subscribe_market_data"):
+            await exchange.subscribe_market_data(sub)
+        _snapshot["enabled"] = True
+        _snapshot["last_refresh_ts"] = time.time()
+        _snapshot["symbols"] = list(alts)
+        _snapshot["stats"] = {**stats, "mode": "beta_neutral_hf", "anchor": anchor}
+        _snapshot["error"] = ""
+        return True, "ok_bnhf"
 
     config_manager.config.strategy.symbols = list(syms)
     if hasattr(exchange, "subscribe_market_data"):

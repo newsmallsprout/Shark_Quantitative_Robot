@@ -25,6 +25,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend source code
 COPY main.py .
+COPY backtest_runner.py .
+COPY backtest_worker.py .
+COPY event_replay_main.py .
 COPY src/ ./src/
 COPY config/ ./config/
 COPY license/ ./license/

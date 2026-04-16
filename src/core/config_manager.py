@@ -22,6 +22,10 @@ def _resolve_settings_yaml_path() -> str:
         cand = root / "config" / "settings.yaml"
         if cand.is_file():
             return str(cand)
+        model = root / "config" / "settings.model.yaml"
+        if model.is_file():
+            log.info(f"Using template config {model} (copy to config/settings.yaml for local secrets)")
+            return str(model)
     except Exception:
         pass
     rel = "config/settings.yaml"
@@ -131,6 +135,12 @@ class ExecutionConfig(BaseModel):
     high_conviction_trailing_min_hold_sec: float = 2.0
     # ROE 达阈值并武装 trailing 后，再过 N 秒才允许按价回撤触发平仓（防止武装当根 K 立刻被洗）
     trailing_callback_grace_after_arm_sec: float = 1.0
+    # Predator 净利润 Chandelier / 不败金身：仅当「毛利 − 开+平预估 Taker 费」> 该值才允许止盈类平仓（0=必须严格为正）
+    predator_chandelier_min_net_usdt: float = 0.0
+    # Chandelier：当前净利须 ≥ 峰值净利 × 该比例才不平（0.8=最多回吐 20% 峰值，「止损线」宽松）
+    predator_chandelier_retain_frac: float = 0.8
+    # Predator 止盈/地板平仓用盘口限价（reduce_only），避免纯市价吃单
+    predator_exit_limit_order: bool = True
 
 
 class PaperEngineConfig(BaseModel):
@@ -153,6 +163,19 @@ class PaperEngineConfig(BaseModel):
     enforce_exchange_physics: bool = False
     # True：新开仓须在 entry_context 带止盈/止损限价；成交后挂 OCO（单测 conftest 会关）
     require_entry_tp_sl_limits: bool = False
+    # 盈利化债：平仓实现正净利后，用其中一部分去市价减仓当前最亏腿（见 paper_engine）
+    pnl_wash_enabled: bool = True
+    # 微利多单实现净利 ≥ 该值时触发化债（与 leg 微利阈值配合，默认与 beta_hf 目标一致偏 1.5U 量级）
+    pnl_wash_min_credit_usdt: float = 1.5
+    # True：仅当 entry_context 带 beta_leg_micro_take 且多为多单赢利时，优先啃空单（按 ROE 最烂优先）
+    pnl_wash_prefer_short_bags_on_long_micro: bool = True
+    # True：化债候选腿须带 beta_neutral_hf 标记
+    pnl_wash_only_beta_hf_legs: bool = True
+    # 逐仓纸面：权益（margin_used+unrealized）触及维持保证金附近则强制市价全平，避免「无限浮亏」拖累全账户
+    isolated_hard_liquidation_enabled: bool = True
+    isolated_liquidation_maintenance_buffer: float = 1.05  # equity <= maintenance × 该系数 → 强平
+    # AI 下发 dynamic_max_loss_margin_pct：浮亏超「保证金×比例」先斩；False 则仅走上面维持带强平
+    ai_dynamic_margin_loss_cap_enabled: bool = True
 
 class StrategyParams(BaseModel):
     neutral_rsi_buy: int = 30
@@ -300,6 +323,13 @@ class BetaNeutralHFConfig(BaseModel):
     cross_section_min_edge_bps: float = 0.6
     cross_section_top_k: int = 4
     cross_section_lookback: int = 8
+    # 双雷达：山寨波动 ≫ BTC 且资金/单币 Z 极端 → 脱钩；切 OBI 动量、禁 BTC 均值回归与截面锚回退
+    dual_radar_enabled: bool = True
+    decouple_vol_ratio_vs_btc: float = 3.0
+    decouple_funding_rate_abs: float = 0.0005
+    decouple_zscore_abs: float = 4.0
+    decouple_momentum_obi_abs: float = 0.28
+    decoupled_margin_loss_cap: float = 0.4
     pair_leverage: int = 8
     pair_margin_usdt: float = 6.0
     # 单 pair 双腿合计初始保证金 ≤ min(available/max_active_pairs, equity × 本比例)
@@ -318,7 +348,7 @@ class BetaNeutralHFConfig(BaseModel):
     entry_order_type: str = "limit"
     entry_limit_ttl_ms: int = 1500
     entry_limit_requote_max: int = 3
-    exit_order_type: str = "market"
+    exit_order_type: str = "limit"
     candidate_limit_ui: int = 6
     closed_history_limit: int = 12
     max_active_pairs: int = 50
@@ -333,18 +363,62 @@ class BetaNeutralHFConfig(BaseModel):
     entry_group_min_feasible: int = Field(default=1, ge=1, le=32)
     # exchange_group_min_max：组内统一杠杆 = 各 ALT 与锚的交易所 leverage_max 的最小值；单开取 min(该 ALT, 锚)。dynamic=旧版按信号/AI 缩放，组内取各腿有效杠杆的最小值
     entry_leverage_mode: str = "exchange_group_min_max"
-    # 开仓 EV：期望 TP(USDT) 需 > 圆桌双边费 × 该倍数；调低以放开震荡市高频小单
-    entry_ev_round_trip_mult: float = 0.22
+    # 开仓 EV：期望 TP(USDT) 需 > 圆桌双边费 × 该倍数（代码层再强制 floor≥1.2）
+    entry_ev_round_trip_mult: float = 1.2
     # 独立腿：毛利 − 单次市价平仓预估费 > 该值(USDT) 则微利平仓并可瞬时重载（宜小，避免「有赚不平」）
     leg_micro_take_usdt: float = 0.06
+    # 圆桌微利：净利 = 毛 unrealized − 开仓Taker费(按entry) − 平仓Taker费(按现价)；仅当净利 > max(下值, frac*(两费之和)) 才平仓
+    leg_micro_dynamic_floor_usdt: float = 0.15
+    leg_micro_fee_surplus_fraction: float = 0.5
+    # 同一标的在同一 Unix 分钟内最多「收割+续杯」次数（对齐 1m K 内刷单上限）
+    leg_micro_max_reload_per_1m_bar: int = Field(default=2, ge=0, le=32)
+    # 微利触发后该腿最短冷却（秒），与 reload_cooldown_sec 取大
+    leg_micro_live_cooldown_sec: float = 10.0
     # 微利平仓后立刻同品种同向同量市价再进场（永动机续杯）
     instant_reload_enabled: bool = True
     # 同一腿连续重载的最短间隔，避免信号队列堆积重复触发
     reload_cooldown_sec: float = 0.35
-    # matrix_regime=TRENDING_* 时顺势腿 ROE 追踪（替代 1U 微利斩仓）
-    trend_trailing_activation_roe: float = 0.008
+    # matrix_regime=TRENDING_* 时顺势腿 ROE 追踪（paper_engine Predator：武装 ROE 阈值，如 0.004=0.4%）
+    trend_trailing_activation_roe: float = 0.004
     trend_trailing_callback_roe: float = 0.004
-
+    # 顺势奔跑：同武装 ROE；净利回撤由 execution.predator_chandelier_retain_frac 控制
+    ride_trailing_activation_roe: float = 0.004
+    ride_trailing_price_callback_frac: float = 0.15  # 已废弃：狼群仅用利润回撤，保留字段兼容
+    # 锚（BTC）大级别趋势过滤：STRONG_UP 禁山寨做空；STRONG_DOWN 禁山寨做多；STABLE 双向
+    trend_filter_enabled: bool = True
+    trend_filter_fast_minutes: int = 15
+    trend_filter_slow_minutes: int = 60
+    trend_filter_strong_separation_bps: float = 28.0
+    trend_filter_min_minutes: int = 65  # 分钟收样本不足则 STABLE
+    # 单车种 1m 微观趋势：逆势不加空/不加多；续杯同样尊重
+    micro_trend_filter_enabled: bool = True
+    micro_trend_ema_minutes: int = 20
+    micro_trend_lookback_minutes: int = 15
+    micro_trend_min_bars: int = 24
+    micro_trend_bps_confirm: float = 8.0
+    # 策略 inventory：做空腿数 − 做多腿数 ≥ 该值 → 禁止新开/续空；对称禁止开多
+    directional_imbalance_cap: int = 3
+    # 激进市价 Taker 前：前 5 档 OBI 必须同向极端（无盘口时不挡单，避免停机）
+    obi_taker_gate_enabled: bool = True
+    obi_taker_min_abs: float = 0.28
+    obi_taker_top_levels: int = 5
+    # 资金费「养单」：持仓吃贴够厚时跳过自动减仓化债（仍尊重强平）
+    funding_preserve_skip_wash_enabled: bool = True
+    funding_preserve_min_abs_rate: float = 0.00025  # 每期费率绝对值（Gate: 正=多付空）
+    # 微利平仓：Post-Only 限价挂在动态 TP 附近（Maker）；即时「续杯」默认关闭以免裸露
+    leg_micro_maker_exit_enabled: bool = False
+    leg_micro_maker_exit_offset_bps: float = 0.0
+    leg_micro_maker_exit_skip_instant_reload: bool = True
+    # 成交流「毒性」门控（与 OBI 并列）：需 futures.trades WS 已由网关 ingest
+    trade_flow_gate_enabled: bool = False
+    trade_flow_window_sec: float = 10.0
+    trade_flow_min_abs: float = 0.22
+    trade_flow_min_abs_contracts: float = 12.0
+    # 目标波动率缩放：pair_margin 参考 × vol(ATR) / vol_target
+    vol_scaled_sizing_enabled: bool = False
+    vol_target_micro_atr_bps: float = 12.0
+    vol_scale_min: float = 0.35
+    vol_scale_max: float = 1.85
 
 class DarwinSymbolPatch(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -522,6 +596,13 @@ class GateHotUniverseConfig(BaseModel):
     change_score_cap: float = 5.0
     funding_score_scale: float = 800.0
     funding_score_cap_mult: float = 1.5
+    # 24h 高低振幅(bps)加成：score *= (1 + w * min(hl_bps/div, cap))；0=关闭
+    hl_vol_weight: float = 0.85
+    hl_vol_bps_divisor: float = 180.0
+    hl_vol_score_cap: float = 2.2
+    # True 时不再因「beta_neutral 占用 symbols」而拒绝刷新，而是覆盖 beta_neutral_hf.symbols（山寨列表，不含锚）
+    apply_to_beta_neutral_hf: bool = False
+    beta_neutral_hf_alt_cap: int = 20
 
 
 class L2CommandConfig(BaseModel):
@@ -718,7 +799,7 @@ class InfiniteMatrixConfig(BaseModel):
     min_net_close_usdt: float = 0.08
     reload_enabled: bool = True
     reload_debounce_sec: float = 0.05
-    trend_trailing_activation_roe: float = 0.008
+    trend_trailing_activation_roe: float = 0.5
     trend_trailing_callback_roe: float = 0.004
     inject_dummy_tp_sl_for_paper: bool = True
 

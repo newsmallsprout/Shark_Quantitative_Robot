@@ -41,6 +41,9 @@ class AIContext:
                 "suggested_leverage_cap": 100,
                 "tp_atr_multiplier": 2.0,
                 "sl_atr_multiplier": 1.8,
+                "dynamic_tp_fee_multiplier": 1.5,
+                "dynamic_max_loss_margin_pct": 0.85,
+                "is_decoupled_hint": False,
                 "reason": "Waiting for initial AI analysis...",
             },
         )
@@ -297,6 +300,20 @@ class MarketAnalyzer:
         }
 
     @staticmethod
+    def _micro_decoupling_hint(micro_alt: Dict[str, Any], micro_btc: Dict[str, Any]) -> bool:
+        """
+        与 beta_neutral_hf._is_decoupled_alt 条件对齐的 REST 侧近似：供 LLM 与监控标签使用。
+        vol_alt > 3×vol_btc 且 (|资金费|>0.05% 或 |OBI| 极端近似「脱钩」)。
+        """
+        va = float(micro_alt.get("volatility_1m_bps", 0.0) or 0.0)
+        vb = float(micro_btc.get("volatility_1m_bps", 0.0) or 0.0)
+        if va <= 3.0 * max(vb, 1e-6):
+            return False
+        fr = abs(float(micro_alt.get("funding_rate", 0.0) or 0.0))
+        obi = abs(float(micro_alt.get("obi_5", 0.0) or 0.0))
+        return bool(fr > 0.0005 or obi > 0.45)
+
+    @staticmethod
     def _normalize_ai_payload(
         payload: Dict[str, Any],
         fallback_reason: str = "",
@@ -338,6 +355,16 @@ class MarketAnalyzer:
             sl_mult = 1.8
         tp_mult = max(0.5, min(2.0, tp_mult))
         sl_mult = max(1.0, min(3.0, sl_mult))
+        try:
+            tp_fee_mult = float(raw.get("dynamic_tp_fee_multiplier", 1.5) or 1.5)
+        except Exception:
+            tp_fee_mult = 1.5
+        tp_fee_mult = max(1.1, min(5.0, tp_fee_mult))
+        try:
+            max_loss_pct = float(raw.get("dynamic_max_loss_margin_pct", 0.85) or 0.85)
+        except Exception:
+            max_loss_pct = 0.85
+        max_loss_pct = max(0.2, min(0.85, max_loss_pct))
         if mr in ("TRENDING_UP", "TRENDING_DOWN"):
             regime = "VOLATILE"
         return {
@@ -347,19 +374,30 @@ class MarketAnalyzer:
             "suggested_leverage_cap": lev_cap,
             "tp_atr_multiplier": tp_mult,
             "sl_atr_multiplier": sl_mult,
+            "dynamic_tp_fee_multiplier": tp_fee_mult,
+            "dynamic_max_loss_margin_pct": max_loss_pct,
             "reason": str(raw.get("reason") or fallback_reason or "Normalized AI payload"),
         }
 
     async def analyze_markets(self):
         global_config = config_manager.get_config()
-        symbols = global_config.strategy.symbols
+        symbols = list(global_config.strategy.symbols or [])
+        anchor = str(getattr(getattr(global_config, "beta_neutral_hf", None), "anchor_symbol", None) or "BTC/USDT")
         async with aiohttp.ClientSession() as session:
+            try:
+                btc_micro = await self._collect_micro_inputs(session, anchor)
+            except Exception:
+                btc_micro = {"volatility_1m_bps": 0.0, "obi_5": 0.0, "funding_rate": 0.0}
             for symbol in symbols:
                 if not self.running:
                     break
 
                 try:
                     micro = await self._collect_micro_inputs(session, symbol)
+                    if str(symbol).strip() != str(anchor).strip():
+                        micro["is_decoupled_hint"] = bool(MarketAnalyzer._micro_decoupling_hint(micro, btc_micro))
+                    else:
+                        micro["is_decoupled_hint"] = False
                     prompt = self._build_prompt(symbol, micro)
                     analysis = await self._call_llm_with_retry(prompt, micro=micro)
                     payload = {"symbol": symbol, **micro, **analysis}
@@ -374,6 +412,8 @@ class MarketAnalyzer:
                         f"AI Published [{symbol}]: {regime_str} | Score: {score:.1f} | "
                         f"LevCap: {payload.get('suggested_leverage_cap')} | "
                         f"TPxATR: {payload.get('tp_atr_multiplier')} | SLxATR: {payload.get('sl_atr_multiplier')} | "
+                        f"tpFee×: {payload.get('dynamic_tp_fee_multiplier')} | "
+                        f"maxLoss%: {payload.get('dynamic_max_loss_margin_pct')} | "
                         f"{payload.get('reason', '')}"
                     )
 
@@ -398,6 +438,11 @@ Rules:
 3. suggested_leverage_cap must be an integer between 10 and 100.
 4. tp_atr_multiplier must be a float between 0.5 and 2.0.
 5. sl_atr_multiplier must be a float between 1.0 and 3.0.
+6. dynamic_tp_fee_multiplier: float — take-profit micro-target as a multiple of ROUND-TRIP taker fees (open+close).
+   Guide: choppy / low vol_1m_bps + mild OBI → 1.2–1.5 (scratch fees quickly). Spikes in vol_1m_bps or extreme |obi_5| → 2.0–4.0 (let winners run).
+7. dynamic_max_loss_margin_pct: float — max allowed FLOATING LOSS per isolated leg as a fraction of that leg's initial margin (0.2–0.85).
+   Guide: STABLE / mean-revert tape → 0.70–0.85 (room to mean-revert). One-sided violence (high vol + OBI aligned against a hypothetical counter-trend bag) → 0.30–0.50 (cut fast).
+8. If input JSON has is_decoupled_hint=true: this alt is likely decoupling from BTC (vol ratio + funding/OBI shock). Prefer momentum-aware TP/SL multipliers; do NOT recommend fading the vertical move.
 
 Output EXACTLY these fields:
 - "regime": string ("VOLATILE" or "STABLE") — legacy coarse bucket
@@ -410,6 +455,8 @@ Output EXACTLY these fields:
 - "suggested_leverage_cap": integer (10-100)
 - "tp_atr_multiplier": float (0.5-2.0)
 - "sl_atr_multiplier": float (1.0-3.0)
+- "dynamic_tp_fee_multiplier": float (1.1-5.0)
+- "dynamic_max_loss_margin_pct": float (0.2-0.85)
 - "reason": string
 """
 

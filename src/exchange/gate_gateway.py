@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import hmac
 import hashlib
+import os
 import time
 import json
 from typing import Dict, Any, Callable, List, Optional, Tuple
@@ -160,12 +161,19 @@ class GateFuturesGateway:
         else:
             tif = "ioc"
         payload = {
-            "contract": symbol.replace('/', '_'), # Gate.io uses BTC_USDT
+            "contract": symbol.replace('/', '_'),  # Gate.io uses BTC_USDT
             "size": int(size),
             "price": str(price) if price else "0",
             "tif": tif,
             "reduce_only": reduce_only,
         }
+        # 禁止自动追加保证金（部分合约/账户支持；若下单被拒可设环境变量 SKIP_GATE_AUTO_MARGIN_FALSE=1）
+        if os.environ.get("SKIP_GATE_AUTO_MARGIN_FALSE", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+        ):
+            payload["auto_margin"] = False
         if oid:
             payload["text"] = str(oid)[:28]
 
@@ -310,6 +318,12 @@ class GateFuturesGateway:
                         "tif": "ioc",
                         "reduce_only": True,
                     }
+                    if os.environ.get("SKIP_GATE_AUTO_MARGIN_FALSE", "").strip().lower() not in (
+                        "1",
+                        "true",
+                        "yes",
+                    ):
+                        payload["auto_margin"] = False
                     payload_str = json.dumps(payload)
                     headers = self._generate_signature("POST", endpoint, "", payload_str)
 

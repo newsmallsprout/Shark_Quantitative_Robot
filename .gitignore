@@ -6,7 +6,8 @@ venv/
 env/
 logs/
 data/
-license/
+license/*
+!license/public.pem
 frontend/node_modules/
 frontend/dist/
 config/settings.yaml

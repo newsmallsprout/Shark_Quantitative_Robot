@@ -38,6 +38,9 @@ from src.strategy.tuner import (
     strategy_auto_tuner,
 )
 from src.data.market_oracle import MarketOracle
+from src.core.license_gate import assert_strategy_runtime_allowed
+
+assert_strategy_runtime_allowed()
 
 
 def _norm_symbol_key(s: str) -> str:
@@ -972,6 +975,39 @@ class StrategyEngine:
         balance_task = asyncio.create_task(self._periodic_balance_update())
         
         await asyncio.gather(processor_task, balance_task)
+
+    async def start_replay_workers(self) -> None:
+        """
+        事件回放：启动与实盘相同的 OrderManager（若启用）+ 信号处理 + 余额同步，
+        但不阻塞调用方（由 event_replay 驱动 tick 泵送）。
+        """
+        self.running = True
+        log.info("Strategy Engine replay workers starting…")
+        cfg = config_manager.get_config()
+        need_core_limit_manager = bool(getattr(cfg.strategy.params, "core_entry_limit_enabled", False))
+        if cfg.execution.use_order_manager or need_core_limit_manager:
+            self.order_manager = OrderManager(self.exchange)
+            await self.order_manager.start()
+            log.info(
+                "OrderManager enabled for replay "
+                f"(use_order_manager={bool(cfg.execution.use_order_manager)} "
+                f"core_limit_manager={need_core_limit_manager})"
+            )
+        self._replay_processor_task = asyncio.create_task(self.process_signals())
+        self._replay_balance_task = asyncio.create_task(self._periodic_balance_update())
+
+    async def stop_replay_workers(self) -> None:
+        self.running = False
+        for attr in ("_replay_processor_task", "_replay_balance_task"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attr, None)
+        await self.stop()
 
     async def _periodic_balance_update(self):
         """Fetch balance periodically since WS doesn't push it in standard ticker."""

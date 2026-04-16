@@ -66,11 +66,23 @@ async def handle_ai_message(topic: str, data: dict):
     """Callback for ZMQ Subscriber to update local AIContext"""
     if topic == IPC_TOPIC_AI_SCORE:
         symbol = data.get("symbol")
+        if not str(symbol or "").strip():
+            return
         try:
             regime = MarketRegime(data.get("regime"))
         except ValueError:
             regime = MarketRegime.OSCILLATING
             
+        try:
+            tp_fee_mult = float(data.get("dynamic_tp_fee_multiplier", 1.5) or 1.5)
+        except (TypeError, ValueError):
+            tp_fee_mult = 1.5
+        tp_fee_mult = max(1.1, min(5.0, tp_fee_mult))
+        try:
+            max_loss_pct = float(data.get("dynamic_max_loss_margin_pct", 0.85) or 0.85)
+        except (TypeError, ValueError):
+            max_loss_pct = 0.85
+        max_loss_pct = max(0.2, min(0.85, max_loss_pct))
         ai_context.update(
             symbol,
             {
@@ -79,6 +91,9 @@ async def handle_ai_message(topic: str, data: dict):
                 "score": float(data.get("score", 50.0)),
                 "reason": data.get("reason", ""),
                 "obi_5": float(data.get("obi_5", 0.0) or 0.0),
+                "dynamic_tp_fee_multiplier": tp_fee_mult,
+                "dynamic_max_loss_margin_pct": max_loss_pct,
+                "is_decoupled_hint": bool(data.get("is_decoupled_hint", False)),
             },
         )
     elif topic == IPC_TOPIC_L1_TUNING:
@@ -116,14 +131,16 @@ async def run_bot(trading_ready: Optional[asyncio.Event] = None):
     if not os.path.exists("license/public.pem"):
         log.critical(f"Public key not found at license/public.pem")
 
+    skip_lic = os.environ.get("SKIP_LICENSE_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
     validator = LicenseValidator("license/public.pem", config.license_path)
-    if os.path.exists(config.license_path):
-        # Temporarily bypass license check for Sandbox Testing as requested
-        # if not validator.validate():
-        #     log.critical("License validation failed.")
-        pass
-    else:
-        log.warning("License missing. Please upload via API.")
+    if skip_lic:
+        log.warning("SKIP_LICENSE_CHECK enabled — not for production; strategy IP is exposed.")
+    elif not os.path.exists("license/public.pem") or not os.path.exists(config.license_path):
+        log.critical("License or public key missing. Place license/public.pem and license/license.key, or set SKIP_LICENSE_CHECK=1 for dev only.")
+        sys.exit(1)
+    elif not validator.validate():
+        log.critical("License validation failed (signature, expiry, or machine fingerprint).")
+        sys.exit(1)
 
     # 2. Initialize Risk Control Engine
     log.info("Risk Control Engine Initialized.")
@@ -163,12 +180,50 @@ async def run_bot(trading_ready: Optional[asyncio.Event] = None):
     subscriber_task = asyncio.create_task(subscriber.start(handle_ai_message))
 
     # 5. Start Gateway WebSocket and Strategy Engine
-    symbols = config.strategy.symbols
-    if not symbols:
-        symbols = ["BTC/USDT", "ETH/USDT"]
+    cfg0 = config_manager.get_config()
+    hu0 = cfg0.gate_hot_universe
+    bn0 = cfg0.beta_neutral_hf
+    active0 = list(cfg0.strategy.active_strategies or [])
+    use_hot_bnhf = (
+        bool(hu0.enabled)
+        and bool(getattr(hu0, "apply_to_beta_neutral_hf", False))
+        and bool(bn0.enabled)
+        and "beta_neutral_hf" in active0
+    )
 
     await exchange.start_rest_session()
     await exchange.sync_usdt_futures_physics_matrix()
+
+    if use_hot_bnhf:
+        import aiohttp
+
+        from src.core.gate_hot_universe import refresh_gate_hot_universe_once
+
+        symbols: list = []
+        try:
+            connector = aiohttp.TCPConnector(ssl=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                await refresh_gate_hot_universe_once(exchange, session)
+            cfg1 = config_manager.get_config()
+            anchor = str(cfg1.beta_neutral_hf.anchor_symbol or "").strip()
+            alts = list(cfg1.beta_neutral_hf.symbols or [])
+            symbols = [anchor, *alts] if anchor else list(alts)
+            if not alts:
+                log.warning(
+                    "[HotUniverse] 启动拉榜无山寨列表，回退到 strategy.symbols（请检查 Gate 连通与 min_quote_vol）"
+                )
+                symbols = list(cfg1.strategy.symbols) or ["BTC/USDT", "ETH/USDT"]
+            else:
+                log.info(f"[HotUniverse] 启动订阅热门监控 {len(alts)} 山寨 + 锚: {anchor} | 预览 {alts[:5]}…")
+        except Exception as e:
+            log.warning(f"[HotUniverse] 启动刷新失败: {e}；使用 strategy.symbols 订阅")
+            cfg1 = config_manager.get_config()
+            symbols = list(cfg1.strategy.symbols) or ["BTC/USDT", "ETH/USDT"]
+    else:
+        symbols = list(cfg0.strategy.symbols)
+        if not symbols:
+            symbols = ["BTC/USDT", "ETH/USDT"]
+
     await exchange.subscribe_market_data(symbols)
 
     # 避免前 10s periodic 更新前 risk_engine.current_balance=0 导致下单数量为 0

@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../../store/useStore';
 import type { Position } from '../../store/useStore';
 import { Crosshair } from 'lucide-react';
@@ -23,11 +23,23 @@ function formatMarginUsd(v: number): string {
   return `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+const POS_PAGE = 18;
+
 export const StarshipPositions: React.FC = () => {
   const allPositions = useStore((s) => s.positions);
   const positions = useMemo(
     () => allPositions.filter((p) => Math.abs(p.size) > 0),
     [allPositions]
+  );
+  const [posPage, setPosPage] = useState(0);
+  const posPages = Math.max(1, Math.ceil(positions.length / POS_PAGE));
+  const pageIdx = Math.min(posPage, posPages - 1);
+  useEffect(() => {
+    setPosPage((p) => Math.min(p, Math.max(0, posPages - 1)));
+  }, [positions.length, posPages]);
+  const slice = useMemo(
+    () => positions.slice(pageIdx * POS_PAGE, pageIdx * POS_PAGE + POS_PAGE),
+    [positions, pageIdx]
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -37,13 +49,34 @@ export const StarshipPositions: React.FC = () => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = scrollTopRef.current;
-  }, [positions]);
+  }, [slice]);
 
   return (
     <div className="ti-glass rounded-xl flex flex-col min-h-0 h-full overflow-hidden ring-1 ring-slate-200/80 shadow-sm">
       <div className="px-3 py-1.5 border-b border-slate-200/90 flex items-center gap-2 shrink-0 bg-gradient-to-r from-white to-slate-50/90">
         <Crosshair className="w-4 h-4 text-teal-600 shrink-0" />
         <span className="text-[11px] font-semibold tracking-wide text-slate-600">当前持仓</span>
+        {positions.length > POS_PAGE ? (
+          <span className="ml-auto flex items-center gap-1 text-[10px] text-slate-500">
+            <button
+              type="button"
+              disabled={pageIdx <= 0}
+              onClick={() => setPosPage((p) => Math.max(0, p - 1))}
+              className="px-1.5 py-0.5 rounded border border-slate-200 bg-white disabled:opacity-40"
+            >
+              ‹
+            </button>
+            {pageIdx + 1}/{posPages}
+            <button
+              type="button"
+              disabled={pageIdx >= posPages - 1}
+              onClick={() => setPosPage((p) => Math.min(posPages - 1, p + 1))}
+              className="px-1.5 py-0.5 rounded border border-slate-200 bg-white disabled:opacity-40"
+            >
+              ›
+            </button>
+          </span>
+        ) : null}
       </div>
       <div
         ref={scrollRef}
@@ -70,7 +103,7 @@ export const StarshipPositions: React.FC = () => {
                 </td>
               </tr>
             ) : (
-              positions.map((pos) => {
+              slice.map((pos) => {
                 const marginU = initialMarginUsdt(pos);
                 const lev = pos.leverage && pos.leverage > 0 ? Math.round(pos.leverage) : '—';
                 const win = pos.unrealizedPnl >= 0;

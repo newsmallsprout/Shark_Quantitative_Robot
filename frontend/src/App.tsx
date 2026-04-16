@@ -1,15 +1,31 @@
 import { useEffect, useState } from 'react';
 import { StarshipDashboard } from './components/starship/StarshipDashboard';
 import TradeHistoryPage from './components/TradeHistoryPage';
+import { LicenseOverlay, type LicenseStatusPayload } from './components/LicenseOverlay';
 import { useStore } from './store/useStore';
 import { ActivitySquare, ShieldCheck, LayoutDashboard, History } from 'lucide-react';
 
 function App() {
   const feedMeta = useStore((s) => s.feedMeta);
   const [page, setPage] = useState<'dashboard' | 'history'>('dashboard');
+  const [licensePayload, setLicensePayload] = useState<LicenseStatusPayload | null>(null);
+  const [licenseFetchError, setLicenseFetchError] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
+      try {
+        const res = await fetch('/api/license/status');
+        if (!res.ok) {
+          setLicenseFetchError(`许可证接口返回 ${res.status}`);
+          setLicensePayload(null);
+        } else {
+          setLicensePayload((await res.json()) as LicenseStatusPayload);
+          setLicenseFetchError(null);
+        }
+      } catch {
+        setLicenseFetchError('无法连接后端（请确认 API 已启动，默认 127.0.0.1:8002）');
+        setLicensePayload(null);
+      }
       await useStore.getState().hydrateDashboard();
       useStore.getState().initWebSocket();
     })();
@@ -17,6 +33,7 @@ function App() {
 
   return (
     <div className="min-h-screen flex flex-col text-slate-900">
+      <LicenseOverlay payload={licensePayload} fetchError={licenseFetchError} />
       <header className="shrink-0 border-b border-slate-200 bg-white/95 backdrop-blur-md z-20 shadow-sm">
         {feedMeta.sandboxExecution ? (
           <div className="text-center py-1.5 text-[10px] font-mono font-bold uppercase tracking-[0.15em] text-amber-800 bg-amber-50 border-b border-amber-200">

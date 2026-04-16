@@ -10,6 +10,19 @@ type TradeHistoryRow = {
   exit_reason: string;
 };
 
+type LeaderboardRow = {
+  file?: string;
+  closed_at?: number;
+  symbol?: string;
+  side?: string;
+  net_pnl?: number;
+  gross_pnl?: number;
+  fees?: number;
+  exit_reason?: string;
+  duration_sec?: number;
+  leverage?: number;
+};
+
 type LogsResponse = { logs?: string[] };
 type SceneLeaderboardItem = {
   scene_key?: string;
@@ -34,6 +47,12 @@ type TradeHistoryResponse = {
     losses?: number;
     win_rate?: number;
     net_total?: number;
+    fees_total?: number;
+    worst_losses?: LeaderboardRow[];
+    best_wins?: LeaderboardRow[];
+    worst_losses_top_sum?: number;
+    best_wins_top_sum?: number;
+    strategy_hints?: string[];
   };
 };
 type ResonanceResponse = {
@@ -59,6 +78,9 @@ function exitReasonZh(reason: string): string {
     exit_alpha_decay_time: '时间止损',
     core_bracket_tp: '限价止盈',
     core_bracket_sl: '限价止损',
+    isolated_margin_ruin: '逐仓保证金击穿',
+    eod_flat: '回测/会话结束强平',
+    liquidated: '强平',
   };
   return m[reason] || reason || '—';
 }
@@ -75,6 +97,12 @@ export const BattleReportDeck: React.FC = () => {
     losses: 0,
     winRate: 0,
     net: 0,
+    feesTotal: 0,
+    worstLosses: [] as LeaderboardRow[],
+    bestWins: [] as LeaderboardRow[],
+    worstTopSum: 0,
+    bestTopSum: 0,
+    strategyHints: [] as string[],
   });
 
   const load = useCallback(async () => {
@@ -82,8 +110,8 @@ export const BattleReportDeck: React.FC = () => {
     setError(null);
     try {
       const [historyRes, logsRes, resoRes] = await Promise.all([
-        fetch('/api/trade_history?limit=50'),
-        fetch('/api/logs'),
+        fetch('/api/trade_history?limit=24&offset=0'),
+        fetch('/api/logs?limit=12&offset=0'),
         fetch('/api/resonance_metrics'),
       ]);
 
@@ -114,21 +142,39 @@ export const BattleReportDeck: React.FC = () => {
       if (!logsRes.ok) throw new Error(`logs HTTP ${logsRes.status}`);
 
       setRows(Array.isArray(history.items) ? history.items : []);
-      setLogs(Array.isArray(logsJson.logs) ? logsJson.logs.slice().reverse().slice(0, 8) : []);
+      setLogs(Array.isArray(logsJson.logs) ? logsJson.logs : []);
       setSceneTop(Array.isArray(resoJson.adaptation?.scene_leaderboard) ? resoJson.adaptation.scene_leaderboard.slice(0, 3) : []);
       setSummaryState({
-        total: Number(history.summary?.total_count ?? history.items?.length ?? 0),
+        total: Number(history.summary?.total_count ?? 0),
         wins: Number(history.summary?.wins ?? 0),
         losses: Number(history.summary?.losses ?? 0),
         winRate: Number(history.summary?.win_rate ?? 0) * 100,
         net: Number(history.summary?.net_total ?? 0),
+        feesTotal: Number(history.summary?.fees_total ?? 0),
+        worstLosses: Array.isArray(history.summary?.worst_losses) ? history.summary!.worst_losses! : [],
+        bestWins: Array.isArray(history.summary?.best_wins) ? history.summary!.best_wins! : [],
+        worstTopSum: Number(history.summary?.worst_losses_top_sum ?? 0),
+        bestTopSum: Number(history.summary?.best_wins_top_sum ?? 0),
+        strategyHints: Array.isArray(history.summary?.strategy_hints) ? history.summary!.strategy_hints! : [],
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载战报失败');
       setRows([]);
       setLogs([]);
       setSceneTop([]);
-      setSummaryState({ total: 0, wins: 0, losses: 0, winRate: 0, net: 0 });
+      setSummaryState({
+        total: 0,
+        wins: 0,
+        losses: 0,
+        winRate: 0,
+        net: 0,
+        feesTotal: 0,
+        worstLosses: [],
+        bestWins: [],
+        worstTopSum: 0,
+        bestTopSum: 0,
+        strategyHints: [],
+      });
     } finally {
       setLoading(false);
     }
@@ -156,6 +202,15 @@ export const BattleReportDeck: React.FC = () => {
     };
   }, [rows, summaryState]);
 
+  const fmtTime = useCallback((ts: number) => {
+    if (!Number.isFinite(ts) || ts <= 0) return '—';
+    try {
+      return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
+    } catch {
+      return '—';
+    }
+  }, []);
+
   return (
     <div className="ti-glass rounded-xl flex flex-col min-h-0 h-full overflow-hidden ring-1 ring-slate-200/80 shadow-sm">
       <div className="px-3 py-2 border-b border-slate-200/90 flex items-center justify-between gap-2 shrink-0 bg-gradient-to-r from-white to-slate-50/90">
@@ -181,6 +236,17 @@ export const BattleReportDeck: React.FC = () => {
       ) : null}
 
       <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3 text-[11px]">
+        {summaryState.strategyHints.length > 0 ? (
+          <div className="rounded-lg border border-amber-200/90 bg-amber-50/50 p-2.5 text-[10px] text-amber-950 leading-snug">
+            <div className="text-amber-900/90 text-[9px] uppercase tracking-wider font-semibold mb-1">策略提示</div>
+            <ul className="list-disc pl-3 space-y-0.5">
+              {summaryState.strategyHints.map((t, i) => (
+                <li key={i}>{t}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
         <div className="grid grid-cols-2 gap-2">
           <div className="rounded-lg border border-slate-200/90 bg-white p-2 shadow-sm">
             <div className="text-slate-500 text-[9px] uppercase tracking-wider">近战总场次</div>
@@ -232,6 +298,63 @@ export const BattleReportDeck: React.FC = () => {
             </div>
           ) : (
             <div className="text-slate-500">暂无数据</div>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-rose-200/80 bg-rose-50/40 p-2.5 shadow-sm">
+          <div className="flex items-baseline justify-between gap-2 mb-2">
+            <div className="text-rose-700/90 text-[9px] uppercase tracking-wider font-semibold">亏损黑榜 Top10</div>
+            <div className="text-[9px] text-rose-600/80 tabular-nums">合计 {fmtNum(summaryState.worstTopSum, 4)} USDT</div>
+          </div>
+          {summaryState.worstLosses.length > 0 ? (
+            <div className="space-y-1.5 font-mono text-[10px] leading-snug">
+              {summaryState.worstLosses.map((row: LeaderboardRow, idx: number) => (
+                <div
+                  key={`${row.file || row.symbol}-${idx}`}
+                  className="border-b border-rose-100/90 pb-1.5 last:border-0 last:pb-0 text-slate-700"
+                >
+                  <div className="flex justify-between gap-2">
+                    <span className="text-rose-700">#{idx + 1}</span>
+                    <span className="text-slate-900 shrink-0">{row.symbol || '—'}</span>
+                    <span className="text-rose-600 tabular-nums">{fmtNum(Number(row.net_pnl ?? 0), 4)}</span>
+                  </div>
+                  <div className="text-slate-500 mt-0.5 pl-4">
+                    {exitReasonZh(String(row.exit_reason || ''))} · {row.side} · ×{fmtNum(Number(row.leverage ?? 0), 0)}
+                  </div>
+                  <div className="text-slate-400 pl-4">{fmtTime(Number(row.closed_at ?? 0))}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-slate-500 text-[10px]">暂无亏损平仓或未写入 autopsy</div>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-emerald-200/70 bg-emerald-50/30 p-2.5 shadow-sm">
+          <div className="flex items-baseline justify-between gap-2 mb-2">
+            <div className="text-emerald-800/90 text-[9px] uppercase tracking-wider font-semibold">盈利红榜 Top10</div>
+            <div className="text-[9px] text-emerald-700/80 tabular-nums">合计 +{fmtNum(summaryState.bestTopSum, 4)} USDT</div>
+          </div>
+          {summaryState.bestWins.length > 0 ? (
+            <div className="space-y-1.5 font-mono text-[10px] leading-snug">
+              {summaryState.bestWins.map((row: LeaderboardRow, idx: number) => (
+                <div
+                  key={`${row.file || row.symbol}-w-${idx}`}
+                  className="border-b border-emerald-100/80 pb-1.5 last:border-0 last:pb-0 text-slate-700"
+                >
+                  <div className="flex justify-between gap-2">
+                    <span className="text-emerald-700">#{idx + 1}</span>
+                    <span className="text-slate-900 shrink-0">{row.symbol || '—'}</span>
+                    <span className="text-emerald-700 tabular-nums">+{fmtNum(Number(row.net_pnl ?? 0), 4)}</span>
+                  </div>
+                  <div className="text-slate-500 mt-0.5 pl-4">
+                    {exitReasonZh(String(row.exit_reason || ''))} · {row.side}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-slate-500 text-[10px]">暂无盈利记录</div>
           )}
         </div>
 

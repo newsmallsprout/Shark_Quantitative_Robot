@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 import { List } from 'lucide-react';
 import type { Position } from '../store/useStore';
@@ -53,8 +53,20 @@ function positionMargin(pos: Position): number | null {
   return n / lev;
 }
 
+const POS_PAGE = 20;
+
 const PositionsTable: React.FC = () => {
   const { positions } = useStore();
+  const [page, setPage] = useState(0);
+  const pages = Math.max(1, Math.ceil(positions.length / POS_PAGE));
+  const pageIdx = Math.min(page, pages - 1);
+  useEffect(() => {
+    setPage((p) => Math.min(p, Math.max(0, pages - 1)));
+  }, [positions.length, pages]);
+  const slice = useMemo(
+    () => positions.slice(pageIdx * POS_PAGE, pageIdx * POS_PAGE + POS_PAGE),
+    [positions, pageIdx]
+  );
 
   return (
     <div className="card h-full flex flex-col">
@@ -63,9 +75,34 @@ const PositionsTable: React.FC = () => {
           <List className="w-5 h-5 text-slate-400" />
           仓位详情
         </h2>
-        <span className="bg-slate-800 text-slate-300 px-2 py-1 rounded text-xs font-mono">
-          {positions.length} 笔
-        </span>
+        <div className="flex items-center gap-2">
+          {positions.length > POS_PAGE ? (
+            <div className="flex items-center gap-1 text-xs text-slate-400">
+              <button
+                type="button"
+                disabled={pageIdx <= 0}
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                className="px-2 py-0.5 rounded bg-slate-800 disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <span className="font-mono">
+                {pageIdx + 1}/{pages}
+              </span>
+              <button
+                type="button"
+                disabled={pageIdx >= pages - 1}
+                onClick={() => setPage((p) => Math.min(pages - 1, p + 1))}
+                className="px-2 py-0.5 rounded bg-slate-800 disabled:opacity-40"
+              >
+                下一页
+              </button>
+            </div>
+          ) : null}
+          <span className="bg-slate-800 text-slate-300 px-2 py-1 rounded text-xs font-mono">
+            {positions.length} 笔
+          </span>
+        </div>
       </div>
 
       <div className="overflow-x-auto flex-1 min-h-0">
@@ -90,7 +127,7 @@ const PositionsTable: React.FC = () => {
                 </td>
               </tr>
             ) : (
-              positions.map((pos, idx) => {
+              slice.map((pos, idx) => {
                 const notional = positionNotional(pos);
                 const margin = positionMargin(pos);
                 const lev =

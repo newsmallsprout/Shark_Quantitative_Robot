@@ -72,6 +72,7 @@ flowchart LR
 
 ```bash
 pip install -r requirements.txt
+cp config/settings.model.yaml config/settings.yaml   # first run only; then edit secrets & symbols
 export SHARK_CONFIG_PATH="${PWD}/config/settings.yaml"
 python main.py
 ```
@@ -111,6 +112,46 @@ docker compose up -d --build
 
    The script wraps **PyArmor** over `src/strategy`, `src/execution`, and any extra `-r` paths you pass. Distribute the output together with the `pyarmor_runtime_*` package PyArmor emits, on the **same Python minor version** used to build. Obfuscation is not a substitute for key management or exchange permission hardening.
 
+### Commercial runtime license (RSA + device binding)
+
+Distribution of **strategy bytecode** (optionally obfuscated) is orthogonal to **runtime authorization**:
+
+| Artifact | Role |
+|----------|------|
+| `license/public.pem` | **RSA public key** embedded with the bot; verifies detached signatures over the license payload. Safe to ship in the repository (private key stays offline). |
+| `license/license.key` | **Signed JSON** (`LicenseData`): expiry, license type, **machine fingerprint**, and **PSS-SHA256** signature over the canonical payload. Issued by the author; never commit real keys. |
+| `SKIP_LICENSE_CHECK=1` | **Development bypass** only. Skips import-time and API-side checks; **must not** be used in production. |
+
+**Verification chain:** `LicenseValidator` reconstructs the signed JSON (excluding `signature`), verifies with the public key, checks `expires_at`, then compares `machine_fingerprint` to `MachineFingerprint.get_fingerprint()`. The strategy engine calls `assert_strategy_runtime_allowed()` at import; `main.py` enforces the same invariant before live operation.
+
+**Authoring keys (vendor machine):** `python tools/generate_keys.py` emits `license/private.pem` + `license/public.pem`. **Signing licenses:** use the companion tooling that hashes the payload with the private key (see `tools/` for `generate_license.py` if present). **Dashboard:** `GET /api/license/status` exposes `license_status_payload()` for the React shell; without a valid license the UI shows a **Chinese-first** overlay directing users to contact the author.
+
+### Configuration contract (`settings.model.yaml` vs `settings.yaml`)
+
+| File | Git | Purpose |
+|------|-----|---------|
+| `config/settings.model.yaml` | **Tracked** | Schema-complete **template** with safe defaults (empty API keys, sanitized exchange block). Clone → copy → edit. |
+| `config/settings.yaml` | **Ignored** | **Authoritative** runtime file: credentials, symbol universe, strategy allocations, Darwin/LLM blocks, risk ceilings. |
+
+If `settings.yaml` is missing, `config_manager` falls back to `settings.model.yaml` and logs that you are on the template. Production deployments should always materialize a private `settings.yaml` (or set `SHARK_CONFIG_PATH`).
+
+### Strategy surface — terminology & primary knobs
+
+The orchestration layer (`StrategyEngine`) multiplexes **playbook-weighted** tactics under the global **risk engine** and **state machine**. The following is a concise **control-plane** glossary aligned with `config/settings.model.yaml`:
+
+| Block | Role | Representative parameters |
+|-------|------|---------------------------|
+| `strategy.active_strategies` / `allocations` | **Capital budget** across named engines (e.g. `core_neutral`, `core_attack`). | `allocations` must sum to the intended exposure budget; `single_open_per_symbol` enforces **one net position per symbol**. |
+| `strategy.params` | **Core discretionary** thresholds for mean-reversion vs breakout legs. | `neutral_rsi_*`, `attack_ai_threshold`, `*_signal_cooldown_sec`, bracket knobs `core_entry_tp_bps` / `core_entry_sl_bps`, **ATR regime** widen `core_atr_sl_widen_mult`, **breakeven** `core_breakeven_arm_r`. |
+| `beta_neutral_hf` | **Stat-arb style** pair trading: beta-adjusted spreads, **z-score** entry/exit bands, **cross-section** filters. | `entry_zscore`, `exit_zscore`, `stop_zscore`, `min_correlation`, `pair_leverage`, `max_hold_sec`, **micro take-profit** `leg_micro_take_usdt`, **trend / micro-trend** guards. |
+| `playbook` | **Regime-conditioned** routing: switches between **matrix** vs **guerrilla** posture by equity and volatility. | `matrix_capital_threshold_usdt`, `matrix_volatility_threshold_pct`, `guerrilla_leverage`, `position_ttl_minutes`. |
+| `market_oracle` | **Cross-exchange** stress / crowding signals (funding, OBI crash anchor). | `crowded_ls_ratio`, `crash_max_anchor_return_pct`, `long_obi_veto_max`. |
+| `risk` | **Hard limits**: per-trade and structure risk, drawdown brakes, **berserker** OBI gate. | `max_single_risk`, `daily_drawdown_limit`, `hard_drawdown_limit`, `berserker_obi_threshold`, `drawdown_cool_down_sec`. |
+| `paper_engine` | **Simulation physics**: fees, slippage, optional **bracket** enforcement, liquidation buffer. | `taker_fee_rate` / `maker_fee_rate`, `require_entry_tp_sl_limits`, `isolated_liquidation_maintenance_buffer`. |
+| `execution` | **Order style** and **Kelly-style** sizing caps for tactical modules. | `kelly_fraction`, `max_allowed_leverage`, **sniper** TTL `sniper_normal_ttl_ms`, **trailing** `high_conviction_trailing_activation_pct`. |
+
+This is **not** an exhaustive parameter list; treat `settings.model.yaml` as the **ground truth** for defaults and comments in your tree.
+
 ### Disclaimer
 
 Trading digital asset derivatives involves **substantial risk of loss**. This software is provided for research and educational purposes; you are solely responsible for compliance, capital, and operational safety. Past backtests or paper results do not guarantee future performance.
@@ -149,6 +190,7 @@ See repository `LICENSE` if present; otherwise treat usage terms as project-loca
 
 ```bash
 pip install -r requirements.txt
+cp config/settings.model.yaml config/settings.yaml   # 首次克隆后复制模板并编辑密钥与品种
 export SHARK_CONFIG_PATH="${PWD}/config/settings.yaml"
 python main.py
 ```
@@ -186,6 +228,42 @@ docker compose up -d --build
    ```
 
    默认递归处理 `src/strategy`、`src/execution`；可通过脚本参数追加更多 `-r` 路径。发布时需连同 PyArmor 生成的 **`pyarmor_runtime_*`** 一并分发，且运行环境 Python **次版本**应与构建环境一致。混淆不能替代密钥管理与交易所侧权限最小化。
+
+### 商业运行时许可证（RSA + 设备指纹）
+
+| 文件 | 作用 |
+|------|------|
+| `license/public.pem` | **RSA 公钥**，随程序分发，用于校验 `license.key` 内嵌的 **PSS-SHA256** 签名。 |
+| `license/license.key` | **JSON 许可证**：到期时间、类型、**机器指纹**、签名域；由创作者离线签发，**切勿**提交仓库。 |
+| `SKIP_LICENSE_CHECK=1` | 仅用于 **本地开发/CI**，跳过 import 与 API 侧校验；**禁止**在生产环境使用。 |
+
+**校验顺序**：验签 → 过期检查 → 指纹比对。策略引擎在 import 时执行 `assert_strategy_runtime_allowed()`；`main.py` 在启动路径上再次保证一致性。前端通过 **`GET /api/license/status`** 拉取状态；无有效授权时展示 **中文引导**，提示向创作者申请 `license.key`。
+
+**密钥生成**：`python tools/generate_keys.py` 在 `license/` 下生成公私钥对；**私钥**仅用于签发，留在离线环境。
+
+### 配置文件约定（`settings.model.yaml` 与 `settings.yaml`）
+
+| 文件 | 是否入库 | 说明 |
+|------|----------|------|
+| `config/settings.model.yaml` | **是** | 完整字段的 **默认模板**（密钥位留空），可安全提交。 |
+| `config/settings.yaml` | **否**（gitignore） | **真实运行配置**：API Key、品种池、策略与风控参数。首次使用请 `cp config/settings.model.yaml config/settings.yaml` 后编辑。 |
+
+若缺少 `settings.yaml`，`config_manager` 会回退加载模板并打日志提示。
+
+### 策略控制面 — 术语与主参数（对照 `settings.model.yaml`）
+
+| 模块 | 职责 | 典型参数 |
+|------|------|----------|
+| `strategy.active_strategies` / `allocations` | 多引擎 **资金权重** 与 **互斥** 约束 | `allocations`、`single_open_per_symbol`、`regime_switch_anchor_symbol` |
+| `strategy.params` | **Core** 均值回归 / 追击腿 的阈值与 **括号单** | `neutral_rsi_*`、`attack_ai_threshold`、`*_cooldown_sec`、`core_entry_tp_bps` / `core_entry_sl_bps`、高波动 **ATR** 放宽 `core_atr_sl_widen_mult` |
+| `beta_neutral_hf` | **配对统计套利**：价差 z-score、相关性、截面筛选 | `entry_zscore`、`exit_zscore`、`min_correlation`、`pair_leverage`、`max_hold_sec`、`leg_micro_take_usdt` |
+| `playbook` | **体制路由**（矩阵 / 游击）按权益与波动切换 | `matrix_capital_threshold_usdt`、`guerrilla_leverage`、`position_ttl_minutes` |
+| `market_oracle` | **跨所** 拥挤度、崩盘锚、OBI 否决 | `crowded_funding_rate_min`、`crash_max_anchor_return_pct` |
+| `risk` | **硬风控**：回撤、结构风险、狂暴模式门槛 | `daily_drawdown_limit`、`berserker_obi_threshold`、`drawdown_cool_down_sec` |
+| `paper_engine` | 纸面 **费率/滑点/强平** 与可选 **开仓括号** 约束 | `taker_fee_rate`、`require_entry_tp_sl_limits` |
+| `execution` | 订单风格与 **Kelly** 相关上限 | `kelly_fraction`、`max_allowed_leverage`、狙击单 TTL 等 |
+
+完整默认值与字段说明以仓库内 **`config/settings.model.yaml`** 为准。
 
 ### 风险提示
 

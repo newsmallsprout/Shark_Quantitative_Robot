@@ -42,6 +42,8 @@ class RegimeClassifier:
         data.setdefault("suggested_leverage_cap", 100)
         data.setdefault("tp_atr_multiplier", 2.0)
         data.setdefault("sl_atr_multiplier", 1.8)
+        data.setdefault("dynamic_tp_fee_multiplier", 1.5)
+        data.setdefault("dynamic_max_loss_margin_pct", 0.85)
         return data
 
 regime_classifier = RegimeClassifier()

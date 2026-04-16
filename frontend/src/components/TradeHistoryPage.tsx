@@ -23,8 +23,10 @@ export interface TradeHistoryRow {
   duration_sec: number;
   max_favorable_unrealized: number;
   max_adverse_unrealized: number;
-  entry_snapshot: Record<string, unknown>;
+  entry_snapshot?: Record<string, unknown>;
 }
+
+const PAGE_SIZE = 40;
 
 function formatTs(t: number): string {
   if (!t || !Number.isFinite(t)) return '—';
@@ -54,9 +56,31 @@ function exitReasonZh(reason: string): string {
     core_bracket_tp: 'Core 限价止盈',
     core_bracket_sl: 'Core 限价止损',
     core_bracket_stop: 'Core 止损(市价,旧逻辑)',
+    isolated_margin_ruin: '逐仓保证金击穿',
+    eod_flat: '回测/会话结束强平',
+    liquidated: '强平',
+    ai_dynamic_margin_loss_cap: 'AI 动态逐仓浮亏上限',
+    predator_pnl_chandelier: 'Predator 净利 Chandelier 止盈',
+    predator_breakeven_floor: 'Predator 不败金身地板',
   };
   return m[reason] || reason || '—';
 }
+
+type SummaryPayload = {
+  total_count?: number;
+  wins?: number;
+  losses?: number;
+  win_rate?: number;
+  net_total?: number;
+  fees_total?: number;
+  worst_losses?: Array<{ symbol?: string; net_pnl?: number; exit_reason?: string; side?: string }>;
+  best_wins?: Array<{ symbol?: string; net_pnl?: number }>;
+  worst_losses_top_sum?: number;
+  best_wins_top_sum?: number;
+  strategy_hints?: string[];
+  top_loss_exit_reasons?: Array<{ reason: string; count: number }>;
+  top_win_exit_reasons?: Array<{ reason: string; count: number }>;
+};
 
 const TradeHistoryPage: React.FC = () => {
   const [rows, setRows] = useState<TradeHistoryRow[]>([]);
@@ -64,14 +88,27 @@ const TradeHistoryPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [summary, setSummary] = useState<SummaryPayload | null>(null);
+  const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [detailCache, setDetailCache] = useState<Record<string, TradeHistoryRow>>({});
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (pageIndex: number) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/trade_history?limit=500');
+      const offset = pageIndex * PAGE_SIZE;
+      const res = await fetch(`/api/trade_history?limit=${PAGE_SIZE}&offset=${offset}&include_entry_snapshot=0`);
       const text = await res.text();
-      let data: { items?: TradeHistoryRow[]; source_dir?: string; detail?: string } = {};
+      let data: {
+        items?: TradeHistoryRow[];
+        source_dir?: string;
+        detail?: string;
+        summary?: SummaryPayload;
+        total_count?: number;
+        has_more?: boolean;
+      } = {};
       try {
         data = text ? JSON.parse(text) : {};
       } catch {
@@ -80,17 +117,50 @@ const TradeHistoryPage: React.FC = () => {
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       setRows((data.items as TradeHistoryRow[]) || []);
       setSourceDir(String(data.source_dir || ''));
+      setSummary((data.summary as SummaryPayload) || null);
+      setTotalCount(Number(data.total_count ?? data.summary?.total_count ?? 0));
+      setHasMore(Boolean(data.has_more));
+      setPage(pageIndex);
     } catch (e) {
       setError(e instanceof Error ? e.message : '加载失败');
       setRows([]);
+      setSummary(null);
+      setTotalCount(0);
+      setHasMore(false);
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
+    void load(0);
   }, [load]);
+
+  const openDetail = useCallback(async (file: string) => {
+    try {
+      const res = await fetch(`/api/trade_history/detail?file=${encodeURIComponent(file)}`);
+      const data = (await res.json()) as { item?: TradeHistoryRow };
+      if (data.item) {
+        setDetailCache((p) => ({ ...p, [file]: data.item! }));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const toggleExpand = useCallback(
+    async (file: string) => {
+      if (expanded === file) {
+        setExpanded(null);
+        return;
+      }
+      setExpanded(file);
+      await openDetail(file);
+    },
+    [expanded, openDetail]
+  );
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
   return (
     <div className="card flex flex-col min-h-[480px] border-slate-200">
@@ -99,7 +169,7 @@ const TradeHistoryPage: React.FC = () => {
           <History className="w-5 h-5 text-teal-600" />
           历史仓位
         </h2>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           {sourceDir && (
             <span className="text-[10px] text-slate-500 font-mono max-w-[280px] truncate" title={sourceDir}>
               数据源: {sourceDir}
@@ -107,21 +177,96 @@ const TradeHistoryPage: React.FC = () => {
           )}
           <button
             type="button"
-            onClick={() => void load()}
+            onClick={() => void load(page)}
             disabled={loading}
             className="btn flex items-center gap-2 bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 px-3 py-1.5 rounded text-sm disabled:opacity-50 shadow-sm"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             刷新
           </button>
+          <div className="flex items-center gap-1 text-xs">
+            <button
+              type="button"
+              disabled={loading || page <= 0}
+              onClick={() => void load(page - 1)}
+              className="px-2 py-1 rounded border border-slate-200 bg-white disabled:opacity-40"
+            >
+              上一页
+            </button>
+            <span className="text-slate-600 font-mono px-2">
+              {page + 1} / {totalPages}
+            </span>
+            <button
+              type="button"
+              disabled={loading || !hasMore}
+              onClick={() => void load(page + 1)}
+              className="px-2 py-1 rounded border border-slate-200 bg-white disabled:opacity-40"
+            >
+              下一页
+            </button>
+          </div>
           <span className="bg-slate-100 text-slate-700 px-2 py-1 rounded text-xs font-mono border border-slate-200">
-            {rows.length} 条
+            本页 {rows.length} / 共 {totalCount} 条
           </span>
         </div>
       </div>
 
       {error && (
         <div className="mb-4 p-3 rounded border border-red-200 bg-red-50 text-red-800 text-sm">{error}</div>
+      )}
+
+      {summary && Number(summary.total_count) > 0 && (
+        <div className="mb-4 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+          <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="text-slate-500">总场次</div>
+            <div className="font-mono text-slate-900 mt-0.5">{summary.total_count}</div>
+          </div>
+          <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="text-slate-500">胜率</div>
+            <div className="font-mono text-teal-700 mt-0.5">
+              {formatNum((Number(summary.win_rate) || 0) * 100, 2)}%
+            </div>
+          </div>
+          <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="text-slate-500">累计净盈亏</div>
+            <div
+              className={`font-mono mt-0.5 ${Number(summary.net_total) >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}
+            >
+              {Number(summary.net_total) >= 0 ? '+' : ''}
+              {formatNum(Number(summary.net_total), 4)}
+            </div>
+          </div>
+          <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="text-slate-500">累计手续费</div>
+            <div className="font-mono text-amber-800 mt-0.5">{formatNum(Number(summary.fees_total ?? 0), 4)}</div>
+          </div>
+        </div>
+      )}
+
+      {summary?.strategy_hints && summary.strategy_hints.length > 0 && (
+        <div className="mb-4 rounded border border-amber-200 bg-amber-50/80 px-3 py-2 text-[11px] text-amber-950">
+          <div className="font-semibold text-amber-900 mb-1">战报策略提示</div>
+          <ul className="list-disc pl-4 space-y-1">
+            {summary.strategy_hints.map((h, i) => (
+              <li key={i}>{h}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {summary && (summary.worst_losses?.length || 0) > 0 && (
+        <div className="mb-4 rounded border border-rose-100 bg-rose-50/50 px-3 py-2">
+          <div className="text-[11px] font-semibold text-rose-800 mb-2">亏损最大的平仓（Top10）</div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono text-slate-700">
+            {summary.worst_losses!.map((w, i) => (
+              <span key={`${w.symbol}-${i}`}>
+                <span className="text-slate-500">#{i + 1}</span> {w.symbol}{' '}
+                <span className="text-rose-600">{formatNum(Number(w.net_pnl), 4)}</span>
+                <span className="text-slate-400"> · {exitReasonZh(String(w.exit_reason || ''))}</span>
+              </span>
+            ))}
+          </div>
+        </div>
       )}
 
       <div className="overflow-x-auto flex-1 -mx-1 scroll-stable">
@@ -158,13 +303,15 @@ const TradeHistoryPage: React.FC = () => {
             ) : (
               rows.map((r) => {
                 const open = expanded === r.file;
+                const detail = detailCache[r.file];
+                const show = detail || r;
                 return (
                   <React.Fragment key={r.file}>
                     <tr className="border-b border-slate-100 hover:bg-slate-50/80 transition-colors">
                       <td className="px-2 py-2">
                         <button
                           type="button"
-                          onClick={() => setExpanded(open ? null : r.file)}
+                          onClick={() => void toggleExpand(r.file)}
                           className="p-1 text-slate-500 hover:text-slate-800"
                           aria-label="展开详情"
                         >
@@ -184,7 +331,9 @@ const TradeHistoryPage: React.FC = () => {
                           {r.side === 'long' ? '多' : '空'}
                         </span>
                       </td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">${formatNum(Number(r.entry_notional_usdt ?? 0), 2)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-xs">
+                        ${formatNum(Number(r.entry_notional_usdt ?? 0), 2)}
+                      </td>
                       <td className="px-3 py-2 text-right font-mono text-xs">${formatNum(r.entry_price)}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs">${formatNum(r.exit_price)}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs">
@@ -208,40 +357,44 @@ const TradeHistoryPage: React.FC = () => {
                               <ul className="space-y-1 text-slate-700 font-mono">
                                 <li>
                                   最大有利浮动:{' '}
-                                  <span className="text-emerald-700">{formatNum(r.max_favorable_unrealized, 2)}</span>
+                                  <span className="text-emerald-700">{formatNum(show.max_favorable_unrealized, 2)}</span>
                                 </li>
                                 <li>
                                   最大不利浮动:{' '}
-                                  <span className="text-red-600">{formatNum(r.max_adverse_unrealized, 2)}</span>
+                                  <span className="text-red-600">{formatNum(show.max_adverse_unrealized, 2)}</span>
                                 </li>
-                                <li>持仓时长: {r.duration_sec.toFixed(1)} s</li>
+                                <li>持仓时长: {show.duration_sec.toFixed(1)} s</li>
                                 <li>张数: {formatNum(r.closed_size, 8)}</li>
                                 <li>合约面值: {formatNum(Number(r.contract_size ?? 0), 8)}</li>
                                 <li>标的数量: {formatNum(Number(r.base_qty ?? 0), 8)}</li>
                                 <li>
-                                  毛利: <span className="text-slate-800">{formatNum(r.gross_pnl, 4)}</span>
+                                  毛利: <span className="text-slate-800">{formatNum(show.gross_pnl, 4)}</span>
                                 </li>
                                 <li className="rounded border border-red-200 bg-red-50 px-2 py-1.5 -mx-0.5">
                                   <span className="text-red-800">摩擦损耗（手续费合计）</span>{' '}
-                                  <span className="text-red-700 font-semibold">{formatNum(r.fees, 4)} USDT</span>
+                                  <span className="text-red-700 font-semibold">{formatNum(show.fees, 4)} USDT</span>
                                   <span className="block text-[10px] text-red-600/90 font-normal mt-1">
                                     名义 × 费率；与杠杆无关。净利 = 毛利 − 该项。
                                   </span>
                                 </li>
                                 <li>
                                   净盈亏:{' '}
-                                  <span className={r.net_pnl >= 0 ? 'text-emerald-700' : 'text-red-600'}>
-                                    {formatNum(r.net_pnl, 4)}
+                                  <span className={show.net_pnl >= 0 ? 'text-emerald-700' : 'text-red-600'}>
+                                    {formatNum(show.net_pnl, 4)}
                                   </span>
                                 </li>
-                                <li>保证金模式: {r.margin_mode || '—'}</li>
+                                <li>保证金模式: {show.margin_mode || '—'}</li>
                               </ul>
                             </div>
                             <div>
                               <p className="text-slate-500 uppercase tracking-wider mb-2">开仓快照 (entry_snapshot)</p>
-                              <pre className="p-3 rounded bg-white border border-slate-200 overflow-x-auto text-slate-700 max-h-48 shadow-inner">
-                                {JSON.stringify(r.entry_snapshot || {}, null, 2)}
-                              </pre>
+                              {!detail ? (
+                                <p className="text-slate-500 text-[11px]">加载详情中…</p>
+                              ) : (
+                                <pre className="p-3 rounded bg-white border border-slate-200 overflow-x-auto text-slate-700 max-h-48 shadow-inner">
+                                  {JSON.stringify(detail.entry_snapshot || {}, null, 2)}
+                                </pre>
+                              )}
                             </div>
                           </div>
                         </td>

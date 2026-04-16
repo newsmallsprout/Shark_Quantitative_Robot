@@ -12,6 +12,11 @@ class BaseLLM(abc.ABC):
         pass
 
 class DeepSeekLLM(BaseLLM):
+    """
+    JSON 字段由调用方 prompt 约束（如 MarketAnalyzer._build_prompt 中的 dynamic_tp_fee_multiplier 等）；
+    解析与钳制在 analyzer._normalize_ai_payload。
+    """
+
     def __init__(self, api_key: str, base_url: str = "", model_name: str = ""):
         self.api_key = api_key
         self.base_url = base_url or "https://api.deepseek.com/v1"

@@ -1,5 +1,10 @@
 """单测默认关闭「开仓必须带止盈止损限价」，避免大量纸面用例被拒。"""
+import os
+
 import pytest
+
+# 策略引擎 import 时会校验许可证；单测不依赖本机 license.key
+os.environ.setdefault("SKIP_LICENSE_CHECK", "1")
 
 
 @pytest.fixture(autouse=True)

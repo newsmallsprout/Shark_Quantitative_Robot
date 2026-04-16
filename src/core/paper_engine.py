@@ -163,6 +163,8 @@ class PaperTradingEngine:
         self._shadow_orders: Dict[str, Dict[str, Any]] = {}
         # futures.trades 聚合：用于影子单可撮合张数上界（吞吐）
         self._last_tick_volume: Dict[str, float] = {}
+        self._pnl_wash_depth: int = 0
+        self._isolated_liq_depth: int = 0
 
     def note_trade_volume(self, symbol: str, base_volume: float) -> None:
         """网关 futures.trades 回调写入；用于影子限价按盘口成交量分批撮合。"""
@@ -2126,16 +2128,325 @@ class PaperTradingEngine:
         self._process_shadow_orders(symbol, float(price))
         self._process_maker_fills(symbol)
         self._calculate_pnl()
+        if self._isolated_liq_depth <= 0:
+            self._enforce_ai_dynamic_margin_loss_cap()
+        if self._isolated_liq_depth <= 0:
+            self._enforce_isolated_margin_ruin()
         self._maybe_high_conviction_trailing_exit(symbol, float(price))
         self._check_time_stops(symbol)
 
+    def _enforce_ai_dynamic_margin_loss_cap(self) -> None:
+        """
+        逐仓：单腿浮亏超过「初始保证金 × AI dynamic_max_loss_margin_pct」→ 市价全平（先于维持保证金强平触发时更紧）。
+        比例由 DeepSeek 按微观结构下发，主进程 ZMQ 写入 ai_context；缺省时视为 0.85 并钳位 [0.2, 0.85]。
+        """
+        try:
+            from src.core.config_manager import config_manager
+            from src.ai.analyzer import ai_context
+
+            pe = config_manager.get_config().paper_engine
+            if not bool(getattr(pe, "ai_dynamic_margin_loss_cap_enabled", True)):
+                return
+        except Exception:
+            return
+        self._isolated_liq_depth += 1
+        try:
+            self._calculate_pnl()
+            for sym in list(self.positions.keys()):
+                pos = self.positions.get(sym)
+                if not pos or float(pos.get("size", 0) or 0) <= 1e-12:
+                    continue
+                if str(pos.get("margin_mode", "isolated")).lower() != "isolated":
+                    continue
+                mu = float(pos.get("margin_used", 0.0) or 0.0)
+                up = float(pos.get("unrealized_pnl", 0.0) or 0.0)
+                if mu <= 1e-12 or up >= -1e-9:
+                    continue
+                try:
+                    mx = float(ai_context.get(sym).get("dynamic_max_loss_margin_pct", 0.85) or 0.85)
+                except Exception:
+                    mx = 0.85
+                mx = max(0.2, min(0.85, mx))
+                try:
+                    ect0 = dict(pos.get("entry_context") or {})
+                    if bool(ect0.get("beta_hf_decoupled_momentum")):
+                        bn = config_manager.get_config().beta_neutral_hf
+                        dcap = float(getattr(bn, "decoupled_margin_loss_cap", 0.4) or 0.4)
+                        mx = min(mx, max(0.2, min(0.85, dcap)))
+                except Exception:
+                    pass
+                cap = mu * mx
+                if -up <= cap + 1e-9:
+                    continue
+                contracts = float(pos.get("size", 0) or 0)
+                ps = str(pos.get("side", "long")).lower()
+                close_side = "sell" if ps == "long" else "buy"
+                lev = max(int(pos.get("leverage", 1) or 1), 1)
+                log.warning(
+                    f"[Paper] AI_MARGIN_CAP {sym} |upnl|={-up:.6f} > margin×pct={cap:.6f} "
+                    f"(mu={mu:.6f} max_loss_pct={mx:.3f}) — force market flat"
+                )
+                self.execute_order(
+                    sym,
+                    close_side,
+                    contracts,
+                    None,
+                    reduce_only=True,
+                    leverage=lev,
+                    margin_mode=str(pos.get("margin_mode", "isolated")),
+                    berserker=False,
+                    post_only=False,
+                    entry_context={
+                        "ai_dynamic_margin_loss_cap": True,
+                        "beta_neutral_hf": bool((pos.get("entry_context") or {}).get("beta_neutral_hf")),
+                    },
+                    exit_reason="ai_dynamic_margin_loss_cap",
+                )
+        finally:
+            self._isolated_liq_depth = max(0, self._isolated_liq_depth - 1)
+
+    def _enforce_isolated_margin_ruin(self) -> None:
+        """逐仓：权益压穿维持保证金带 → 市价减仓/全平，禁止纸面出现远超保证金的浮亏。"""
+        try:
+            from src.core.config_manager import config_manager
+
+            pe = config_manager.get_config().paper_engine
+            if not bool(getattr(pe, "isolated_hard_liquidation_enabled", True)):
+                return
+            buf = float(getattr(pe, "isolated_liquidation_maintenance_buffer", 1.05) or 1.05)
+        except Exception:
+            buf = 1.05
+        self._isolated_liq_depth += 1
+        try:
+            self._calculate_pnl()
+            syms = list(self.positions.keys())
+            for sym in syms:
+                pos = self.positions.get(sym)
+                if not pos or float(pos.get("size", 0) or 0) <= 1e-12:
+                    continue
+                if str(pos.get("margin_mode", "isolated")).lower() != "isolated":
+                    continue
+                mu = float(pos.get("margin_used", 0.0) or 0.0)
+                up = float(pos.get("unrealized_pnl", 0.0) or 0.0)
+                cs = self._position_contract_size(pos, sym)
+                mark = float(self.latest_prices.get(sym, pos.get("entry_price")) or 0)
+                if mark <= 0:
+                    continue
+                contracts = float(pos.get("size", 0) or 0)
+                notional = abs(contracts) * float(cs) * mark
+                mmr = float(pos.get("mmr_rate", 0.0) or 0.0) or self._paper_mmr_rate(
+                    self._exchange_physics_specs(sym)
+                )
+                maint = max(0.0, float(notional) * float(mmr))
+                equity = mu + up
+                if equity > maint * buf + 1e-9:
+                    continue
+                ps = str(pos.get("side", "long")).lower()
+                close_side = "sell" if ps == "long" else "buy"
+                lev = max(int(pos.get("leverage", 1) or 1), 1)
+                log.warning(
+                    f"[Paper] ISOLATED LIQ {sym} equity={equity:.6f}<=maint×buf≈{maint * buf:.6f} "
+                    f"(mu={mu:.6f} uPnL={up:.6f}) — force market flat"
+                )
+                self.execute_order(
+                    sym,
+                    close_side,
+                    contracts,
+                    None,
+                    reduce_only=True,
+                    leverage=lev,
+                    margin_mode=str(pos.get("margin_mode", "isolated")),
+                    berserker=False,
+                    post_only=False,
+                    entry_context={
+                        "forced_isolated_liquidation": True,
+                        "beta_neutral_hf": bool((pos.get("entry_context") or {}).get("beta_neutral_hf")),
+                    },
+                    exit_reason="isolated_margin_ruin",
+                )
+        finally:
+            self._isolated_liq_depth = max(0, self._isolated_liq_depth - 1)
+
+    def _maybe_inventory_pnl_wash(
+        self,
+        out: Dict[str, Any],
+        *,
+        symbol: str,
+        reduce_only: bool,
+        entry_context: Optional[Dict[str, Any]],
+    ) -> None:
+        """盈利化债：本笔已实现净利 > 阈值时，用预算部分市价削最亏腿。"""
+        try:
+            from src.core.config_manager import config_manager
+
+            pe = config_manager.get_config().paper_engine
+            if not bool(getattr(pe, "pnl_wash_enabled", True)):
+                return
+            min_credit = float(getattr(pe, "pnl_wash_min_credit_usdt", 1.5) or 1.5)
+            prefer_short = bool(getattr(pe, "pnl_wash_prefer_short_bags_on_long_micro", True))
+            only_beta = bool(getattr(pe, "pnl_wash_only_beta_hf_legs", True))
+        except Exception:
+            min_credit = 1.5
+            prefer_short = True
+            only_beta = True
+        ect = dict(entry_context or {})
+        if ect.get("pnl_wash_subsidy") or ect.get("forced_isolated_liquidation") or ect.get("ai_dynamic_margin_loss_cap"):
+            return
+        if not reduce_only:
+            return
+        if self._pnl_wash_depth >= 4:
+            return
+        net = out.get("final_trade_pnl_net_usdt")
+        if net is None:
+            net = out.get("realized_net_usdt")
+        try:
+            credit = float(net or 0.0)
+        except (TypeError, ValueError):
+            return
+        if credit < min_credit:
+            return
+        micro_take = bool(ect.get("beta_leg_micro_take"))
+        closed_side = str(ect.get("micro_take_closed_side") or "").lower()
+        self._pnl_wash_depth += 1
+        try:
+            self._calculate_pnl()
+            worst_sym: Optional[str] = None
+            worst_score = 0.0  # 越负越烂（浮亏/保证金）
+            worst_up = 0.0
+
+            def _leg_ok(p: Dict[str, Any]) -> bool:
+                if only_beta:
+                    return bool((p.get("entry_context") or {}).get("beta_neutral_hf"))
+                return True
+
+            # 微利多单 → 优先按 ROE 啃做空烂仓
+            if micro_take and prefer_short and closed_side == "long":
+                for s, p in self.positions.items():
+                    if s == symbol:
+                        continue
+                    if float(p.get("size", 0) or 0) <= 1e-12:
+                        continue
+                    if not _leg_ok(p):
+                        continue
+                    if str(p.get("side", "long")).lower() != "short":
+                        continue
+                    up = float(p.get("unrealized_pnl", 0.0) or 0.0)
+                    if up >= -1e-6:
+                        continue
+                    mu = float(p.get("margin_used", 0.0) or 0.0)
+                    sc = up / max(mu, 1e-9)
+                    if sc < worst_score:
+                        worst_score = sc
+                        worst_up = up
+                        worst_sym = s
+            if worst_sym is None:
+                for s, p in self.positions.items():
+                    if s == symbol:
+                        continue
+                    if float(p.get("size", 0) or 0) <= 1e-12:
+                        continue
+                    if not _leg_ok(p):
+                        continue
+                    up = float(p.get("unrealized_pnl", 0.0) or 0.0)
+                    if up < worst_up:
+                        worst_up = up
+                        worst_sym = s
+            if worst_sym is None or worst_up >= -1e-6:
+                return
+            budget = min(credit, -worst_up)
+            pos = self.positions.get(worst_sym)
+            if not pos:
+                return
+            try:
+                from src.core.config_manager import config_manager
+
+                bn = config_manager.get_config().beta_neutral_hf
+                if bool(getattr(bn, "funding_preserve_skip_wash_enabled", False)):
+                    if bool((pos.get("entry_context") or {}).get("beta_neutral_hf")):
+                        fr = self._funding_rate_for_symbol(worst_sym)
+                        thr = float(getattr(bn, "funding_preserve_min_abs_rate", 0.00025) or 0.0)
+                        pside = str(pos.get("side", "long")).lower()
+                        if pside == "long" and fr <= -max(thr, 0.0):
+                            return
+                        if pside == "short" and fr >= max(thr, 0.0):
+                            return
+            except Exception:
+                pass
+            frac = min(1.0, budget / max(-worst_up, 1e-12))
+            raw_amt = float(pos.get("size", 0) or 0) * frac
+            if raw_amt <= 1e-12:
+                return
+            specs = self._exchange_physics_specs(worst_sym) or {}
+            if not bool(specs.get("enable_decimal", False)):
+                raw_amt = float(max(1, round(raw_amt)))
+            ps = str(pos.get("side", "long")).lower()
+            close_side = "sell" if ps == "long" else "buy"
+            lev = max(int(pos.get("leverage", 1) or 1), 1)
+            log.info(
+                f"[Paper] PnL_WASH subsidy≈{budget:.4f} USDT from {symbol} → "
+                f"trim {worst_sym} frac={frac:.4f} amt={raw_amt:.6f}"
+            )
+            self.execute_order(
+                worst_sym,
+                close_side,
+                raw_amt,
+                None,
+                reduce_only=True,
+                leverage=lev,
+                margin_mode=str(pos.get("margin_mode", "isolated")),
+                berserker=False,
+                post_only=False,
+                entry_context={"pnl_wash_subsidy": True},
+                exit_reason="pnl_wash_subsidy",
+            )
+        finally:
+            self._pnl_wash_depth = max(0, self._pnl_wash_depth - 1)
+
+    def _hc_est_close_taker_fee_usdt(self, symbol: str, pos: Dict[str, Any], mark_px: float) -> float:
+        """按当前市价估算平掉全仓的 Taker 手续费（名义×费率）。"""
+        sz = abs(float(pos.get("size", 0) or 0))
+        if sz <= 1e-12 or mark_px <= 0:
+            return 0.0
+        cs = float(self._position_contract_size(pos, symbol))
+        tk, _ = self._fee_rates_for_symbol(symbol)
+        return float(sz * cs * float(mark_px) * float(tk))
+
+    def _predator_limit_exit_price(self, symbol: str, pos_side: str, mark: float) -> float:
+        """Predator 平仓：对手一价限价（多平卖一、空平买一），无盘口则用标记价。"""
+        bb, ba = self._best_bid_ask(symbol)
+        ps = str(pos_side).lower()
+        mp = float(mark)
+        if ps == "long":
+            return float(ba) if ba and ba > 0 else mp
+        if ps == "short":
+            return float(bb) if bb and bb > 0 else mp
+        return mp
+
+    def _hc_est_open_taker_fee_usdt(self, symbol: str, pos: Dict[str, Any]) -> float:
+        """按开仓价估算开仓侧 Taker 手续费（与平仓口径一致，用于 round-trip 净利）。"""
+        sz = abs(float(pos.get("size", 0) or 0))
+        ep = float(pos.get("entry_price", 0) or 0)
+        if sz <= 1e-12 or ep <= 0:
+            return 0.0
+        cs = float(self._position_contract_size(pos, symbol))
+        tk, _ = self._fee_rates_for_symbol(symbol)
+        return float(sz * cs * float(ep) * float(tk))
+
     def _maybe_high_conviction_trailing_exit(self, symbol: str, mark: float) -> None:
-        """高置信度仓：ROE 达阈值后，按最有利极价回撤 callback 触发市价全平。"""
+        """高置信度追踪：全策略统一净利润 Chandelier（峰值回撤 30%）+ 不败金身地板。"""
         pos = self.positions.get(symbol)
         if not pos or float(pos.get("size", 0) or 0) <= 0:
             return
         if not pos.get("high_conviction_trailing"):
             return
+        self._predator_pnl_chandelier_exit(symbol, float(mark), pos)
+
+    def _predator_pnl_chandelier_exit(self, symbol: str, mark: float, pos: Dict[str, Any]) -> None:
+        """
+        全策略统一：Real_Net = gross_unrealized − 预估开+平 Taker 费；Max/回撤/武装 ROE 均以 Real_Net；
+        不败金身：cost_ref = beta_absolute_cost_usdt 或现场 dynamic（|张|×cs×entry×taker×2），floor = cost_ref×1.5。
+        predator_pnl_chandelier / predator_breakeven_floor 仅在 Real_Net 高于 execution.predator_chandelier_min_net_usdt（默认 0=严格正净利）时才会真的平仓。
+        """
         mp = float(mark)
         if mp <= 0:
             return
@@ -2143,11 +2454,20 @@ class PaperTradingEngine:
             from src.core.config_manager import config_manager
 
             exe = config_manager.get_config().execution
+            bn = config_manager.get_config().beta_neutral_hf
             min_hold = float(exe.high_conviction_trailing_min_hold_sec or 0.0)
             grace_after_arm = float(exe.trailing_callback_grace_after_arm_sec or 0.0)
+            micro_floor = float(getattr(bn, "leg_micro_dynamic_floor_usdt", 0.15) or 0.15)
+            pred_min_net = float(getattr(exe, "predator_chandelier_min_net_usdt", 0.0) or 0.0)
+            retain_frac = float(getattr(exe, "predator_chandelier_retain_frac", 0.8) or 0.8)
+            use_lim_exit = bool(getattr(exe, "predator_exit_limit_order", True))
         except Exception:
             min_hold = 2.0
             grace_after_arm = 1.0
+            micro_floor = 0.15
+            pred_min_net = 0.0
+            retain_frac = 0.8
+            use_lim_exit = True
 
         now = time.time()
         opened = float(pos.get("opened_at", 0) or 0)
@@ -2155,32 +2475,89 @@ class PaperTradingEngine:
             return
 
         contracts = float(pos["size"])
-        entry = float(pos.get("entry_price", 0) or 0)
         cs = self._position_contract_size(pos, symbol)
-        lev = max(int(pos.get("leverage", 1) or 1), 1)
-        if str(pos.get("side", "long")).lower() == "long":
-            pnl = contracts * cs * (mp - entry)
+        entry = float(pos.get("entry_price", 0) or 0)
+        tk, _ = self._fee_rates_for_symbol(symbol)
+
+        close_fee_est = self._hc_est_close_taker_fee_usdt(symbol, pos, mp)
+        open_fee_est = self._hc_est_open_taker_fee_usdt(symbol, pos)
+        pnl_gross = float(pos.get("unrealized_pnl", 0) or 0)
+        # 双边 Taker 预估：避免「毛利≈0 仅亏手续费」仍触发 Chandelier 平仓
+        real_net = float(pnl_gross - close_fee_est - open_fee_est)
+
+        prev_max = float(pos.get("hc_predator_max_pnl_usdt", real_net) or real_net)
+        mx = max(prev_max, real_net)
+        pos["hc_predator_max_pnl_usdt"] = mx
+        if real_net >= micro_floor - 1e-12:
+            pos["hc_predator_saw_micro_profit"] = True
+
+        ect = dict(pos.get("entry_context") or {})
+        abs_cost = float(ect.get("beta_absolute_cost_usdt", 0) or 0)
+        entry_notional = abs(contracts) * float(cs) * max(entry, 1e-12)
+        dynamic_roundtrip_cost = float(entry_notional * float(tk) * 2.0)
+        if abs_cost > 1e-12:
+            cost_ref = abs_cost
         else:
-            pnl = contracts * cs * (entry - mp)
+            cost_ref = max(dynamic_roundtrip_cost, 1e-9)
+
+        lev = max(int(pos.get("leverage", 1) or 1), 1)
         notional = self._notional_from(contracts, mp, cs)
         margin = notional / float(lev) if lev > 0 else notional
-        roe = (pnl / margin) if margin > 1e-12 else 0.0
+        roe_net = (real_net / margin) if margin > 1e-12 else 0.0
 
-        act = float(pos.get("trailing_stop_activation_pct") or 0.02)
-        cb = float(pos.get("trailing_stop_callback_pct") or 0.005)
+        act = float(pos.get("trailing_stop_activation_pct") or 0.5)
+        retain = max(0.05, min(0.99, float(retain_frac)))
+        cost_floor_mult = 1.5
+        armed = bool(pos.get("trailing_armed"))
+        floor_line = float(cost_ref * cost_floor_mult)
 
-        hi = max(float(pos.get("highest_unrealized_pnl_pct") or 0.0), roe)
-        pos["highest_unrealized_pnl_pct"] = hi
+        def _predator_close(reason: str) -> None:
+            if reason in ("predator_pnl_chandelier", "predator_breakeven_floor"):
+                thr = max(float(pred_min_net), 1e-9)
+                if real_net <= thr - 1e-12:
+                    log.info(
+                        f"[HC_TRAIL SKIP] {symbol} reason={reason} skipped: real_net={real_net:.6f} "
+                        f"(need > {thr:.6f} after est open+close taker fees)"
+                    )
+                    return
+            ps = str(pos.get("side", "long")).lower()
+            close_side = "sell" if ps == "long" else "buy"
+            ect_out = dict(pos.get("entry_context") or {})
+            ect_out["exit_reason"] = reason
+            lim_px: Optional[float] = None
+            if bool(use_lim_exit):
+                lim_px = float(self._predator_limit_exit_price(symbol, ps, mp))
+                ect_out["predator_limit_exit"] = True
+                ect_out["resting_quote"] = True
+            log.warning(
+                f"[HC_TRAIL EXIT] {symbol} reason={reason} real_net={real_net:.6f} gross={pnl_gross:.6f} "
+                f"est_open_fee={open_fee_est:.6f} est_close_fee={close_fee_est:.6f} mx_net={mx:.6f} roe_net={roe_net:.6f} "
+                f"armed={armed} cost_ref={cost_ref:.6f} floor={floor_line:.6f} retain={retain:.3f} "
+                f"limit_px={lim_px if lim_px is not None else 'market'}"
+            )
+            self.execute_order(
+                symbol,
+                close_side,
+                contracts,
+                float(lim_px) if lim_px is not None and lim_px > 0 else None,
+                reduce_only=True,
+                leverage=int(pos.get("leverage", 10)),
+                margin_mode=str(pos.get("margin_mode", "isolated")),
+                berserker=False,
+                post_only=False,
+                entry_context=ect_out,
+                exit_reason=reason,
+            )
 
-        if not pos.get("trailing_armed"):
-            if roe >= act - 1e-12:
+        if not armed:
+            if bool(pos.get("hc_predator_saw_micro_profit")) and real_net < floor_line - 1e-12:
+                _predator_close("predator_breakeven_floor")
+                return
+            if roe_net >= act - 1e-12:
                 pos["trailing_armed"] = True
-                pos["trailing_favorable_extreme"] = mp
                 pos["trailing_armed_ts"] = now
                 log.warning(
-                    f"[TRAIL DEBUG] {symbol} ARM roe={roe:.6f}>={act:.6f} mark={mp:.8f} entry={entry:.8f} "
-                    f"pnl={pnl:.6f} margin={margin:.6f} notional={notional:.6f} lev={lev} | "
-                    f"callback exit suppressed for {grace_after_arm:.2f}s after arm"
+                    f"[HC_TRAIL ARM] {symbol} roe_net={roe_net:.6f}>={act:.6f} real_net={real_net:.6f} margin={margin:.6f}"
                 )
             return
 
@@ -2189,43 +2566,8 @@ class PaperTradingEngine:
             if ts_arm > 0 and (now - ts_arm) < grace_after_arm:
                 return
 
-        ext_raw = pos.get("trailing_favorable_extreme")
-        if ext_raw is None:
-            pos["trailing_favorable_extreme"] = mp
-            ext_raw = mp
-        ext = float(ext_raw)
-        ps = str(pos.get("side", "long")).lower()
-        if ps == "long":
-            ext = max(ext, mp)
-            pos["trailing_favorable_extreme"] = ext
-            dd = (ext - mp) / ext if ext > 1e-12 else 0.0
-        else:
-            ext = min(ext, mp)
-            pos["trailing_favorable_extreme"] = ext
-            dd = (mp - ext) / ext if ext > 1e-12 else 0.0
-
-        if dd < cb - 1e-12:
-            return
-        close_side = "sell" if ps == "long" else "buy"
-        ect = dict(pos.get("entry_context") or {})
-        ect["exit_reason"] = "high_conviction_trailing"
-        log.warning(
-            f"[TRAIL EXIT] {symbol} ROE={roe:.6f} dd_price={dd:.6f} vs cb={cb:.6f} "
-            f"mark={mp:.8f} extreme={ext:.8f} entry={entry:.8f} margin={margin:.6f}"
-        )
-        self.execute_order(
-            symbol,
-            close_side,
-            contracts,
-            None,
-            reduce_only=True,
-            leverage=int(pos.get("leverage", 10)),
-            margin_mode=str(pos.get("margin_mode", "isolated")),
-            berserker=False,
-            post_only=False,
-            entry_context=ect,
-            exit_reason="high_conviction_trailing",
-        )
+        if mx > 1e-12 and real_net < mx * retain - 1e-12:
+            _predator_close("predator_pnl_chandelier")
 
     def attach_high_conviction_trailing(
         self,
@@ -2234,7 +2576,7 @@ class PaperTradingEngine:
         callback_roe: float,
         extra_ctx: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """为已有仓位挂载 ROE 追踪止盈（Beta 断臂后主腿顺势奔跑）。"""
+        """挂载全统一净利润 Chandelier；activation_roe=武装阈值；callback_roe 保留签名兼容（不再用于价退）。"""
         pos = self.positions.get(symbol)
         if not pos or float(pos.get("size", 0) or 0) <= 0:
             return False
@@ -2246,10 +2588,15 @@ class PaperTradingEngine:
         pos["highest_unrealized_pnl_pct"] = 0.0
         pos["trailing_armed"] = False
         pos["trailing_favorable_extreme"] = None
+        mk = float(self.latest_prices.get(symbol, 0) or pos.get("entry_price") or 0)
+        fee_close0 = self._hc_est_close_taker_fee_usdt(symbol, pos, mk) if mk > 0 else 0.0
+        fee_open0 = self._hc_est_open_taker_fee_usdt(symbol, pos)
+        pnl0 = float(pos.get("unrealized_pnl", 0) or 0)
+        pos["hc_predator_max_pnl_usdt"] = float(pnl0 - fee_close0 - fee_open0)
+        pos["hc_predator_saw_micro_profit"] = False
         ect = dict(pos.get("entry_context") or {})
         ect.update(dict(extra_ctx or {}))
         ect["high_conviction_trailing"] = True
-        ect.setdefault("beta_hf_ride_trailing", True)
         pos["entry_context"] = ect
         return True
 
@@ -2266,6 +2613,8 @@ class PaperTradingEngine:
             "trailing_armed",
             "trailing_armed_ts",
             "trailing_favorable_extreme",
+            "hc_predator_max_pnl_usdt",
+            "hc_predator_saw_micro_profit",
         ):
             pos.pop(k, None)
         ect = dict(pos.get("entry_context") or {})
@@ -2432,6 +2781,14 @@ class PaperTradingEngine:
             return sp if isinstance(sp, dict) and sp else None
         except Exception:
             return None
+
+    def _funding_rate_for_symbol(self, symbol: str) -> float:
+        """Gate 约定：funding_rate>0 多付空；<0 空付多。"""
+        specs = self._exchange_physics_specs(symbol) or {}
+        try:
+            return float(specs.get("funding_rate", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _effective_order_size_cap(specs: Dict[str, Any], is_market: bool) -> float:
@@ -3275,6 +3632,12 @@ class PaperTradingEngine:
             if self._pending_fee_audit:
                 out.update(self._pending_fee_audit)
                 self._pending_fee_audit = None
+            self._maybe_inventory_pnl_wash(
+                out,
+                symbol=symbol,
+                reduce_only=bool(reduce_only),
+                entry_context=ctx0,
+            )
             return out
 
         except SimulatedAPIError as e:
@@ -3317,6 +3680,29 @@ class PaperTradingEngine:
             "total_funding_paid_usdt": float(self.accumulated_funding_fee),
             "wallet_cash_ledger_usdt": float(self.initial_balance),
         }
+
+    def reset_for_event_replay(self, initial_balance_usdt: float) -> None:
+        """纸面会话清零，供事件回放与生产引擎同一单例复跑。"""
+        self.initial_balance = float(initial_balance_usdt)
+        self.balance = float(initial_balance_usdt)
+        self.available_balance = float(initial_balance_usdt)
+        self.accumulated_fee_paid = 0.0
+        self.accumulated_funding_fee = 0.0
+        self.positions.clear()
+        self.orderbooks_cache.clear()
+        self.latest_prices.clear()
+        self._pending_realized_net_usdt = None
+        self._pending_fee_audit = None
+        self._maker_resting.clear()
+        self._shadow_orders.clear()
+        self._last_tick_volume.clear()
+        try:
+            from src.core.trend_filter import reset_anchor_trend_debug, reset_symbol_trends_debug
+
+            reset_anchor_trend_debug()
+            reset_symbol_trends_debug()
+        except Exception:
+            pass
 
     def get_balance(self):
         self._calculate_pnl()

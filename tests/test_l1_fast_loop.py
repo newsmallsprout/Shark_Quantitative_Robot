@@ -30,6 +30,22 @@ def test_cvd_rolling_window():
     assert base > 0
 
 
+def test_trade_flow_imbalance_buy_heavy():
+    sym = "TFLOW/USDT"
+    now = time.time()
+    l1_fast_loop.ingest_trades(
+        sym,
+        [
+            {"create_time": now - 2, "size": 30.0, "side": "buy", "contract": "TFLOW_USDT"},
+            {"create_time": now - 1, "size": 10.0, "side": "sell", "contract": "TFLOW_USDT"},
+        ],
+    )
+    imb = l1_fast_loop.trade_flow_imbalance(sym, 10.0, now)
+    assert imb > 0.4
+    g = l1_fast_loop.trade_flow_gross_contracts(sym, 10.0, now)
+    assert g == 40.0
+
+
 def test_atr_1m_bps_requires_bars():
     sym = "TEST2/USDT"
     t0 = 3600.0
