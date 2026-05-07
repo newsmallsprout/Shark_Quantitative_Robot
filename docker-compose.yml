@@ -1,103 +1,20 @@
-# Shark Quant — 生产栈：Nginx(80) → FastAPI(8002) + Redis（内网）
-# 使用方式：
-#   cp .env.example .env
-#   # 编辑 .env：至少设置 SHARK_API_TOKEN（生产）、SKIP_LICENSE_CHECK=0
-#   cp config/settings.model.yaml config/settings.yaml   # 若尚无
-#   docker compose up -d --build
-#
-# 访问：http://localhost （经 Nginx，不要直连 8002）
-#
-# 排查（许可证失败时主进程退出 → 容器反复重启 → docker exec 报「restarting」）：
-#   docker logs shark-quant-bot --tail 150
-#   不启动 main、仅查看挂载（与 compose 相同卷）：
-#   docker compose run --rm --no-deps --entrypoint /bin/sh shark-quant -c "ls -la /app/license; wc -c /app/license/fingerprint_override 2>/dev/null || true"
-
 services:
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: shark-quant-nginx
-    restart: unless-stopped
+  shark:
+    build: .
+    container_name: shark2
     ports:
-      - "${SHARK_HTTP_PORT:-80}:80"
-    volumes:
-      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      shark-quant:
-        condition: service_healthy
-    networks:
-      - quant_net
-
-  shark-quant:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        VITE_SHARK_API_TOKEN: ${SHARK_API_TOKEN:-}
-    image: shark-quant:latest
-    container_name: shark-quant-bot
-    restart: unless-stopped
-    expose:
-      - "8002"
-    volumes:
-      - ./config/settings.yaml:/app/config/settings.yaml
-      - ./logs:/app/logs
-      - ./license:/app/license
+      - "80:80"
+    env_file:
+      - .env
     environment:
-      NODE_ENV: production
-      SHARK_API_HOST: "0.0.0.0"
-      SHARK_API_TOKEN: ${SHARK_API_TOKEN:-}
-      SKIP_LICENSE_CHECK: ${SKIP_LICENSE_CHECK:-0}
-      SHARK_LICENSE_FINGERPRINT: ${SHARK_LICENSE_FINGERPRINT:-}
-      TZ: ${TZ:-UTC}
-    depends_on:
-      redis:
-        condition: service_healthy
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/api/health"]
       interval: 15s
       timeout: 5s
-      retries: 5
-      start_period: 90s
-    networks:
-      - quant_net
-
-  backtest-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        VITE_SHARK_API_TOKEN: ""
-    image: shark-quant:latest
-    profiles: ["backtest"]
-    working_dir: /app
-    command: ["python3", "backtest_worker.py", "--days", "7", "--insecure"]
-    volumes:
-      - ./config/settings.yaml:/app/config/settings.yaml
-      - ./data:/app/data
-    environment:
-      TZ: ${TZ:-UTC}
-      BACKTEST_INSECURE_SSL: "1"
-    networks:
-      - quant_net
-
-  redis:
-    image: redis:7.2-alpine
-    container_name: shark-quant-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
       retries: 3
-    networks:
-      - quant_net
-
-volumes:
-  redis_data:
-
-networks:
-  quant_net:
-    driver: bridge

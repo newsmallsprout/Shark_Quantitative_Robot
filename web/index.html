@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shark 2.0 — Quantum Trading Terminal</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦈</text></svg>">
+  <style>
+    /* 预加载字体回退：避免 FOIT */
+    @font-face { font-family: 'Terminal'; src: local('Menlo'), local('SF Mono'), local('Consolas'), local('Courier New'); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <canvas id="starfield"></canvas>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

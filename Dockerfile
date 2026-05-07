@@ -1,50 +1,47 @@
-# Build Frontend（生产令牌在构建时注入 VITE_*）
-FROM node:20-alpine AS frontend-builder
-WORKDIR /app/frontend
-ARG VITE_SHARK_API_TOKEN=""
-ENV VITE_SHARK_API_TOKEN=$VITE_SHARK_API_TOKEN
-COPY frontend/package*.json ./
-RUN npm install
-COPY frontend/ ./
+# ── Stage 1: Build React frontend ──
+FROM node:20-alpine AS web-builder
+WORKDIR /app/web
+COPY web/package.json web/package-lock.json ./
+RUN npm install --legacy-peer-deps
+COPY web/ ./
 RUN npm run build
 
-# Backend
+# ── Stage 2: Python runtime ──
 FROM python:3.11-slim
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    python3-dev \
-    libzmq3-dev \
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# App code
 COPY main.py .
-COPY backtest_runner.py .
-COPY backtest_worker.py .
-COPY event_replay_main.py .
-COPY src/ ./src/
-COPY config/ ./config/
-# 仅公钥入镜像；私钥与 license.key 由运行时卷挂载（见 .dockerignore）
-RUN mkdir -p /app/license
-COPY license/public.pem /app/license/public.pem
+COPY ai_strategy.py .
+COPY dual_strategy.py .
+COPY ai_position.py .
+COPY oscillation.py .
+COPY ai/ ./ai/
+COPY engine/ ./engine/
+COPY api/ ./api/
+COPY strategies/ ./strategies/
 
-COPY --from=frontend-builder /app/frontend/dist/ ./src/web/
+# Built frontend (from web-builder stage)
+COPY --from=web-builder /app/web/dist ./web/dist
 
-COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+# Static assets (background images etc)
+COPY web/public ./web/public
 
-RUN mkdir -p logs
+# Config
+COPY .env .
 
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+EXPOSE 80
 
-EXPOSE 8002
-EXPOSE 5555
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:80/api/health || exit 1
 
-ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["python3", "main.py"]
+CMD ["python", "main.py"]

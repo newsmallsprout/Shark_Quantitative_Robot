@@ -11,9 +11,12 @@ license/*
 !license/fingerprint_override.example
 frontend/node_modules/
 frontend/dist/
+tmp_screencap_frames/
 dist/
 config/settings.yaml
 .ide/
 docs/
 delivery/
 tests/
+# 浅克隆的 Cursor 参考库（~260MB+），新环境请运行: bash scripts/setup_cursor_refs.sh
+third_party/cursor-references/
