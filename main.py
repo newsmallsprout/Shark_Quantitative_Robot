@@ -275,9 +275,11 @@ MAX_MARGIN_PER_POS = 5.0  # 单仓最大保证金
 
 # ═══════════════════════════════════════════════════════════════════════
 class StrategyRunner:
-    def __init__(self, initial_balance=250.0):
+    def __init__(self, initial_balance=10000.0):
         self.balance = initial_balance
         self.equity = initial_balance
+        self.static_equity = initial_balance      # 已实现权益（不含浮盈）
+        self.peak_static_equity = initial_balance  # static_equity 历史峰值
         self.positions: Dict[str, dict] = {}
         self.realized_pnl = 0.0
         self.trades = 0          # 总开仓次数
@@ -333,6 +335,17 @@ class StrategyRunner:
 
     def update_contracts(self, specs: Dict[str, ContractSpec]):
         self._contract_specs = specs
+
+    def _quanto_for(self, sym: str) -> float:
+        sp = self._contract_specs.get(sym)
+        return float(sp.quanto_multiplier) if sp else 1.0
+
+    def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
+        """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
+        q = self._quanto_for(sym)
+        if pos["side"] == "long":
+            return pos["size"] * q * (px - pos["entry"])
+        return pos["size"] * q * (pos["entry"] - px)
 
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
@@ -392,13 +405,10 @@ class StrategyRunner:
                     if avg_count < 2:  # 最多补 2 次
                         add_m = pos["margin"] * add_ratio
                         if add_m >= 0.3 and self.balance > add_m + pos["margin"]:
-                            add_s = (add_m * pos["leverage"]) / max(px, 1e-9)
-                            # 考虑quanto
-                            spec = self._contract_specs.get(sym)
-                            if spec:
-                                quanto = spec.quanto_multiplier
-                                add_s = add_s / max(quanto, 1e-9) if quanto < 1 else add_s
+                            q_av = self._quanto_for(sym)
+                            add_s = (add_m * pos["leverage"]) / max(q_av * px, 1e-9)
                             pos["margin"] += add_m
+                            self.balance -= add_m
                             pos["size"] += add_s
                             pos["entry"] = (pos["entry"] * (pos["size"] - add_s) + px * add_s) / pos["size"]
                             self._osc_avg_count[sym] = avg_count + 1
@@ -418,11 +428,11 @@ class StrategyRunner:
                                (pside == "short" and ai_sl > pos["entry"])
                     sl_hit = (pside == "long" and px <= ai_sl) or (pside == "short" and px >= ai_sl)
                     if sl_valid and sl_hit:
-                        self._close_position(sym, px, f"AI止损{ai_sl:.2f}", pnl_pct)
+                        self._close_position(sym, px, f"AI止损{ai_sl:.2f}", pnl_pct, prices)
                         continue
                     elif not sl_valid and sl_hit:
                         # 止损价在盈利方向 → 当作止盈触发
-                        self._close_position(sym, px, f"AI目标{ai_sl:.2f}", pnl_pct)
+                        self._close_position(sym, px, f"AI目标{ai_sl:.2f}", pnl_pct, prices)
                         continue
 
                 # 2. AI 防守区
@@ -439,8 +449,10 @@ class StrategyRunner:
                         if vol_ratio < 1.2:  # 缩量 → 补仓
                             add_m = min(pos["margin"] * 0.3, self.balance * 0.02, 2.0)
                             if add_m >= 0.3 and self.balance > add_m + pos["margin"]:
-                                add_s = (add_m * pos["leverage"]) / max(px, 1e-9)
+                                q_df = self._quanto_for(sym)
+                                add_s = (add_m * pos["leverage"]) / max(q_df * px, 1e-9)
                                 pos["margin"] += add_m
+                                self.balance -= add_m
                                 pos["size"] += add_s
                                 pos["entry"] = (pos["entry"] * (pos["size"] - add_s) + px * add_s) / pos["size"]
                                 pos["defense_used"] = True
@@ -470,10 +482,15 @@ class StrategyRunner:
                         # 步骤A：平掉 30% 底仓落袋利润
                         harvest_ratio = 0.3
                         harvest_size = pos["size"] * harvest_ratio
-                        harvest_pnl = harvest_size * (px - pos["entry"]) if pside == "long" else harvest_size * (pos["entry"] - px)
+                        qh = self._quanto_for(sym)
+                        harvest_pnl = (
+                            harvest_size * qh * (px - pos["entry"])
+                            if pside == "long"
+                            else harvest_size * qh * (pos["entry"] - px)
+                        )
                         # 扣 Maker 手续费
                         fee_r = self._get_maker_fee(sym)
-                        harvest_fee = harvest_size * px * fee_r
+                        harvest_fee = harvest_size * qh * px * fee_r
                         net_harvest = harvest_pnl - harvest_fee
                         
                         if net_harvest <= 0:
@@ -493,14 +510,16 @@ class StrategyRunner:
                         # 步骤B：用利润作最大回撤额度加仓
                         add_margin = min(net_harvest * 2, pos["margin"] * 0.5, self.balance * 0.05)
                         if add_margin >= 0.3 and self.balance > add_margin:
-                            add_size = (add_margin * pos["leverage"]) / max(px, 1e-9)
+                            add_size = (add_margin * pos["leverage"]) / max(qh * px, 1e-9)
                             pos["margin"] += add_margin
+                            self.balance -= add_margin
                             pos["size"] += add_size
+                            open_fee_est = add_size * qh * px * fee_r
+                            self.balance -= open_fee_est
+                            self.total_fees += open_fee_est
                             pos["entry"] = (pos["entry"] * (pos["size"] - add_size) + px * add_size) / pos["size"]
                             pos["pyramid_count"] = pos.get("pyramid_count", 0) + 1
                             self.trades += 1
-                            self.balance -= add_margin * fee_r  # 开仓费
-                            self.total_fees += add_margin * fee_r
                             
                             # 全局止损移至初始开仓价（保本）
                             pos["trailing_stop"] = pos.get("ai_entry", pos["entry"])
@@ -509,10 +528,11 @@ class StrategyRunner:
                     elif act_type == "take_profit":
                         if ratio >= 0.8:  # 终极止盈 → 全平
                             fee_r = self._get_maker_fee(sym)
-                            est_fee = pos["size"] * px * fee_r * 2
+                            qp = self._quanto_for(sym)
+                            est_fee = pos["size"] * qp * px * fee_r * 2
                             net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
                             if net_pnl > 0.03:
-                                self._close_position(sym, px, f"AI终极止盈{tp:.2f}", pnl_pct)
+                                self._close_position(sym, px, f"AI终极止盈{tp:.2f}", pnl_pct, prices)
                                 continue
                         elif ratio > 0 and pnl_pct > 1.0:  # 部分止盈
                             reduce_s = pos["size"] * ratio
@@ -531,13 +551,15 @@ class StrategyRunner:
                     if act["type"] == "take_profit":
                         # 只有确实盈利才平仓
                         if pnl_pct > 1.0:  # 至少1%盈利
-                            self._close_position(sym, px, f"AI目标{act['price']:.2f}", pnl_pct)
+                            self._close_position(sym, px, f"AI目标{act['price']:.2f}", pnl_pct, prices)
                             break
                     elif act["type"] == "pyramid_add" and pos.get("pyramid_count", 0) < 3:
                         add_m = pos["margin"] * 0.5
                         if add_m >= 0.5 and self.balance > add_m:
-                            add_s = (add_m * pos["leverage"]) / max(px, 1e-9)
+                            q_at = self._quanto_for(sym)
+                            add_s = (add_m * pos["leverage"]) / max(q_at * px, 1e-9)
                             pos["margin"] += add_m
+                            self.balance -= add_m
                             pos["size"] += add_s
                             pos["pyramid_count"] = pos.get("pyramid_count", 0) + 1
                             self.trades += 1
@@ -554,8 +576,10 @@ class StrategyRunner:
                 if signal_valid and self.balance > pos["margin"] * 1.2:
                     add_margin = pos["margin"] * 0.5
                     if add_margin >= 0.5 and self.balance > add_margin:
-                        add_size = (add_margin * pos["leverage"]) / max(px, 1e-9)
+                        q_py = self._quanto_for(sym)
+                        add_size = (add_margin * pos["leverage"]) / max(q_py * px, 1e-9)
                         pos["margin"] += add_margin
+                        self.balance -= add_margin
                         pos["size"] += add_size
                         pos["pyramid_count"] = pos.get("pyramid_count", 0) + 1
                         pos["entry"] = (pos["entry"] * (pos["size"] - add_size) + px * add_size) / pos["size"]
@@ -566,29 +590,29 @@ class StrategyRunner:
                 trail_pct = abs(dyn_sl) * trail_ratio
                 if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
                     fee_r = self._get_maker_fee(sym)
-                    est_fee = pos["size"] * px * fee_r * 3
+                    qe = self._quanto_for(sym)
+                    est_fee = pos["size"] * qe * px * fee_r * 3
                     net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
                     if net_pnl > max(0.03, est_fee):
-                        self._close_position(sym, px, "移动止盈", pnl_pct)
+                        self._close_position(sym, px, "移动止盈", pnl_pct, prices)
                         continue
 
             # 固定止盈（兜底）：净利必须超过手续费 3 倍
             if pnl_pct >= vol_chg * 1.5:
                 fee_r = self._get_maker_fee(sym)
-                est_fee = pos["size"] * px * fee_r * 3  # 双边费的 3 倍
+                qe2 = self._quanto_for(sym)
+                est_fee = pos["size"] * qe2 * px * fee_r * 3  # 双边费的 3 倍
                 net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
                 if net_pnl > max(0.03, est_fee):  # 净利 > 5倍手续费
-                    self._close_position(sym, px, "止盈", pnl_pct)
+                    self._close_position(sym, px, "止盈", pnl_pct, prices)
                     continue
 
             # 动态止损
             if pnl_pct <= dyn_sl:
-                self._close_position(sym, px, "止损", pnl_pct)
+                self._close_position(sym, px, "止损", pnl_pct, prices)
                 continue
 
-            # 超时平仓
-            if now - pos["opened"] > TIMEOUT_SEC:
-                self._close_position(sym, px, "超时", pnl_pct)
+            # 超时平仓已禁用
 
         # 计算当前总风险敞口
         total_margin = sum(p["margin"] for p in self.positions.values())
@@ -625,6 +649,25 @@ class StrategyRunner:
             scored.append((sym, score, vol, chg_abs))
 
         scored.sort(key=lambda x: x[1], reverse=True)
+        # BTC/ETH 优先尝试开仓（分数排序后仍插到队首）
+        scored_stable = [s for s in scored if is_stable(s[0])]
+        scored_alt = [s for s in scored if not is_stable(s[0])]
+        scored = scored_stable + scored_alt
+
+        # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
+        prefetch_tasks = []
+        for psym, _, _, _ in scored[:35]:
+            if len(prefetch_tasks) >= 4:
+                break
+            if now - self._ai_cooldowns.get(psym, 0) < 300:
+                continue
+            prefetch_tasks.append(
+                self._fetch_ai_plan(psym, prices[psym],
+                                    funding_rates.get(psym, 0),
+                                    changes.get(psym, 0),
+                                    volumes.get(psym, 0)))
+        if prefetch_tasks:
+            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
 
         opened = 0
         for sym, score, vol, chg_abs in scored:
@@ -640,6 +683,11 @@ class StrategyRunner:
 
             # 取合约最大杠杆
             spec = self._contract_specs.get(sym)
+            if spec is None and is_stable(sym):
+                print(
+                    f"[DEBUG-BTC] {sym} 无合约规格，使用默认杠杆/面值",
+                    flush=True,
+                )
             max_lev = spec.leverage_max if spec else 50
 
             # 杠杆：合约最大 * 波动衰减（平滑连续）
@@ -647,13 +695,11 @@ class StrategyRunner:
             lev_factor = max(0.25, 1.0 / (1 + chg_abs / 25))
             lev = max(1, int(max_lev * lev_factor))
 
-            # 保证金：纯波动率驱动（不再用固定比例）
-            # 低波大仓、高波小仓，范围 $0.50 ~ $3.00
-            vol_factor = max(0.3, min(2.0, 2.0 / (1 + chg_abs / 10)))
-            base_margin = 1.0  # 基础保证金 $1
-            margin = base_margin * vol_factor
-            if margin < 0.5: margin = 0.5
-            if margin > 3.0: margin = 3.0
+            # 保证金：余额动态比例 × 波动衰减（低波大仓，高波小仓）
+            cfg = get_config(sym)
+            base_pct = cfg.get("margin_pct", 0.01)
+            vol_factor = max(0.4, 1.5 / (1 + chg_abs / 12))
+            margin = self.balance * base_pct * vol_factor
 
             # 资金上限检查
             cap = get_capital_limit(self.balance, sym)
@@ -683,7 +729,6 @@ class StrategyRunner:
             entry_price = px  # Maker 单无滑点
 
             # 策略类型持仓限制
-            cfg = get_config(sym)
             max_pos = cfg.get("max_positions", 0)
             if max_pos > 0:
                 same_type = sum(1 for s in self.positions if is_stable(s) == is_stable(sym))
@@ -712,16 +757,15 @@ class StrategyRunner:
                 if osc_side:
                     signal_src = f"震荡{osc_reason} 信{osc_conf}"
             
-            if ai_direction and ai_confidence >= 45:
-                # AI 说了算
+            if ai_direction and ai_confidence >= 35:
+                # AI 优先
                 side = "long" if ai_direction == "LONG" else "short"
                 signal_src = f"AI多维 信{ai_confidence}"
             elif osc_side:
                 side = osc_side
             else:
-                # ── 层级3：费率/趋势兜底 ──
+                # 费率/趋势兜底
                 if is_stable(sym):
-                    # 主流币：顺势（费率正→做多，负→做空），无费率看涨跌
                     if funding > 0:
                         side, signal_src = "long", f"主流费率{funding*100:+.3f}%"
                     elif funding < 0:
@@ -755,38 +799,48 @@ class StrategyRunner:
             stype = "主流" if is_stable(sym) else "山寨"
             msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}"
             
-            # 所有检查通过，扣费开仓
-            self.balance -= fee
+            # 所有检查通过，扣费开仓（冻结保证金 + 手续费）
+            self.balance -= margin + fee
             self.total_fees += fee
             
             self._log.append(msg)
-            print(msg)
+            print(msg, flush=True)
 
             opened += 1
 
         self._recalc_equity(prices)
         self._update_state(prices)
 
-    def _close_position(self, sym, px, reason, pnl_pct):
+    def _close_position(self, sym, px, reason, pnl_pct, prices=None):
         pos = self.positions.pop(sym)
         self._osc_avg_count.pop(sym, None)  # 清补仓计数
-        realized = pos["margin"] * pnl_pct / 100
 
-        # Maker 平仓费（返佣）
         spec = self._contract_specs.get(sym)
+        q = self._quanto_for(sym)
+        gross = self._gross_pnl_usd(sym, pos, px)
         fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
-        fee_close = pos["size"] * px * fee_rate_maker
-        realized -= fee_close
+        fee_close = pos["size"] * q * px * fee_rate_maker
+        realized = gross - fee_close
+
         self.total_fees += fee_close
-        print(f"[DEBUG费用] 平仓扣费 fee={fee_close:.6f} balance={self.balance:.2f} total_fees={self.total_fees:.4f}")
+        print(
+            f"[DEBUG费用] 毛利={gross:.6f} 平仓费={fee_close:.6f} 净利={realized:.6f} "
+            f"balance={self.balance:.2f} total_fees={self.total_fees:.4f}",
+            flush=True,
+        )
 
-        # Maker 无滑点
-        slip_close = 0
-
-        self.balance += realized
+        self.balance += pos["margin"] + gross - fee_close
         self.realized_pnl += realized
         self.closed_trades += 1
-        if realized > 0: self.wins += 1
+        if realized > 0:
+            self.wins += 1
+
+        # 更新 static_equity（平仓后 = 已实现的真实权益，剔除浮盈）
+        if prices:
+            self._recalc_equity(prices)
+        self.static_equity = self.equity
+        if self.static_equity > self.peak_static_equity:
+            self.peak_static_equity = self.static_equity
 
         # 记录到交易历史
         self._trade_history.append({
@@ -796,27 +850,29 @@ class StrategyRunner:
             "margin": pos["margin"], "realized_pnl": realized,
             "pnl_pct": pnl_pct, "reason": reason,
             "fee_open": pos.get("fee_open", 0),
-            "fee_close": pos["size"] * px * (spec.taker_fee if spec else TAKER_FEE),
+            "fee_close": fee_close,
+            "gross_pnl": gross,
             "opened_at": pos["opened"], "closed_at": time.time(),
         })
 
-        msg = f"[平仓] {sym} {reason} 盈亏={realized:+.4f} ({pnl_pct:+.1f}%) 余额={self.balance:.2f} 累计手续费={self.total_fees:.4f}"
+        msg = (
+            f"[平仓] {sym} {reason} 盈亏={realized:+.4f} ({pnl_pct:+.1f}%) "
+            f"余额={self.balance:.2f} static_equity={self.static_equity:.2f} 累计手续费={self.total_fees:.4f}"
+        )
         self._log.append(msg)
-        print(msg)
+        print(msg, flush=True)
 
         # 平仓后冷却，避免立即重开（止损更长）
         cooldown_sec = 120 if reason == "止损" else 30
         self._cooldowns[sym] = time.time() + cooldown_sec
 
     def _recalc_equity(self, prices):
-        unrealized = 0
+        locked = sum(p["margin"] for p in self.positions.values())
+        unrealized = 0.0
         for sym, pos in self.positions.items():
             px = prices.get(sym, pos["entry"])
-            if pos["side"] == "long":
-                unrealized += pos["size"] * (px - pos["entry"])
-            else:
-                unrealized += pos["size"] * (pos["entry"] - px)
-        self.equity = self.balance + unrealized
+            unrealized += self._gross_pnl_usd(sym, pos, px)
+        self.equity = self.balance + locked + unrealized
 
     def _update_state(self, prices):
         _state["equity"] = self.equity
@@ -854,12 +910,8 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
                 pos_list = []
                 for sym, pos in runner.positions.items():
                     px = prices.get(sym, pos["entry"])
-                    if pos["side"] == "long":
-                        unrealized = pos["size"] * (px - pos["entry"])
-                        pnl_pct = (px - pos["entry"]) / pos["entry"] * pos["leverage"] * 100
-                    else:
-                        unrealized = pos["size"] * (pos["entry"] - px)
-                        pnl_pct = (pos["entry"] - px) / pos["entry"] * pos["leverage"] * 100
+                    unrealized = runner._gross_pnl_usd(sym, pos, px)
+                    pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
                     pos_list.append({
                         "symbol": sym, "side": pos["side"],
                         "size": pos["size"], "entry_price": pos["entry"],
@@ -869,7 +921,7 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
                     })
                 _state["position_list"] = pos_list
         except Exception as e:
-            print(f"[价格推送错误] {e}")
+            print(f"[价格推送错误] {e}", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -883,9 +935,9 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
     try:
         specs = await fetch_contract_specs()
         runner.update_contracts(specs)
-        print(f"📡 合约规格加载完成: {len(specs)} 个合约")
+        print(f"📡 合约规格加载完成: {len(specs)} 个合约", flush=True)
     except Exception as e:
-        print(f"[警告] 合约规格获取失败: {e}，使用默认值")
+        print(f"[警告] 合约规格获取失败: {e}，使用默认值", flush=True)
 
     while True:
         try:
@@ -913,12 +965,8 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             pos_list = []
             for sym, pos in runner.positions.items():
                 px = prices.get(sym, pos["entry"])
-                if pos["side"] == "long":
-                    unrealized = pos["size"] * (px - pos["entry"])
-                    pnl_pct = (px - pos["entry"]) / pos["entry"] * pos["leverage"] * 100
-                else:
-                    unrealized = pos["size"] * (pos["entry"] - px)
-                    pnl_pct = (pos["entry"] - px) / pos["entry"] * pos["leverage"] * 100
+                unrealized = runner._gross_pnl_usd(sym, pos, px)
+                pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
                 pos_list.append({
                     "symbol": sym, "side": pos["side"],
                     "size": pos["size"], "entry_price": pos["entry"],
@@ -927,7 +975,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                 })
             _state["position_list"] = pos_list
         except Exception as e:
-            print(f"[错误] 交易循环: {e}")
+            print(f"[错误] 交易循环: {e}", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -937,12 +985,18 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
 async def main():
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
-    runner = StrategyRunner(initial_balance=250.0)
+    runner = StrategyRunner(initial_balance=10000.0)
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="warning",
+        access_log=False,
+    )
     server = uvicorn.Server(config)
 
-    print(f"\U0001f988 Shark 2.0 启动成功 :{port}")
+    print(f"\U0001f988 Shark 2.0 启动成功 :{port}", flush=True)
     price_feed = MarketDataFeed()
     await asyncio.gather(
         server.serve(),
