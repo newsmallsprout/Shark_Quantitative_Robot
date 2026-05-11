@@ -105,8 +105,8 @@ class Reflector:
     def maybe_adjust(self) -> dict:
         """累积足够样本后触发战术调整，返回调整指令"""
         total = self.total_losses
-        if total < 10:
-            return {}  # 样本不够
+        if total < 5:
+            return {}  # 样本不够（放宽至5笔）
 
         adjustments = {}
 

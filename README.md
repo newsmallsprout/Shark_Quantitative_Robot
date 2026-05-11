@@ -1,244 +1,287 @@
-# Shark 2.0 · Quantitative Trading Robot  
-# Shark 2.0 · 量化交易机器人
+# Shark 2.0 — Quantitative Execution & Risk Research Stack
 
-**English:** A research-oriented crypto futures stack that combines live public market data (Gate.io USDT perpetuals) with optional multi-model AI signals, risk controls, and a real-time web dashboard.  
-**中文：** 面向研究与演练的加密货币合约系统：对接 Gate.io 公开 USDT 永续行情与合约参数，可选多模型 AI 信号、风控与组合模块，并提供 WebSocket 实时看板。
+**Choose documentation language · 点击下方标题展开对应语言全文（中英分块，互不混排）**
 
----
+<details open>
+<summary><strong>English</strong> — Institutional &amp; quant desk overview</summary>
 
-## Table of contents · 目录
+## Executive summary
 
-1. [Highlights · 特性](#highlights--特性)  
-2. [Architecture · 架构](#architecture--架构)  
-3. [Requirements · 环境要求](#requirements--环境要求)  
-4. [Quick start (Docker) · 快速开始](#quick-start-docker--快速开始-docker)  
-5. [Local development · 本地开发](#local-development--本地开发)  
-6. [Configuration · 配置说明](#configuration--配置说明)  
-7. [HTTP API · 接口](#http-api--接口)  
-8. [Repository layout · 目录结构](#repository-layout--目录结构)  
-9. [Security & operations · 安全与运维](#security--operations--安全与运维)  
-10. [Disclaimer · 免责声明](#disclaimer--免责声明)
+Shark 2.0 is a **crypto derivatives research and paper-trading workstation** built around **USDT-margined perpetual swaps**. It consumes **public reference data** from Gate.io—**contract specifications**, **funding-rate mechanics**, and **fee schedules**—so simulated execution reflects **venue-grade economics**: configurable **slippage**, **taker/maker fee** assumptions, **notional** and **max-leverage** bounds, and logic consistent with **perpetual funding** behaviour on live markets.
+
+The runtime reconciles **discretionary overlays** with **systematic guardrails**: **dual-track capital allocation** (liquid majors vs **high-beta alt** sleeves), **regime / oscillation** filters, optional **multi-LLM alpha** pipelines for idea generation and **position sizing**, and a **priority-tier circuit breaker** layer (`engine/safety.py`) to contain **operational risk** during stress.
+
+Delivery includes **FastAPI** REST endpoints for **liveness**, **aggregated book / P&amp;L snapshots**, and a paginated **trade blotter**; a **Vite + React** dashboard ingests **~1 Hz WebSocket** pushes for **mark-to-market** visibility—suitable for **research**, **sandboxed strategy acceptance**, and **middle-office-style** monitoring (non-production by default unless you harden networking and secrets).
 
 ---
 
-## Highlights · 特性
+## Value proposition for finance stakeholders
 
-**English**
-
-- **Market realism:** Contract specs, funding, and fee assumptions aligned with Gate.io public APIs; configurable slippage, cooldowns, and exposure caps in the core loop.  
-- **Modular strategies:** Optional components include AI targets (`ai_strategy.py`), AI position sizing (`ai_position.py`), oscillation detection, dual-track capital rules, and a circuit-breaker-aware risk layer.  
-- **Dashboard:** FastAPI serves REST endpoints and a WebSocket feed; production images bundle a Vite + React + Tailwind UI (`web/`).  
-- **Automation-friendly:** Docker multi-stage build (Node build → Python runtime); `docker compose` mounts `./data` and `./logs` for persistence.
-
-**中文**
-
-- **贴近实盘参数：** 从 Gate.io 公共接口拉取合约规格、资金费率等，主循环内可配置滑点、冷却与总敞口上限。  
-- **策略与风控可插拔：** AI 标的、AI 仓位、震荡识别、双轨资金、熔断式风控等可按依赖与配置启用。  
-- **可视化：** FastAPI 提供 REST 与 WebSocket；镜像内包含前端构建产物，亦可本地单独开发 `web/`。  
-- **部署：** 多阶段 Dockerfile；Compose 持久化数据与日志目录。
+| Theme | What it addresses |
+|--------|-------------------|
+| **Execution realism** | **Cost of carry** awareness via funding; explicit fee and **market-impact** knobs—not a frictionless backtest toy. |
+| **Risk architecture** | **Exposure caps**, cooldowns, **pyramid / trail** rules on majors, and **circuit breakers** with severities from **INFO** to **CRITICAL**. |
+| **Portfolio construction** | **Sleeve separation**: e.g. BTC/ETH **swing** parameters vs selected **high-volatility** alt **scalp** sleeves (`dual_strategy.py`). |
+| **Signal stack (optional)** | Cloud LLM APIs (env-only keys) can contribute **risk/reward**-aware targets; **signal fusion** and evolution tooling (`evolve_v2.py`, `multi_exchange.py`) extend **cross-venue** and **tactical** research—enable only what your governance allows. |
+| **Observability** | **Request correlation** (`X-Request-ID` / `[rid=…]` logs) for audit-friendly tracing across HTTP and background ticks. |
 
 ---
 
-## Architecture · 架构
+## Architecture (technical)
 
-**English**
+- **Runtime:** `main.py` — single **ASGI** entry (`main:app`); **asyncio** concurrency for Uvicorn, market refresh, and strategy **tick** loop.
+- **Data plane:** REST polling against Gate.io public APIs; dashboard clients subscribe to **`/ws`** for consolidated state.
+- **Persistence (optional paths):** SQLAlchemy / Alembic / Redis modules under `persistence/` when configured.
+- **Domains:** `engine/` (orchestrator, **paper engine**, rate limiting, safety), `strategies/`, `domain/trading/`, `ai/` heuristics layer.
 
-- **Runtime:** `main.py` runs an asyncio event loop: Uvicorn (FastAPI) concurrently with market refresh and strategy ticks.  
-- **Data:** REST polling against `api.gateio.ws` for tickers and contract metadata; WebSocket `/ws` pushes aggregated state to the UI.  
-- **AI path (optional):** `ai_strategy.py` calls cloud LLM HTTP APIs using keys supplied **only** via environment variables (never commit secrets).
-
-**中文**
-
-- **运行模型：** `main.py` 在单进程内用 asyncio 并行跑 HTTP 服务、行情刷新与策略节拍。  
-- **数据：** 对 Gate.io 公共 REST 轮询；前端通过 `/ws` 获取聚合状态。  
-- **AI（可选）：** `ai_strategy.py` 仅通过环境变量读取各云厂商 API Key，密钥不得写入仓库。
+See `adr/` for entrypoint and DDD decisions.
 
 ---
 
-## Requirements · 环境要求
+## Requirements
 
-| Item · 项目 | English | 中文 |
-|-------------|---------|------|
-| Python | 3.11+ recommended | 建议 3.11+ |
-| Node.js | 20+ (for local `web/` builds) | 本地构建 `web/` 时用 20+ |
-| Container | Docker / Docker Compose | Docker / Compose |
-
----
-
-## Quick start (Docker) · 快速开始 (Docker)
-
-**English**
-
-1. Copy environment template and edit **private** values (keys, tokens) locally:  
-   `cp .env.example .env`  
-2. Build and start:  
-   `docker compose up -d --build`  
-3. Open the dashboard: `http://localhost` (host port maps container `80`; override with `SHARK_HTTP_PORT` as needed).  
-4. Logs and state: host directories `./logs` and `./data` are mounted into the container.
-
-**中文**
-
-1. 复制环境模板并仅在本地 `.env` 中填写密钥（勿提交）：`cp .env.example .env`  
-2. 构建并启动：`docker compose up -d --build`  
-3. 浏览器访问 `http://localhost`（默认映射 80 端口，可用 `SHARK_HTTP_PORT` 调整）。  
-4. `./logs`、`./data` 挂载到容器内，便于排障与留存。
+| Item | Version |
+|------|---------|
+| Python | 3.11+ recommended |
+| Node.js | 20+ (local `web/` builds) |
+| Container | Docker / Docker Compose |
 
 ---
 
-## Local development · 本地开发
+## Quick start (Docker)
 
-**English**
+1. `cp .env.example .env` — set secrets **only** on the host; do not commit.
+2. `docker compose up -d --build`
+3. Dashboard: `http://localhost` (host maps container `80`; adjust with `SHARK_HTTP_PORT` as needed).
+4. Host directories `./logs` and `./data` are mounted for **logs** and **state**.
+
+---
+
+## Local development
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# Optional: build the React dashboard so /assets is available
 cd web && npm ci && npm run build && cd ..
 python main.py
 ```
 
-For frontend hot reload during UI work:
+Frontend hot reload: `cd web && npm ci && npm run dev` — align Vite proxy with `SHARK_HTTP_PORT` (see `web/vite.config.ts`).
 
-```bash
-cd web && npm ci && npm run dev
-# Vite proxies /api and /ws. Default proxy target is 127.0.0.1:8002 (web/vite.config.ts);
-# if you run `python main.py` with SHARK_HTTP_PORT=80, either set SHARK_HTTP_PORT=8002
-# or change the proxy to match your backend port.
+---
+
+## Configuration (summary)
+
+- Authoritative template: **`.env.example`** → copy to `.env`.
+- **HTTP:** `SHARK_HTTP_PORT`
+- **Logging:** `SHARK_LOG_LEVEL`; stderr uses `[rid=…]` tied to `X-Request-ID`.
+- **LLM (optional):** e.g. `DEEPSEEK_API_KEY`, `VOLC_KEY`, `QWEN_KEY` — non-empty only if that **provider path** is enabled in `ai_strategy.py`.
+- **API hardening:** `SHARK_API_TOKEN` (Bearer for REST; `?token=` on WebSocket); mirror with `VITE_SHARK_API_TOKEN` in `web/`.
+- **Licensing:** if your distribution uses checks, see `SKIP_LICENSE_CHECK`, `SHARK_LICENSE_FINGERPRINT` in `.env.example`.
+
+---
+
+## HTTP API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/health` | Liveness |
+| GET | `/api/status` | Aggregated runtime snapshot |
+| GET | `/api/history` | Paginated trade history (`offset`, `limit`) |
+| WS | `/ws` | ~1 Hz JSON push |
+
+**Single canonical entry:** `main:app`. Legacy second app in `api/server.py` is explicitly deprecated; see `adr/0001-single-http-entrypoint.md`.
+
+**Correlation:** Responses echo `X-Request-ID`; supply your own for **end-to-end** log alignment.
+
+---
+
+## Repository layout
+
+```
+Shark_Quantitative_Robot/
+├── main.py
+├── ai_strategy.py / ai_position.py
+├── dual_strategy.py
+├── evolve_v2.py         # Evolution / regime research (optional)
+├── multi_exchange.py    # Cross-venue signals (optional)
+├── backtest.py
+├── ai/
+├── engine/              # orchestrator, paper_engine, safety, rate_limiter
+├── strategies/
+├── persistence/
+├── domain/
+├── observability/
+├── api/
+├── adr/
+├── web/
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── .env.example
 ```
 
-**中文**
+---
+
+## Security & operations
+
+- **Secrets:** Never bake `.env` into images in production; inject via Compose / orchestrator **secret stores**. Rotate any leaked keys.
+- **Network:** Default Compose exposes port **80**; use firewalls or an **authenticated reverse proxy** on untrusted networks. Treat **PnL** and **position** payloads as **confidential operational** data—apply **least-privilege** access consistent with **middle-office** hygiene.
+- **Dependencies:** `requirements.txt` lists direct imports; optional lines are commented—pin when enabling.
+- **CPU baseline (offline):** `python tools/profile_tick_baseline.py` (`PROFILE_TICKS`, `PROFILE_TOP`).
+
+---
+
+## Disclaimer
+
+This software is provided for **education and research** only. **Cryptocurrency derivatives** are **highly volatile**; **paper** or **simulated** performance is **not** indicative of **live P&amp;L**. You are solely responsible for **regulatory compliance**, **exchange terms**, and **capital loss**. **No warranty** or **investment advice** is provided.
+
+---
+
+## License
+
+Unless a `LICENSE` file is present, rights are reserved; follow the license shipped with your distribution.
+
+</details>
+
+<details>
+<summary><strong>中文</strong> — 金融机构与量化团队导读</summary>
+
+## 导读摘要
+
+Shark 2.0 是一款面向 **USDT 本位永续合约**的 **加密衍生品投研与纸面交易工作台**。系统对接 Gate.io **公开参考数据**——**合约细则**、**资金费率机制**与**手续费结构**——使仿真成交具备 **贴近交易所层级的经济约束**：可配置 **滑点**、**吃单/挂单费率**假设、**名义本金**与**最大杠杆**边界，以及与市场惯例一致的 **永续资金费** 行为近似。
+
+运行时在 **自由裁量策略叠加** 与 **系统性风控护栏** 之间做平衡：**双轨制资金配置**（高流动性主流品种 vs **高 Beta 山寨**子组合）、**市场状态 / 震荡** 识别过滤、可选 **多模型 LLM Alpha** 管线（ idea 生成与 **仓位管理**），以及基于优先级的 **熔断式** 安全层（`engine/safety.py`），用于在压力情景下收敛 **操作风险**。
+
+交付形态为 **FastAPI** REST（**探活**、**聚合账本/盯市盈亏快照**、分页 **成交回报**）与 **Vite + React** 看板（约 **1Hz WebSocket** 推送 **盯市盈亏** 状态）——适用于 **策略研究**、**sandbox 验收** 与 **类中台风控** 可视监控（默认非生产级，需自行加固网络与密钥治理）。
+
+---
+
+## 面向金融客户的价值表述
+
+| 维度 | 说明 |
+|------|------|
+| **执行层贴近度** | 通过资金费率与费率表体现 **持有成本**；显式 **冲击成本（滑点）** 与手续费模型——非零摩擦回测。 |
+| **风险管理架构** | **名义敞口/杠杆** 约束、**冷却期**、主流币 **金字塔/移动止盈** 规则，以及 **INFO 至 CRITICAL** 分级的 **熔断** 机制。 |
+| **组合构建** | **子策略分仓**：如 BTC/ETH **波段** 参数 vs 精选 **高波动** 山寨 **短线**（`dual_strategy.py`）。 |
+| **信号栈（可选）** | 云侧 LLM（仅环境变量密钥）可输出带 **风险收益比** 考量的标的筛选；`evolve_v2.py`、`multi_exchange.py` 等扩展 **跨所** 与 **战术库** 研究——按贵司 **模型风险管理** 与合规要求逐项启用。 |
+| **可审计性** | **请求关联 ID**（`X-Request-ID` / 日志 `[rid=…]`）便于跨 HTTP 与后台 **tick** 对齐排障与追溯。 |
+
+---
+
+## 架构说明（技术）
+
+- **运行时：** `main.py` — 单一 **ASGI** 入口（`main:app`）；**asyncio** 并发承载 Uvicorn、行情刷新与策略 **节拍**。
+- **数据面：** 对 Gate.io 公共 REST 轮询；前端经 **`/ws`** 订阅聚合状态。
+- **持久化（按需）：** `persistence/` 下 SQLAlchemy、Alembic、Redis 等路径。
+- **核心模块：** `engine/`（编排、**纸面撮合引擎**、限流、安全）、`strategies/`、`domain/trading/`、`ai/` 启发式层。
+
+架构决策见 `adr/`。
+
+---
+
+## 环境要求
+
+| 项目 | 版本 |
+|------|------|
+| Python | 建议 3.11+ |
+| Node.js | 本地构建 `web/` 时 20+ |
+| 容器 | Docker / Compose |
+
+---
+
+## 快速开始（Docker）
+
+1. `cp .env.example .env` — 密钥仅在宿主机填写，**勿提交**仓库。
+2. `docker compose up -d --build`
+3. 浏览器访问 `http://localhost`（默认映射 80；可用 `SHARK_HTTP_PORT` 调整）。
+4. 宿主机 `./logs`、`./data` 挂载用于 **日志** 与 **状态** 留存。
+
+---
+
+## 本地开发
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cd web && npm ci && npm run build && cd ..   # 可选：生成 dist 供 FastAPI 挂载
+cd web && npm ci && npm run build && cd ..
 python main.py
 ```
 
-前端热更新：
-
-```bash
-cd web && npm ci && npm run dev
-# 默认代理到 127.0.0.1:8002（见 web/vite.config.ts）。若 `main.py` 监听 80 端口，
-# 请将 SHARK_HTTP_PORT=8002 或修改 Vite 代理与后端一致。
-```
+前端热更新：`cd web && npm ci && npm run dev` — 与 `SHARK_HTTP_PORT` 对齐代理（见 `web/vite.config.ts`）。
 
 ---
 
-## Configuration · 配置说明
+## 配置摘要
 
-**English**
-
-- Primary reference: **`.env.example`**. After copying to `.env`, set variables required for your deployment.  
-- **HTTP:** `SHARK_HTTP_PORT` (default 80 inside container when using the provided Compose file).  
-- **Logging:** `SHARK_LOG_LEVEL` (default `INFO`). Stderr lines include `[rid=…]` from `X-Request-ID` on HTTP requests (or `-` for background tasks).  
-- **LLM (optional AI path):** e.g. `DEEPSEEK_API_KEY`, `VOLC_KEY`, `QWEN_KEY` — must be non-empty only if you enable those call paths in `ai_strategy.py`.  
-- **API hardening (when implemented in your fork):** `SHARK_API_TOKEN` and matching frontend token for Bearer authentication.  
-- **License / fingerprint:** If your distribution uses license checks, follow comments in `.env.example` for `SKIP_LICENSE_CHECK` and `SHARK_LICENSE_FINGERPRINT`.
-
-**中文**
-
-- 以 **`.env.example`** 为准，复制为 `.env` 后在本地填写。  
-- **HTTP：** `SHARK_HTTP_PORT`（与 Compose 端口映射配合）。  
-- **日志：** `SHARK_LOG_LEVEL`（默认 `INFO`）。标准错误输出含 `[rid=…]`：与 HTTP 请求头 `X-Request-ID` 对应；后台任务无请求时为 `-`。  
-- **LLM：** 如启用 `ai_strategy.py` 中对应提供方，需在环境中配置 `DEEPSEEK_API_KEY`、`VOLC_KEY`、`QWEN_KEY` 等，且**不得**写入 Git。  
-- **鉴权：** 若分支中实现了 Bearer 校验，需与前端 `VITE_*` 等变量保持一致。  
-- **许可证：** 若使用许可证校验，参见 `.env.example` 中 `SKIP_LICENSE_CHECK`、`SHARK_LICENSE_FINGERPRINT` 说明。
+- 模板以 **`.env.example`** 为准，复制为 `.env`。
+- **HTTP：** `SHARK_HTTP_PORT`
+- **日志：** `SHARK_LOG_LEVEL`；标准错误含 `[rid=…]`，对应 `X-Request-ID`。
+- **LLM（可选）：** 如启用 `ai_strategy.py` 对应厂商，配置 `DEEPSEEK_API_KEY`、`VOLC_KEY`、`QWEN_KEY` 等，**禁止**写入 Git。
+- **鉴权：** `SHARK_API_TOKEN`（REST 用 Bearer；WebSocket 用 `?token=`）；前端 `web/.env.local` 中 `VITE_SHARK_API_TOKEN` 保持一致。
+- **许可证：** 见 `.env.example` 中 `SKIP_LICENSE_CHECK`、`SHARK_LICENSE_FINGERPRINT`。
 
 ---
 
-## HTTP API · 接口
-
-**English** — Endpoints exposed by `main.py` (only supported stack):
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/health` | Liveness JSON payload |
-| GET | `/api/status` | Aggregated runtime state snapshot |
-| GET | `/api/history` | Paginated trade history (`offset`, `limit`) |
-| WS | `/ws` | ~1 Hz JSON push of dashboard state |
-
-Canonical ASGI: **`main:app`**. The former second app in `api/server.py` was removed; see `adr/0001-single-http-entrypoint.md`.
-
-**Correlation ID:** HTTP responses echo `X-Request-ID`. Send your own id to trace a call across logs; if omitted the server generates one. WebSocket clients may send `X-Request-ID` on the handshake (non-browser clients); the same id is used for log context during that connection.
-
-**Optional API token:** When `SHARK_API_TOKEN` is set, `GET /api/status` and `GET /api/history` require `Authorization: Bearer <token>`. The WebSocket must pass the same secret as query `?token=<token>` (browser `WebSocket` cannot send custom headers). Leave unset for open local dev. Use `VITE_SHARK_API_TOKEN` under `web/` (same value) so the dashboard connects.
-
-**中文** — `main.py` 默认路由：
+## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 探活 |
-| GET | `/api/status` | 聚合状态 |
+| GET | `/api/status` | 聚合运行快照 |
 | GET | `/api/history` | 历史成交分页 |
-| WS | `/ws` | 约每秒推送 JSON 状态 |
+| WS | `/ws` | 约每秒 JSON 推送 |
 
-**单一入口：** 对外 HTTP/WebSocket 仅 **`main:app`**（`python main.py`）。`api/server.py` 已改为显式占位（若调用 `create_api_server` 会报错）；说明见 `adr/0001-single-http-entrypoint.md`。
+**单一规范入口：** `main:app`。历史第二入口已废弃，说明见 `adr/0001-single-http-entrypoint.md`。
 
-**请求关联：** HTTP 响应带回 `X-Request-ID`。可自带该头以便在日志中对齐一次调用；未带则由服务端生成。WebSocket 握手可带 `X-Request-ID`（浏览器原生 API 无法自定义头，多用于非浏览器客户端），连接期间日志使用同一 `rid`。
-
-**可选鉴权：** 若环境变量设置了 `SHARK_API_TOKEN`，则 `/api/status`、`/api/history` 须带请求头 `Authorization: Bearer <token>`；`/ws` 须带查询参数 `?token=<token>`（与令牌相同）。未设置时保持原先开放行为。前端开发时在 `web/.env.local` 配置 `VITE_SHARK_API_TOKEN` 与之一致。
+**关联 ID：** 响应回传 `X-Request-ID`；可自带该头做 **全链路** 日志对齐。
 
 ---
 
-## Repository layout · 目录结构
+## 目录结构
 
 ```
 Shark_Quantitative_Robot/
-├── main.py              # Entry: FastAPI + trading loop
-├── ai_strategy.py       # Optional multi-LLM strategy pipeline
-├── ai_position.py       # Optional AI position manager
-├── risk_manager.py      # Risk / circuit-breaker helpers
-├── dual_strategy.py     # Dual-track symbol & capital rules
-├── backtest.py          # Historical experiment script
-├── ai/                  # Brain / heuristics (engineered AI layer)
-├── engine/              # Orchestrator, safety, paper engine, rate limiting
-├── strategies/          # Strategy implementations
-├── api/                 # 迁移占位（历史第二入口已移除；见 adr/0001）
-├── adr/                 # 架构决策记录 (ADR)
-├── domain/              # 领域模型骨架（交易订单/状态；见 adr/0002）
-├── observability/       # 请求关联 ID、根日志格式
-├── tools/               # 开发工具（如 profile 基线脚本）
-├── web/                 # React (Vite) dashboard source + dist after build
-├── Dockerfile           # Multi-stage image
+├── main.py
+├── ai_strategy.py / ai_position.py
+├── dual_strategy.py
+├── evolve_v2.py         # 自进化 / 状态机研究（可选）
+├── multi_exchange.py    # 跨所信号（可选）
+├── backtest.py
+├── ai/
+├── engine/              # 编排、纸面引擎、安全、限流
+├── strategies/
+├── persistence/
+├── domain/
+├── observability/
+├── api/
+├── adr/
+├── web/
+├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-├── .env.example
-└── README.md
+└── .env.example
 ```
 
 ---
 
-## Security & operations · 安全与运维
+## 安全与运维
 
-**English**
-
-- **Secrets:** Keep `.env` out of version control; rotate any key previously exposed in logs or chat. Do not bake `.env` into images in production—inject at runtime (Compose `env_file`, orchestrator secrets, etc.).  
-- **Network exposure:** Default Compose publishes port 80 on the host. Restrict firewalls or place an authenticated reverse proxy in untrusted networks. REST and WebSocket data can include PnL and positions—treat as sensitive.  
-- **Dependencies:** `requirements.txt` lists direct imports used by the default `main.py` stack; optional packages are commented at the file bottom—uncomment and pin when enabling those code paths. For reproducible builds, pin versions or use a lockfile.  
-- **Observability:** Application logs go under `./logs` when using the bundled Compose volume mapping; Uvicorn access logging may be reduced in code for noise control—verify your observability stack separately.  
-- **CPU baseline (no network):** Run `python tools/profile_tick_baseline.py` from the repo root (optional env `PROFILE_TICKS`, `PROFILE_TOP`). On a typical dev machine, cumulative time is dominated by `StrategyRunner.tick`, then per-symbol work in `oscillation.py` (`OscillationDetector.feed`) and frequent `dual_strategy.get_config` calls—use this as a before/after when optimizing the inner loop.
-
-**中文**
-
-- **密钥：** `.env` 不提交；曾泄露的 Key 应在云控制台轮换；生产环境勿将 `.env` `COPY` 进镜像，应在运行时注入。  
-- **网络：** 默认映射宿主机 80 端口，公网部署请加防火墙或前置带鉴权的反向代理；`/api/*` 与 `/ws` 可能包含仓位与盈亏，按敏感数据处理。  
-- **依赖：** 根目录 `requirements.txt` 仅保留当前代码路径实际使用的直接依赖；可选包以注释形式列于文件末尾，启用时再取消注释并建议锁定版本。  
-- **可观测性：** Compose 挂载 `./logs`；代码中可能关闭部分访问日志以降低噪音——生产请用独立监控与告警。  
-- **CPU 基线（无网络）：** 在仓库根执行 `python tools/profile_tick_baseline.py`（可用环境变量 `PROFILE_TICKS`、`PROFILE_TOP`）。开发机上累计耗时多在 `StrategyRunner.tick`、各 symbol 的 `oscillation.py`（`OscillationDetector.feed`）以及高频的 `dual_strategy.get_config`——作内层循环优化时可对比前后 profile。
+- **密钥：** 生产环境勿将 `.env` `COPY` 入镜像；使用 Compose / 编排器 **密钥管理** 注入；泄露密钥须在云控制台 **轮换**。
+- **网络：** 默认暴露宿主机 **80**；公网须 **防火墙** 或带鉴权的 **反向代理**。**盈亏与仓位** 类数据按 **敏感内部信息** 管控。
+- **依赖：** `requirements.txt` 为当前路径直接依赖；文件末尾注释为可选包——启用时建议 **锁定版本**。
+- **性能基线（无网络）：** `python tools/profile_tick_baseline.py`（`PROFILE_TICKS`、`PROFILE_TOP`）。
 
 ---
 
-## Disclaimer · 免责声明
+## 免责声明
 
-**English:** This software is provided for educational and research purposes. Cryptocurrency derivatives are highly volatile; simulated or paper behaviour does not guarantee live performance. You are solely responsible for compliance with applicable laws, exchange terms, and for any capital loss. No warranty or investment advice is given.
-
-**中文：** 本软件仅供学习与策略研究。加密衍生品波动极大，模拟或纸面表现不代表实盘结果。使用者须自行遵守法律法规与交易所条款，并承担全部资金与合规风险。本项目不构成投资建议，亦不提供任何担保。
+本软件仅供 **学习与研究**。**加密衍生品** **波动剧烈**；**模拟/纸面** 表现 **不构成** **实盘收益** 预测。使用者须自行承担 **监管合规**、**交易所协议** 与 **资金损失** 责任。本项目 **不构成投资建议**，亦 **不提供任何担保**。
 
 ---
 
-## License · 许可
+## 许可
 
-**English:** Unless a `LICENSE` file is present in this repository, all rights are reserved by the project authors. Add or follow the license file shipped with your distribution.
+若仓库根目录无 `LICENSE` 文件则权利保留；请以实际发行版附带许可为准。
 
-**中文：** 若仓库根目录未包含 `LICENSE` 文件，则权利保留；请以实际随发行版提供的许可文件为准。
+</details>

@@ -578,6 +578,9 @@ class StrategyRunner:
         self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
         self._evolve_patterns: list = []  # 检测到的模式
         self._reflector = Reflector() if KLINE_ENABLED else None  # 止损反思器
+        self._evo_margin_mult = 1.0      # 进化保证金倍率
+        self._evo_skip_alts = False       # 进化暂停山寨
+        self._evo_cooldown_bonus = 0      # 进化额外冷却
         self._persistence = persistence
 
     def _get_maker_fee(self, sym: str) -> float:
@@ -655,45 +658,122 @@ class StrategyRunner:
         return float(sp.quanto_multiplier) if sp else 1.0
 
     def _check_evolution(self):
-        """实时自进化检测：分析最近交易→匹配战术→应用"""
+
+    def _strategic_entry(self, sym: str, side: str, px: float, regime_value: str) -> float:
+        """根据行情类型计算策略性入场价，而非市价盲入。
+        趋势市回调入场，震荡市边界入场，突破市追入。"""
+        try:
+            kc = get_kline_cache() if KLINE_ENABLED else None
+            if not kc:
+                return px
+
+            highs, lows = kc.get_high_low(sym, "5m")
+            closes = kc.get_close(sym, "5m")
+            if len(closes) < 10:
+                return px
+
+            hh = max(highs[-20:])   # 20根K线高点
+            ll = min(lows[-20:])     # 20根K线低点
+            ema9 = kc.ema(sym, 9, "5m")
+            ema21 = kc.ema(sym, 21, "5m")
+            rng = hh - ll
+
+            # ── 强趋势：回调/反弹到EMA入场 ──
+            if "strong_trend" in regime_value:
+                if "up" in regime_value and side == "long":
+                    # 做多：等回调到EMA9，不超过现价1%
+                    target = ema9 if ema9 < px else px * 0.995
+                    return max(target, px * 0.99)
+                elif "down" in regime_value and side == "short":
+                    target = ema9 if ema9 > px else px * 1.005
+                    return min(target, px * 1.01)
+
+            # ── 弱趋势：小幅偏向趋势方向 ──
+            elif "weak_trend" in regime_value:
+                if "up" in regime_value and side == "long":
+                    return px * 0.997  # 微回调入场
+                elif "down" in regime_value and side == "short":
+                    return px * 1.003
+
+            # ── 震荡：靠边界入场（做多近支撑，做空近阻力）──
+            elif "ranging" in regime_value:
+                if side == "long":
+                    # 靠近区间下沿30%处
+                    target = ll + rng * 0.3
+                    return max(target, px * 0.985)  # 最多偏1.5%
+                else:
+                    target = hh - rng * 0.3
+                    return min(target, px * 1.015)
+
+            # ── 突破：追在突破点上方 ──
+            elif "breakout" in regime_value:
+                if "up" in regime_value and side == "long":
+                    return min(hh * 1.002, px * 1.01)  # 略高于前高，但不超过1%
+                elif "down" in regime_value and side == "short":
+                    return max(ll * 0.998, px * 0.99)
+
+            # ── 乱震/默认：市价 ──
+            return px
+
+        except Exception:
+            return px
+        """实时自进化：分析交易模式 → 即时调整参数"""
         recent = self._trade_history[-30:]
-        if len(recent) < 10:
+        if len(recent) < 3:
             return
         
-        # 检测连亏
+        # 心跳：确认引擎在跑
+        stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
+        wins = sum(1 for t in recent if t["realized_pnl"] > 0)
         consecutive = 0
         for t in reversed(recent):
             if t["realized_pnl"] <= 0:
                 consecutive += 1
             else:
                 break
-        
+
         # 连亏3+ → 缩减仓位
-        if consecutive >= 3 and consecutive > len(self._evolve_patterns):
-            self._evolve_patterns.append(consecutive)
-            factor = max(0.3, 1.0 - consecutive * 0.2)
-            # 通过降低MARGIN_PCT实现缩仓
-            old_margin = MARGIN_PCT
-            # 这里不能直接修改常量，但可以通过cooldown延长实现
-            
-        # 止损率过高 → 多交易所确认
+        if consecutive >= 3:
+            self._evo_margin_mult = max(0.25, 1.0 - consecutive * 0.15)
+            print(f"[进化] 连亏{consecutive}笔，保证金缩至{self._evo_margin_mult:.0%}", flush=True)
+
+        # 止盈后恢复仓位
+        if consecutive == 0 and self._evo_margin_mult < 1.0:
+            self._evo_margin_mult = min(1.0, self._evo_margin_mult + 0.1)
+            if self._evo_margin_mult >= 1.0:
+                print("[进化] 仓位恢复正常", flush=True)
+
+        # 止损率过高 → 放宽止损
         stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
-        if stops > len(recent) * 0.45:
-            if "multi_exchange" not in str(self._evolve_patterns):
-                self._evolve_patterns.append("multi_exchange")
-                print(f"[进化] 检测到高止损率({stops}/{len(recent)})，强化多交易所确认", flush=True)
-        
-        # 震荡市 → 暂停山寨
+        if len(recent) >= 5 and stops > len(recent) * 0.35:
+            if self._reflector:
+                self._reflector.stop_boost = min(4, self._reflector.stop_boost + 1.0)
+            print(f"[进化] 止损率{stops}/{len(recent)}={stops/len(recent):.0%}，止损+1%", flush=True)
+
+        # 连亏5+ → 暂停山寨
         if consecutive >= 5:
-            if "alt_pause" not in str(self._evolve_patterns):
-                self._evolve_patterns.append("alt_pause")
-                print(f"[进化] 连续{consecutive}次亏损，暂停山寨开仓", flush=True)
-        
-        # 止损反思 → 战术调整
-        if self._reflector:
+            self._evo_skip_alts = True
+            print(f"[进化] 连亏{consecutive}笔，暂停山寨开仓", flush=True)
+        elif consecutive == 0:
+            self._evo_skip_alts = False
+
+        # 盈利后放宽AI门槛
+        wins_recent = sum(1 for t in recent[-10:] if t["realized_pnl"] > 0)
+        if wins_recent >= 6 and self._reflector and self._reflector.ai_boost > 0:
+            self._reflector.ai_boost = max(0, self._reflector.ai_boost - 3)
+            print(f"[进化] 近10笔胜{wins_recent}，AI阈值恢复-3", flush=True)
+
+        # 反思器调整（更激进：5笔亏损就触发）
+        if self._reflector and self._reflector.total_losses >= 5:
             adj = self._reflector.maybe_adjust()
             if adj:
-                _log.info("[进化-反思] 调整: %s", adj)
+                print(f"[进化-反思] {adj}", flush=True)
+        
+        # 引擎心跳（每次检查都打印关键指标）
+        _stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
+        _wins = sum(1 for t in recent if t["realized_pnl"] > 0)
+        print(f"[进化] tick={self._evolve_tick} 交易{len(recent)}笔 连亏{consecutive} 止损率{_stops}/{len(recent)} "
+              f"保证金×{self._evo_margin_mult:.1f} AI阈值+{self._reflector.ai_boost if self._reflector else 0}", flush=True)
 
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
@@ -725,7 +805,7 @@ class StrategyRunner:
 
         # ── 自进化实时检测（每50 tick）──
         self._evolve_tick += 1
-        if self._evolve_tick % 50 == 0 and len(self._trade_history) >= 10:
+        if self._evolve_tick % 20 == 0 and len(self._trade_history) >= 3:
             self._check_evolution()
 
         # 喂震荡检测器
@@ -1054,6 +1134,9 @@ class StrategyRunner:
 
         opened = 0
         for sym, score, vol, chg_abs in scored:
+            # 进化引擎：连亏时暂停山寨
+            if self._evo_skip_alts and not is_stable(sym):
+                continue
             # 总敞口限制（余额 * 95%）
             if total_margin >= self.balance * MAX_TOTAL_EXPOSURE:
                 break
@@ -1110,7 +1193,7 @@ class StrategyRunner:
             if is_stable(sym):
                 base_pct *= 1.3
             vol_factor = max(0.4, 1.5 / (1 + chg_abs / 12))
-            margin = self.balance * base_pct * vol_factor
+            margin = self.balance * base_pct * vol_factor * self._evo_margin_mult
 
             # 检查最小下单量（考虑 quanto_multiplier）
             quanto = spec.quanto_multiplier if spec else 1.0
@@ -1145,7 +1228,7 @@ class StrategyRunner:
             if bucket_used + margin > cap:
                 continue
 
-            entry_price = px  # Maker 单无滑点
+            entry_price = px  # 默认市价，策略入场在方向确定后调整
 
             # 策略类型持仓限制
             max_pos = cfg.get("max_positions", 0)
@@ -1268,6 +1351,10 @@ class StrategyRunner:
             _stop_override = _rc.get("stop_pct")
             _tp_override = _rc.get("tp_pct")
             _pyramid_override = _rc.get("pyramid")
+
+            # 策略入场价：根据行情类型+方向智能定位
+            _rv = _regime.value if _regime else "unknown"
+            entry_price = self._strategic_entry(sym, side, entry_price, _rv)
 
             self.positions[sym] = {
                 "side": side, "entry": entry_price, "size": size,
