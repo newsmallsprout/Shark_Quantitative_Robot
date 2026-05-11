@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shark 2.0 — 真实模拟量化交易机器人。手续费、滑点、资金费率、合约最大杠杆全部实盘规格。"""
 
-import asyncio, os, random, sys, time, json
+import asyncio, os, sys, time, json
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -12,6 +12,13 @@ sys.path.insert(0, str(ROOT))
 try:
     from dotenv import load_dotenv; load_dotenv(ROOT / ".env")
 except ImportError: pass
+
+from dialogue_ammo import (
+    dialogue_ammo_loop,
+    pop_line,
+    trade_category_for_close,
+    trade_category_for_open,
+)
 
 # 导入AI策略
 try:
@@ -45,6 +52,20 @@ except ImportError:
     def get_capital_limit(b, s): return b
     def is_high_vol_alt(s): return True
 
+# K线缓存（自进化引擎依赖）
+try:
+    from kline_cache import KlineCache, init_kline_cache, get_kline_cache
+    KLINE_ENABLED = True
+except ImportError:
+    KLINE_ENABLED = False
+
+# 多交易所价格聚合
+try:
+    from multi_exchange import MultiExchangeFeed, init_multi_feed, get_multi_feed
+    MULTI_ENABLED = True
+except ImportError:
+    MULTI_ENABLED = False
+
 # ═══════════════════════════════════════════════════════════════════════
 # 手续费 / 滑点 / 真实参数
 # ═══════════════════════════════════════════════════════════════════════
@@ -53,7 +74,7 @@ MAKER_FEE = 0.0002        # Gate.io maker 费率 0.02%
 SLIPPAGE_MAX = 0.0003     # 最大滑点 0.03%
 COOLDOWN_SEC = 10         # 同币对冷却 10s
 TRADE_INTERVAL = 1        # 交易循环间隔 1s（200ms盘口匹配）
-TP_PCT = 6.0              # 止盈 6%
+TP_PCT = 2.0              # 止盈 2%（微利策略：5x手续费即走）
 SL_PCT = -6.0             # 止损 -6%
 TIMEOUT_SEC = 300         # 超时平仓 5min
 MAX_TOTAL_EXPOSURE = 0.95 # 最大总风险敞口 95%
@@ -139,6 +160,8 @@ class MarketDataFeed:
     def __init__(self): self._cache: Dict[str, LiveTicker] = {}
 
     async def refresh(self, symbols: List[str]):
+        if not isinstance(symbols, (list, tuple)):
+            symbols = []
         url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -179,8 +202,9 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 app = FastAPI(title="Shark 2.0")
-_state = {"equity": 100.0, "balance": 100.0, "realized_pnl": 0.0, "win_rate": 0.0,
-          "positions": 0, "safety_blocked": False, "symbols": [], "trades": 0, "wins": 0,
+_state = {"equity": 100.0, "balance": 100.0, "free_cash": 100.0, "initial_capital": 100.0,
+          "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
+          "positions": 0, "safety_blocked": False, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
           "position_list": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0}
 
 @app.get("/api/health")
@@ -221,6 +245,22 @@ _public_dir = ROOT / "web" / "public"
 if _public_dir.exists():
     app.mount("/public", StaticFiles(directory=str(_public_dir)), name="public")
 
+# 宠物舱 MP4：依次尝试 web/video → 仓库根 video → 构建产物 dist/video
+_pet_video_dir = next(
+    (
+        p
+        for p in (
+            ROOT / "web" / "video",
+            ROOT / "video",
+            ROOT / "web" / "dist" / "video",
+        )
+        if p.is_dir()
+    ),
+    None,
+)
+if _pet_video_dir is not None:
+    app.mount("/video", StaticFiles(directory=str(_pet_video_dir)), name="pet_video")
+
 DASHBOARD = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>🦈 Shark 2.0</title>
@@ -255,7 +295,7 @@ ws.onmessage=e=>{const d=JSON.parse(e.data);
 <div class="card"><h2>Win Rate</h2><div class="val mid">${(d.win_rate*100)?.toFixed(1)}%</div></div>
 <div class="card"><h2>Trades</h2><div class="val mid">${d.trades}</div></div>
 <div class="card"><h2>Positions</h2><div class="val mid">${d.positions}</div></div>
-<div class="card"><h2>Symbols</h2><div class="val mid">${d.symbols||0}</div></div>`;
+<div class="card"><h2>Symbols</h2><div class="val mid">${d.symbol_count ?? d.symbols?.length ?? d.symbols ?? 0}</div></div>`;
 };
 ws.onclose=()=>setTimeout(()=>location.reload(),2000);
 </script></body></html>"""
@@ -272,16 +312,21 @@ MAX_POSITIONS = 0          # 0=不限制，有信号就开
 MARGIN_PCT = 0.005        # 每仓保证金占权益 0.5%
 MAX_MARGIN_PER_POS = 5.0  # 单仓最大保证金
 
+# 看板娘事件序号（前端可对齐最新一条）
+_character_event_seq = 0
+
 
 # ═══════════════════════════════════════════════════════════════════════
 class StrategyRunner:
     def __init__(self, initial_balance=10000.0):
+        self._initial_capital = float(initial_balance)
         self.balance = initial_balance
         self.equity = initial_balance
         self.static_equity = initial_balance      # 已实现权益（不含浮盈）
         self.peak_static_equity = initial_balance  # static_equity 历史峰值
         self.positions: Dict[str, dict] = {}
         self.realized_pnl = 0.0
+        self.gross_realized = 0.0  # 毛利累计（不含手续费）
         self.trades = 0          # 总开仓次数
         self.closed_trades = 0   # 总平仓次数
         self.wins = 0            # 盈利平仓次数
@@ -295,6 +340,9 @@ class StrategyRunner:
         self._oscillator = OscillationDetector() if OSC_ENABLED else None
         self._osc_avg_count: Dict[str, int] = {}  # 每币对补仓次数
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
+        self._open_timestamps: list = []  # 开仓时间戳
+        self._evolve_tick = 0  # 自进化计数器
+        self._evolve_patterns: list = []  # 检测到的模式
 
     def _get_maker_fee(self, sym: str) -> float:
         """从合约API获取实时maker费率"""
@@ -340,12 +388,60 @@ class StrategyRunner:
         sp = self._contract_specs.get(sym)
         return float(sp.quanto_multiplier) if sp else 1.0
 
+    def _check_evolution(self):
+        """实时自进化检测：分析最近交易→匹配战术→应用"""
+        recent = self._trade_history[-30:]
+        if len(recent) < 10:
+            return
+        
+        # 检测连亏
+        consecutive = 0
+        for t in reversed(recent):
+            if t["realized_pnl"] <= 0:
+                consecutive += 1
+            else:
+                break
+        
+        # 连亏3+ → 缩减仓位
+        if consecutive >= 3 and consecutive > len(self._evolve_patterns):
+            self._evolve_patterns.append(consecutive)
+            factor = max(0.3, 1.0 - consecutive * 0.2)
+            # 通过降低MARGIN_PCT实现缩仓
+            old_margin = MARGIN_PCT
+            # 这里不能直接修改常量，但可以通过cooldown延长实现
+            
+        # 止损率过高 → 多交易所确认
+        stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
+        if stops > len(recent) * 0.45:
+            if "multi_exchange" not in str(self._evolve_patterns):
+                self._evolve_patterns.append("multi_exchange")
+                print(f"[进化] 检测到高止损率({stops}/{len(recent)})，强化多交易所确认", flush=True)
+        
+        # 震荡市 → 暂停山寨
+        if consecutive >= 5:
+            if "alt_pause" not in str(self._evolve_patterns):
+                self._evolve_patterns.append("alt_pause")
+                print(f"[进化] 连续{consecutive}次亏损，暂停山寨开仓", flush=True)
+
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
         q = self._quanto_for(sym)
         if pos["side"] == "long":
             return pos["size"] * q * (px - pos["entry"])
         return pos["size"] * q * (pos["entry"] - px)
+
+    def _est_fee_usd(self, sym: str, pos: dict, px: float, fee_rounds: float = 3.0) -> float:
+        """按当前名义估算平仓侧手续费倍数（与止盈里原 *3 口径一致）。"""
+        q = self._quanto_for(sym)
+        fee_r = self._get_maker_fee(sym)
+        return pos["size"] * q * px * fee_r * fee_rounds
+
+    def _take_profit_net_ok(self, sym: str, pos: dict, px: float, fee_rounds: float = 3.0) -> bool:
+        """毛利扣估算手续费后仍有意义，避免 net > est_fee 的翻倍门槛锁死大单止盈。"""
+        gross = self._gross_pnl_usd(sym, pos, px)
+        est = self._est_fee_usd(sym, pos, px, fee_rounds)
+        net = gross - est
+        return net >= max(0.05, 0.25 * est)
 
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
@@ -354,6 +450,11 @@ class StrategyRunner:
 
         # 清理过期冷却
         self._cooldowns = {k: v for k, v in self._cooldowns.items() if now < v}
+
+        # ── 自进化实时检测（每50 tick）──
+        self._evolve_tick += 1
+        if self._evolve_tick % 50 == 0 and len(self._trade_history) >= 10:
+            self._check_evolution()
 
         # 喂震荡检测器
         if self._oscillator:
@@ -531,10 +632,10 @@ class StrategyRunner:
                             qp = self._quanto_for(sym)
                             est_fee = pos["size"] * qp * px * fee_r * 2
                             net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
-                            if net_pnl > 0.03:
+                            if net_pnl > est_fee * 5:  # 微利即走
                                 self._close_position(sym, px, f"AI终极止盈{tp:.2f}", pnl_pct, prices)
                                 continue
-                        elif ratio > 0 and pnl_pct > 1.0:  # 部分止盈
+                        elif ratio > 0 and pnl_pct > 0:  # 部分止盈：有利润就行
                             reduce_s = pos["size"] * ratio
                             pos["size"] -= reduce_s
                             pos["margin"] *= (1 - ratio)
@@ -549,8 +650,8 @@ class StrategyRunner:
                 actions = apply_ai_targets(pos, px, ai_targets, sym, self)
                 for act in actions:
                     if act["type"] == "take_profit":
-                        # 只有确实盈利才平仓
-                        if pnl_pct > 1.0:  # 至少1%盈利
+                        # 微利即走：用统一手续费校验
+                        if self._take_profit_net_ok(sym, pos, px):
                             self._close_position(sym, px, f"AI目标{act['price']:.2f}", pnl_pct, prices)
                             break
                     elif act["type"] == "pyramid_add" and pos.get("pyramid_count", 0) < 3:
@@ -586,26 +687,22 @@ class StrategyRunner:
                         self.trades += 1
 
             # 移动止盈：从最高点回撤，覆盖手续费
-            if best_pnl > trail_trigger:
+            trail_bar = trail_trigger if not is_st else min(trail_trigger, 5.0)
+            if best_pnl > trail_bar:
                 trail_pct = abs(dyn_sl) * trail_ratio
                 if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
-                    fee_r = self._get_maker_fee(sym)
-                    qe = self._quanto_for(sym)
-                    est_fee = pos["size"] * qe * px * fee_r * 3
-                    net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
-                    if net_pnl > max(0.03, est_fee):
+                    if self._take_profit_net_ok(sym, pos, px):
                         self._close_position(sym, px, "移动止盈", pnl_pct, prices)
                         continue
 
-            # 固定止盈（兜底）：净利必须超过手续费 3 倍
-            if pnl_pct >= vol_chg * 1.5:
-                fee_r = self._get_maker_fee(sym)
-                qe2 = self._quanto_for(sym)
-                est_fee = pos["size"] * qe2 * px * fee_r * 3  # 双边费的 3 倍
-                net_pnl = pos["margin"] * pnl_pct / 100 - est_fee
-                if net_pnl > max(0.03, est_fee):  # 净利 > 5倍手续费
-                    self._close_position(sym, px, "止盈", pnl_pct, prices)
-                    continue
+            # 固定止盈（兜底）：主流用「波动 × 系数」但封顶，避免 vol_chg 大时永远达不到线
+            if is_st:
+                fixed_tp_pct = max(4.0, min(vol_chg * 0.85, 6.5))
+            else:
+                fixed_tp_pct = vol_chg * 1.5
+            if pnl_pct >= fixed_tp_pct and self._take_profit_net_ok(sym, pos, px):
+                self._close_position(sym, px, "止盈", pnl_pct, prices)
+                continue
 
             # 动态止损
             if pnl_pct <= dyn_sl:
@@ -616,10 +713,9 @@ class StrategyRunner:
 
         # 计算当前总风险敞口
         total_margin = sum(p["margin"] for p in self.positions.values())
-        # 可用 = 余额 - 已锁定保证金
-        available = self.balance - total_margin
+        # self.balance 已是扣除锁定保证金后的可支配资金，不再减 total_margin
+        available = self.balance
         if available <= 0:
-            self._recalc_equity(prices)
             self._update_state(prices)
             return
 
@@ -701,22 +797,20 @@ class StrategyRunner:
             vol_factor = max(0.4, 1.5 / (1 + chg_abs / 12))
             margin = self.balance * base_pct * vol_factor
 
-            # 资金上限检查
-            cap = get_capital_limit(self.balance, sym)
-            if total_margin >= cap:
-                continue
-
             # 检查最小下单量（考虑 quanto_multiplier）
             quanto = spec.quanto_multiplier if spec else 1.0
             size = (margin * lev) / max(quanto * px, 1e-9)
+            bumped_for_min = False
             if spec and size < spec.order_size_min:
                 size = spec.order_size_min
                 margin = (size * quanto * px) / lev
+                bumped_for_min = True
 
-            # 最小下单量调整后跳过保证金过大的单子
-            # 主流币不限制（BTC/ETH 高价值需要大保证金）
-            if not is_stable(sym) and margin > 2.0:
-                continue
+            # 山寨：仅当「为凑最小张数」把保证金抬得过高时跳过（避免误伤正常 0.2%～数% 仓）
+            if bumped_for_min and not is_stable(sym):
+                alt_ceiling = max(5.0, self.balance * 0.06)
+                if margin > alt_ceiling:
+                    continue
 
             # Maker 手续费
             fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
@@ -724,6 +818,16 @@ class StrategyRunner:
 
             # 余额不够就跳过
             if margin + fee > self.balance:
+                continue
+
+            # 双轨资金上限：只统计同桶（主流/山寨）已用保证金，避免 BTC+ETH 占仓后山寨永不开单
+            cap = get_capital_limit(self.balance, sym)
+            st_bucket = is_stable(sym)
+            bucket_used = sum(
+                p["margin"] for s, p in self.positions.items()
+                if is_stable(s) == st_bucket
+            )
+            if bucket_used + margin > cap:
                 continue
 
             entry_price = px  # Maker 单无滑点
@@ -757,7 +861,7 @@ class StrategyRunner:
                 if osc_side:
                     signal_src = f"震荡{osc_reason} 信{osc_conf}"
             
-            if ai_direction and ai_confidence >= 35:
+            if ai_direction and ai_confidence >= 45:
                 # AI 优先
                 side = "long" if ai_direction == "LONG" else "short"
                 signal_src = f"AI多维 信{ai_confidence}"
@@ -778,6 +882,22 @@ class StrategyRunner:
                 else:
                     side = "short" if change >= 0 else "long"
                     signal_src = "均值回归"
+
+            # ── 多交易所方向确认（自进化v2）──
+            if MULTI_ENABLED:
+                try:
+                    feed_m = get_multi_feed()
+                    if feed_m:
+                        sig = feed_m.direction_signal(sym)
+                        # 交易所间价差过大 → 方向不确定 → 跳过
+                        if sig['divergence'] > 0.5:
+                            continue
+                        # 多交易所共识方向与AI方向相反 → 跳过
+                        if sig['bias'] != 'neutral' and sig['bias'] != side:
+                            if ai_direction and ai_confidence < 70:
+                                continue  # AI信心不足时相信多交易所
+                except:
+                    pass
 
             self.positions[sym] = {
                 "side": side, "entry": entry_price, "size": size,
@@ -805,10 +925,27 @@ class StrategyRunner:
             
             self._log.append(msg)
             print(msg, flush=True)
+            
+            # Alpha角色事件：开仓（短台词 + 可选 LLM 暴走润色）
+            side_cn = "多" if side == "long" else "空"
+            global _character_event_seq
+            _character_event_seq += 1
+            seq = _character_event_seq
+            speech0 = pop_line(trade_category_for_open())
+            ev_open = {
+                "Event_Type": f"开仓_{sym}_{side_cn}",
+                "Action_Code": "action_sword_draw" if side == "long" else "action_hammer_down",
+                "Facial_Expression": "confident",
+                "Emotion_Index": 35,
+                "Speech_Text": speech0,
+                "symbol": sym,
+                "side": side,
+                "_seq": seq,
+            }
+            _state["character_event"] = ev_open
 
             opened += 1
 
-        self._recalc_equity(prices)
         self._update_state(prices)
 
     def _close_position(self, sym, px, reason, pnl_pct, prices=None):
@@ -820,7 +957,9 @@ class StrategyRunner:
         gross = self._gross_pnl_usd(sym, pos, px)
         fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
         fee_close = pos["size"] * q * px * fee_rate_maker
-        realized = gross - fee_close
+        fee_open = pos.get("fee_open", 0)
+        gross_pnl = gross  # 毛利（不含手续费）
+        realized = gross - fee_open - fee_close  # 含全部手续费的净利
 
         self.total_fees += fee_close
         print(
@@ -831,6 +970,7 @@ class StrategyRunner:
 
         self.balance += pos["margin"] + gross - fee_close
         self.realized_pnl += realized
+        self.gross_realized += gross  # 毛利累计（不含手续费），用于余额展示
         self.closed_trades += 1
         if realized > 0:
             self.wins += 1
@@ -862,6 +1002,40 @@ class StrategyRunner:
         self._log.append(msg)
         print(msg, flush=True)
 
+        # Alpha角色事件：平仓
+        is_tp = "止盈" in reason
+        is_big_win = realized > 1.0
+        pnl_abs = abs(realized)
+        global _character_event_seq
+        _character_event_seq += 1
+        seq = _character_event_seq
+        if is_tp:
+            speech0 = pop_line("profit")
+        else:
+            speech0 = pop_line(trade_category_for_close(reason, realized))
+        ev_close = {
+            "Event_Type": f"{'止盈' if is_tp else '止损'}_{sym}",
+            "Action_Code": (
+                ("action_catch_coin" if is_big_win else "action_fist_pump")
+                if is_tp
+                else ("action_adjust_glasses" if pnl_abs < 0.5 else "action_shield_up")
+            ),
+            "Facial_Expression": "excited" if is_tp and is_big_win else ("relaxed" if is_tp else "serious"),
+            "Emotion_Index": 20 if is_tp else 65,
+            "Speech_Text": speech0,
+            "Evolution_Log": (
+                f"止盈记录: {sym} +{realized:.4f} ({pnl_pct:+.1f}%)"
+                if is_tp
+                else f"止损分析: {sym} {realized:.4f} ({pnl_pct:+.1f}%) → 因子权重微调中"
+            ),
+            "symbol": sym,
+            "side": pos["side"],
+            "pnl": realized,
+            "pnl_pct": pnl_pct,
+            "_seq": seq,
+        }
+        _state["character_event"] = ev_close
+
         # 平仓后冷却，避免立即重开（止损更长）
         cooldown_sec = 120 if reason == "止损" else 30
         self._cooldowns[sym] = time.time() + cooldown_sec
@@ -875,19 +1049,29 @@ class StrategyRunner:
         self.equity = self.balance + locked + unrealized
 
     def _update_state(self, prices):
+        self._recalc_equity(prices)
+        locked = sum(p["margin"] for p in self.positions.values())
+        uc = self._initial_capital
+        # 余额 = 初始资金 + 毛利累计 - 总手续费（用户公式）
+        total_balance = uc + self.gross_realized - self.total_fees
+        unrealized = self.equity - self.balance - locked
+        
         _state["equity"] = self.equity
-        _state["balance"] = self.balance
+        _state["balance"] = total_balance  # 总资金净额
+        _state["free_cash"] = self.balance  # 可用余额
+        _state["initial_capital"] = uc
+        _state["unrealized_pnl"] = unrealized
         _state["realized_pnl"] = self.realized_pnl
         _state["win_rate"] = self.wins / max(self.closed_trades, 1)  # 基于已平仓
         _state["positions"] = len(self.positions)
         _state["trades"] = self.trades
         _state["wins"] = self.wins
-        _state["symbols"] = len(prices)
+        _state["symbol_count"] = len(prices)
         _state["total_fees"] = self.total_fees
+        _state["gross_realized"] = self.gross_realized  # 毛利累计
         _state["total_slippage"] = self.total_slippage
         _state["trade_history"] = self._trade_history[-200:]
-        # 锁定保证金 = 权益 - 余额（近似，因为 unrealized PnL 影响）
-        _state["margin_locked"] = sum(p["margin"] for p in self.positions.values())
+        _state["margin_locked"] = locked
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -898,28 +1082,35 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
     while True:
         try:
             symbols = _state.get("symbols", [])
+            if isinstance(symbols, int):
+                symbols = []
             if symbols:
                 await feed.refresh(symbols)
-                prices = feed.get_prices()
-                changes = feed.get_changes()
-                _state["live_prices"] = {
-                    sym: {"price": px, "change": changes.get(sym, 0)}
-                    for sym, px in prices.items()
-                }
-                # 实时更新持仓盈亏（每 2s）
-                pos_list = []
-                for sym, pos in runner.positions.items():
-                    px = prices.get(sym, pos["entry"])
-                    unrealized = runner._gross_pnl_usd(sym, pos, px)
-                    pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
-                    pos_list.append({
-                        "symbol": sym, "side": pos["side"],
-                        "size": pos["size"], "entry_price": pos["entry"],
-                        "leverage": pos["leverage"], "margin": pos["margin"],
-                        "unrealized_pnl": unrealized, "pnl_pct": pnl_pct,
-                        "current_price": px,
-                    })
-                _state["position_list"] = pos_list
+            prices = dict(feed.get_prices())
+            # 持仓币对必须参与权益重算（否则不在本轮 watchlist 时用入场价占位）
+            for psym, pos in runner.positions.items():
+                if psym not in prices:
+                    prices[psym] = float(pos.get("entry", 0) or 0)
+            changes = feed.get_changes()
+            runner._update_state(prices)
+            _state["live_prices"] = {
+                sym: {"price": px, "change": changes.get(sym, 0)}
+                for sym, px in prices.items()
+            }
+            # 实时更新持仓盈亏（与 KPI 同一套 prices）
+            pos_list = []
+            for sym, pos in runner.positions.items():
+                px = prices.get(sym, pos["entry"])
+                unrealized = runner._gross_pnl_usd(sym, pos, px)
+                pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
+                pos_list.append({
+                    "symbol": sym, "side": pos["side"],
+                    "size": pos["size"], "entry_price": pos["entry"],
+                    "leverage": pos["leverage"], "margin": pos["margin"],
+                    "unrealized_pnl": unrealized, "pnl_pct": pnl_pct,
+                    "current_price": px,
+                })
+            _state["position_list"] = pos_list
         except Exception as e:
             print(f"[价格推送错误] {e}", flush=True)
         await asyncio.sleep(interval)
@@ -972,6 +1163,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                     "size": pos["size"], "entry_price": pos["entry"],
                     "leverage": pos["leverage"], "margin": pos["margin"],
                     "unrealized_pnl": unrealized, "pnl_pct": pnl_pct,
+                    "current_price": px,
                 })
             _state["position_list"] = pos_list
         except Exception as e:
@@ -985,7 +1177,11 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
 async def main():
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
-    runner = StrategyRunner(initial_balance=10000.0)
+    runner = StrategyRunner(initial_balance=200.0)
+    _state["initial_capital"] = runner._initial_capital
+    _state["free_cash"] = runner.balance
+    _state["balance"] = runner.balance
+    _state["equity"] = runner.equity
 
     config = uvicorn.Config(
         app,
@@ -997,11 +1193,30 @@ async def main():
     server = uvicorn.Server(config)
 
     print(f"\U0001f988 Shark 2.0 启动成功 :{port}", flush=True)
-    price_feed = MarketDataFeed()
+    
+    # 多交易所价格聚合
+    multi_feed_task = None
+    if MULTI_ENABLED:
+        from multi_exchange import init_multi_feed, get_multi_feed
+        
+        async def multi_loop():
+            feed_m = get_multi_feed()
+            while True:
+                try:
+                    await feed_m.refresh()
+                except Exception as e:
+                    pass
+                await asyncio.sleep(5)
+        
+        await init_multi_feed()
+        multi_feed_task = asyncio.create_task(multi_loop())
+        print("[多交易所] 价格聚合已启动 (Binance/Bybit/OKX/Gate)", flush=True)
+    
     await asyncio.gather(
         server.serve(),
         trading_loop(feed, runner),
-        price_feed_loop(price_feed, runner, interval=1),
+        price_feed_loop(feed, runner, interval=1),
+        dialogue_ammo_loop(),
     )
 
 

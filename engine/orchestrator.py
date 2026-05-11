@@ -133,7 +133,7 @@ class StrategyOrchestrator:
         # State
         self._running = False
         self._last_tick = 0.0
-        self._account_equity = 10000.0  # default, should be updated externally
+        self._account_equity = 100.0  # default, should be updated externally
 
         log.info(
             f"[Orchestrator] Initialized: max_strategies={self.config.max_concurrent_strategies} "

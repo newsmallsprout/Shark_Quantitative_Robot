@@ -20,6 +20,31 @@ TOK_DEEPSEEK = 1536 if FULL_MODE else 900
 TOK_QWEN = 800 if FULL_MODE else 380
 TOK_DOUBAO = 600 if FULL_MODE else 280
 
+# ── 全局降级预案（所有LLM失败时的本地兜底）──
+def _local_fallback_plan(symbol: str, price: float, change_24h: float, funding_rate: float) -> dict:
+    """纯本地计算：基于费率+涨跌幅的简单方向判断"""
+    direction = "HOLD"
+    confidence = 25
+    if funding_rate > 0.0005 and change_24h > 1:
+        direction, confidence = "SHORT", 35
+    elif funding_rate < -0.0005 and change_24h < -1:
+        direction, confidence = "LONG", 35
+    elif change_24h > 3:
+        direction, confidence = "LONG", 30
+    elif change_24h < -3:
+        direction, confidence = "SHORT", 30
+    sl_pct = 0.03
+    return {
+        "direction": direction, "confidence": confidence,
+        "entry_price": price,
+        "targets": [{"price": price * (1.01 if direction == "LONG" else 0.99), "action": "take_profit", "ratio": 0.5, "reason": "本地降级"}],
+        "stop_loss": price * (1 - sl_pct) if direction == "LONG" else price * (1 + sl_pct),
+        "add_zone": {"price": price * 0.99, "condition": "降级无补仓"},
+        "reduce_zone": {"price": price * 1.01, "condition": "降级无减仓"},
+        "supports": [price * 0.98], "resistances": [price * 1.02],
+        "risk_reward": 2.0, "reasoning": "本地降级",
+    }
+
 
 # ═══════════════════════════════════════════════════════════════
 # System Prompts
@@ -134,20 +159,29 @@ async def _fetch_orderbook(sym: str, depth: int = 10) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def _safe_json_parse(text: str) -> dict:
-    """多策略JSON解析：直接parse → regex提取 → reasoning_content fallback"""
+    """多策略JSON解析：md代码块 → 直接parse → regex → strict=False"""
+    if not text or not text.strip():
+        return {}
+    # 策略0: 提取 markdown ```json ... ``` 代码块
+    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except:
+            pass
     # 策略1: 直接解析
     try:
         return json.loads(text)
     except:
         pass
-    # 策略2: regex 提取第一个 {...}
+    # 策略2: regex 提取最外层 {...}
     m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group())
         except:
             pass
-    # 策略3: 宽松匹配
+    # 策略3: 宽松模式
     try:
         return json.loads(text, strict=False)
     except:
@@ -266,8 +300,8 @@ ATR:{atr:.6f}({atr_pct:.2f}%) {k15_text} {k1h_text} {k4h_text} {ob_text}"""
                 flush=True
             )
     else:
-        print(f"[AI委] {symbol} DeepSeek 未配置key", flush=True)
-        return None
+        print(f"[AI委] {symbol} DeepSeek 未配置key，使用本地降级", flush=True)
+        return _local_fallback_plan(symbol, price, change_24h, funding_rate)
 
     # 短路：HOLD / conf<35 / 无targets → 跳过复核和情绪
     if ds_direction == "HOLD" or ds_confidence < 35 or not ds_result.get("targets"):

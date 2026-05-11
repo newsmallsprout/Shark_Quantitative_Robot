@@ -29,6 +29,12 @@ COPY ai/ ./ai/
 COPY engine/ ./engine/
 COPY api/ ./api/
 COPY strategies/ ./strategies/
+COPY multi_exchange.py .
+COPY kline_cache.py .
+COPY evolve_v2.py .
+COPY evolve.py .
+COPY dialogue_ammo.py .
+COPY character_voice.py .
 
 # Built frontend (from web-builder stage)
 COPY --from=web-builder /app/web/dist ./web/dist

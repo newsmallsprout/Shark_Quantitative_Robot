@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState, lazy, Suspense } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore } from './store/useStore'
 import Dashboard from './components/Dashboard'
 import PositionsTable from './components/PositionsTable'
 import TradeHistory from './components/TradeHistory'
 import SafetyPanel from './components/SafetyPanel'
-
-const ChartPanel = lazy(() => import('./components/ChartPanel'))
+import LoliRoom from './components/LoliRoom'
 
 function Clock() {
   const [time, setTime] = useState(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
@@ -19,6 +18,7 @@ function Clock() {
 export default function App() {
   const { status, connected, setStatus, setConnected } = useStore()
   const wsRef = useRef<WebSocket>()
+  const pendingRef = useRef<any>(null)  // rAF节流缓冲区
   const [uptime, setUptime] = useState(0)
 
   // ═══ Starfield animation ═══
@@ -82,20 +82,36 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const d = JSON.parse(e.data)
-          setStatus({
-            equity: d.equity ?? status.equity,
-            balance: d.balance ?? status.balance,
-            positions: d.positions ?? 0,
-            realized_pnl: d.realized_pnl ?? 0,
-            win_rate: d.win_rate ?? 0,
-            safety_blocked: d.safety_blocked ?? false,
-            position_list: d.position_list || [],
-            live_prices: d.live_prices || {},
-            total_fees: d.total_fees ?? 0,
-            total_slippage: d.total_slippage ?? 0,
-            trade_history: d.trade_history || [],
-            margin_locked: d.margin_locked ?? 0,
-          })
+          // rAF节流：累积到下一帧统一更新，防止高频WebSocket导致连锁re-render
+          if (!pendingRef.current) {
+            pendingRef.current = d
+            requestAnimationFrame(() => {
+              const data = pendingRef.current
+              pendingRef.current = null
+              if (!data) return
+              const prev = useStore.getState().status
+              setStatus({
+                equity: typeof data.equity === 'number' ? data.equity : prev.equity,
+                balance: typeof data.balance === 'number' ? data.balance : prev.balance,
+                free_cash: typeof data.free_cash === 'number' ? data.free_cash : prev.free_cash,
+                initial_capital: typeof data.initial_capital === 'number' ? data.initial_capital : prev.initial_capital,
+                unrealized_pnl: typeof data.unrealized_pnl === 'number' ? data.unrealized_pnl : prev.unrealized_pnl,
+                positions: typeof data.positions === 'number' ? data.positions : prev.positions,
+                realized_pnl: typeof data.realized_pnl === 'number' ? data.realized_pnl : prev.realized_pnl,
+                win_rate: typeof data.win_rate === 'number' ? data.win_rate : prev.win_rate,
+                safety_blocked: typeof data.safety_blocked === 'boolean' ? data.safety_blocked : prev.safety_blocked,
+                position_list: Array.isArray(data.position_list) ? data.position_list : prev.position_list,
+                live_prices: data.live_prices && typeof data.live_prices === 'object' ? data.live_prices : prev.live_prices,
+                total_fees: typeof data.total_fees === 'number' ? data.total_fees : prev.total_fees,
+                total_slippage: typeof data.total_slippage === 'number' ? data.total_slippage : prev.total_slippage,
+                trade_history: Array.isArray(data.trade_history) ? data.trade_history : prev.trade_history,
+                margin_locked: typeof data.margin_locked === 'number' ? data.margin_locked : prev.margin_locked,
+                character_event: data.character_event || undefined,
+              })
+            })
+          } else {
+            pendingRef.current = d  // 覆盖为最新数据
+          }
         } catch {}
       }
     }
@@ -103,16 +119,16 @@ export default function App() {
     return () => { clearInterval(id); wsRef.current?.close() }
   }, [])
 
-  const equityChange = status.equity - 100
+  const equityChange = status.equity - status.initial_capital
   const fmtUptime = `${String(Math.floor(uptime / 3600)).padStart(2, '0')}:${String(Math.floor((uptime % 3600) / 60)).padStart(2, '0')}:${String(uptime % 60).padStart(2, '0')}`
 
   return (
+    <>
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* 顶栏 */}
       <div className="topbar">
         <div className="topbar-brand">
-          <span className="accent">🦈 Shark</span>
-          <span style={{ color: 'var(--text-secondary)', marginLeft: '6px', fontSize: '13px', fontWeight: 500 }}>2.0</span>
+          <span className="accent">🦈 Shark 2.0</span>
         </div>
         <div className="topbar-right">
           <span className="badge badge-mode">模拟盘</span>
@@ -132,6 +148,7 @@ export default function App() {
         <Dashboard
           equity={status.equity}
           balance={status.balance}
+          freeCash={status.free_cash}
           realizedPnl={status.realized_pnl}
           winRate={status.win_rate}
           positions={status.positions}
@@ -141,16 +158,24 @@ export default function App() {
           marginLocked={status.margin_locked}
         />
 
-        {/* 图表 + 安全 */}
+        {/* 宠物舱 + 风控 */}
         <div style={{
           display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '10px', marginTop: '10px',
         }}>
           <div className="card">
-            <div className="card-header">行情概览</div>
-            <div className="card-body" style={{ padding: '8px 0 0' }}>
-              <Suspense fallback={<div style={{ height: '510px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '13px' }}>加载行情图表...</div>}>
-                <ChartPanel />
-              </Suspense>
+            <div className="card-header">shark 领域</div>
+            <div
+              className="card-body"
+              style={{
+                padding: '8px 0 0',
+                minHeight: 400,
+                position: 'relative',
+                display: 'flex',
+                flexDirection: 'column',
+                flex: 1,
+              }}
+            >
+              <LoliRoom />
             </div>
           </div>
           <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
@@ -201,5 +226,7 @@ export default function App() {
         <span style={{ fontFamily: 'var(--font-mono)' }}>Gate.io 合约 · 模拟交易</span>
       </div>
     </div>
+
+    </>
   )
 }

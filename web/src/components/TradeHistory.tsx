@@ -1,4 +1,6 @@
-import type { Position } from '../store/useStore'
+import { useEffect, useMemo, useState } from 'react'
+
+const PAGE_SIZE = 20
 
 interface TradeRecord {
   symbol: string; side: string; entry_price: number; exit_price: number;
@@ -13,6 +15,17 @@ function fmtTime(ts: number) {
 }
 
 export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
+  const [page, setPage] = useState(0)
+
+  const ordered = useMemo(() => (trades?.length ? [...trades].reverse() : []), [trades])
+
+  const total = ordered.length
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  useEffect(() => {
+    setPage((p) => Math.min(p, totalPages - 1))
+  }, [totalPages])
+
   if (!trades || !trades.length) {
     return (
       <div className="empty-state">
@@ -22,8 +35,49 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
     )
   }
 
+  const safePage = Math.min(page, totalPages - 1)
+  const start = safePage * PAGE_SIZE
+  const pageRows = ordered.slice(start, start + PAGE_SIZE)
+  const showFrom = total ? start + 1 : 0
+  const showTo = Math.min(start + PAGE_SIZE, total)
+
   return (
     <div style={{ overflowX: 'auto' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '8px',
+          padding: '8px 12px',
+          borderBottom: '1px solid var(--border-subtle)',
+          fontSize: '11px',
+          color: 'var(--text-muted)',
+        }}
+      >
+        <span>
+          第 {safePage + 1} / {totalPages} 页 · 共 {total} 笔 · 本页 {showFrom}–{showTo}
+        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={safePage <= 0}
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+          >
+            上一页
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={safePage >= totalPages - 1}
+            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+          >
+            下一页
+          </button>
+        </div>
+      </div>
       <table className="data-table">
         <thead>
           <tr>
@@ -38,8 +92,8 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
           </tr>
         </thead>
         <tbody>
-          {[...trades].reverse().map((t, i) => (
-            <tr key={i}>
+          {pageRows.map((t, i) => (
+            <tr key={`${t.symbol}-${t.closed_at}-${start + i}`}>
               <td style={{ color: 'var(--text-muted)', fontSize: '11px' }}>{fmtTime(t.closed_at)}</td>
               <td style={{ fontWeight: 600, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
                 {t.symbol}

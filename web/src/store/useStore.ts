@@ -10,16 +10,35 @@ export interface LivePrice {
   price: number; change: number;
 }
 
-interface Status {
-  equity: number; balance: number; positions: number;
+export interface CharacterEvent {
+  Event_Type: string;
+  Action_Code: string;
+  Facial_Expression: string;
+  Emotion_Index: number;
+  Speech_Text: string;
+  Evolution_Log?: string;
+  symbol?: string;
+  side?: string;
+  pnl?: number;
+  pnl_pct?: number;
+  /** 内部：异步 LLM 回写台词时对齐最新事件 */
+  _seq?: number;
+}
+
+export interface Status {
+  equity: number; balance: number; free_cash: number; positions: number;
   realized_pnl: number; win_rate: number;
   safety_blocked: boolean; mode: string;
+  initial_capital: number;
+  unrealized_pnl: number;
   position_list: Position[];
   live_prices: Record<string, LivePrice>;
   total_fees: number;
   total_slippage: number;
   trade_history: any[];
   margin_locked: number;
+  character_event?: CharacterEvent;
+  volatility?: number;
 }
 
 interface Store {
@@ -31,7 +50,8 @@ interface Store {
 
 export const useStore = create<Store>((set) => ({
   status: {
-    equity: 100, balance: 100, positions: 0,
+    equity: 100, balance: 100, free_cash: 100, positions: 0,
+    initial_capital: 100, unrealized_pnl: 0,
     realized_pnl: 0, win_rate: 0,
     safety_blocked: false, mode: 'Paper',
     position_list: [],

@@ -1,3 +1,6 @@
+# 本地模型目录，不提交
+node_model/
+
 __pycache__/
 *.pyc
 .DS_Store
@@ -10,6 +13,7 @@ license/*
 !license/public.pem
 !license/fingerprint_override.example
 frontend/node_modules/
+web/node_modules/
 frontend/dist/
 tmp_screencap_frames/
 dist/

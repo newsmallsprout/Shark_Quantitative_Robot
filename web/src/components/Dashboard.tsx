@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 
 interface Props {
-  equity: number; balance: number; realizedPnl: number;
+  equity: number; balance: number; freeCash: number; realizedPnl: number;
   winRate: number; positions: number; equityChange: number;
   safetyBlocked: boolean; totalFees: number; marginLocked: number;
 }
@@ -33,7 +33,7 @@ function KpiCard({ label, value, sub, cls }: { label: string; value: string; sub
   )
 }
 
-export default function Dashboard({ equity, balance, realizedPnl, winRate, positions, equityChange, safetyBlocked, totalFees, marginLocked }: Props) {
+export default function Dashboard({ equity, balance, freeCash, realizedPnl, winRate, positions, equityChange, safetyBlocked, totalFees, marginLocked }: Props) {
   return (
     <div style={{
       display: 'grid',
@@ -58,8 +58,8 @@ export default function Dashboard({ equity, balance, realizedPnl, winRate, posit
       />
       <KpiCard
         label="可用"
-        value={`$${(balance - marginLocked).toFixed(2)}`}
-        cls={(balance - marginLocked) > 0 ? 'pnl-up' : 'pnl-down'}
+        value={`$${freeCash.toFixed(2)}`}
+        cls={freeCash > 0 ? 'pnl-up' : 'pnl-down'}
       />
       <KpiCard
         label="已实现盈亏"
