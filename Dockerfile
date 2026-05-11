@@ -31,10 +31,19 @@ COPY api/ ./api/
 COPY strategies/ ./strategies/
 COPY multi_exchange.py .
 COPY kline_cache.py .
+COPY market_regime.py .
+COPY trade_reflector.py .
+COPY battle_report.py .
 COPY evolve_v2.py .
 COPY evolve.py .
 COPY dialogue_ammo.py .
 COPY character_voice.py .
+COPY domain/ ./domain/
+COPY observability/ ./observability/
+COPY persistence/ ./persistence/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+COPY scripts/ ./scripts/
 
 # Built frontend (from web-builder stage)
 COPY --from=web-builder /app/web/dist ./web/dist
@@ -42,8 +51,7 @@ COPY --from=web-builder /app/web/dist ./web/dist
 # Static assets (background images etc)
 COPY web/public ./web/public
 
-# Config
-COPY .env .
+# 密钥与本地配置通过运行时注入（Compose env_file、K8s Secret、-e 等），禁止打入镜像层。
 
 EXPOSE 80
 

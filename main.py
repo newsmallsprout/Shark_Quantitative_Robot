@@ -1,24 +1,49 @@
 #!/usr/bin/env python3
 """Shark 2.0 — 真实模拟量化交易机器人。手续费、滑点、资金费率、合约最大杠杆全部实盘规格。"""
 
-import asyncio, os, sys, time, json
+import asyncio, os, sys, time, json, secrets, uuid, math
+import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import aiohttp
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+_log = logging.getLogger(__name__)
 try:
     from dotenv import load_dotenv; load_dotenv(ROOT / ".env")
 except ImportError: pass
 
+from persistence.dialogue_store import DialogueStore, resolve_sync_psycopg_url
+from persistence.bridge import PersistenceBridge, create_redis
+from persistence.repository import AccountRepository
+from persistence.session import create_engine_and_sessionmaker
+from persistence.redis_rate_limit import fixed_window_allow
+
+_storage_bridge: Optional[PersistenceBridge] = None
+
+
+async def _wait_gate_rl(name: str = "gateio_rest", limit: int = 30, window_sec: int = 1) -> None:
+    """Redis 固定窗口限流；未配置 Redis 时直接通过。"""
+    global _storage_bridge
+    br = _storage_bridge
+    if not br or not br.redis:
+        return
+    while True:
+        if await fixed_window_allow(br.redis, name=name, limit=limit, window_sec=window_sec):
+            return
+        await asyncio.sleep(0.05)
+
 from dialogue_ammo import (
     dialogue_ammo_loop,
     pop_line,
+    seed_offline_dialogue_if_needed,
+    set_dialogue_store,
     trade_category_for_close,
     trade_category_for_open,
 )
+from character_voice import character_llm_config, fetch_loli_dialogue
 
 # 导入AI策略
 try:
@@ -55,6 +80,8 @@ except ImportError:
 # K线缓存（自进化引擎依赖）
 try:
     from kline_cache import KlineCache, init_kline_cache, get_kline_cache
+    from market_regime import RegimeDetector, REGIME_CONFIG, init_detector, get_detector
+    from trade_reflector import Reflector, LossReason
     KLINE_ENABLED = True
 except ImportError:
     KLINE_ENABLED = False
@@ -98,6 +125,7 @@ _contract_cache: Dict[str, ContractSpec] = {}
 
 async def fetch_contract_specs() -> Dict[str, ContractSpec]:
     """获取所有 USDT 合约规格：最大杠杆、最小下单量、标记价格、资金费率。"""
+    await _wait_gate_rl()
     url = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
     async with aiohttp.ClientSession() as s:
         async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -127,6 +155,7 @@ async def fetch_contract_specs() -> Dict[str, ContractSpec]:
 # ═══════════════════════════════════════════════════════════════════════
 async def fetch_top_symbols(n: int = 30, min_vol: float = 30000) -> List[str]:
     """Fetch top N USDT perpetual symbols ranked by volatility * volume."""
+    await _wait_gate_rl()
     url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
     async with aiohttp.ClientSession() as s:
         async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -142,7 +171,9 @@ async def fetch_top_symbols(n: int = 30, min_vol: float = 30000) -> List[str]:
                 continue
             score = vol * (1 + chg)
             scored.append((sym.replace("_USDT", "/USDT"), score, vol, chg))
-        except: continue
+        except Exception as e:
+            _log.debug("ticker row skipped: %s", e)
+            continue
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return [s[0] for s in scored[:n]]
@@ -196,44 +227,212 @@ class MarketDataFeed:
 # ═══════════════════════════════════════════════════════════════════════
 # API Server
 # ═══════════════════════════════════════════════════════════════════════
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket
+from starlette import status as http_status
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
+from observability.context import REQUEST_ID_CTX, RequestIdMiddleware, configure_logging
+
 app = FastAPI(title="Shark 2.0")
+app.add_middleware(RequestIdMiddleware)
 _state = {"equity": 100.0, "balance": 100.0, "free_cash": 100.0, "initial_capital": 100.0,
           "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
           "positions": 0, "safety_blocked": False, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
-          "position_list": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0}
+          "position_list": [], "trade_history": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0}
+
+
+def _finite_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _sanitize_ws_value(v):
+    """保证 JSON 无 NaN/Inf，避免浏览器 JSON.parse 整包失败导致前端不更新。"""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        return _finite_float(v)
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        return {str(k): _sanitize_ws_value(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_sanitize_ws_value(x) for x in v]
+    return str(v)
+
+
+def _state_for_websocket() -> dict:
+    return _sanitize_ws_value(dict(_state))
+
+
+def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float]) -> List[dict]:
+    out: List[dict] = []
+    for sym, pos in runner.positions.items():
+        px = float(pos.get("entry", 0) or 0)
+        if sym in prices:
+            px = _finite_float(prices[sym], px)
+        unrealized = runner._gross_pnl_usd(sym, pos, px)
+        pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
+        out.append({
+            "symbol": sym,
+            "side": pos["side"],
+            "size": _finite_float(pos["size"]),
+            "entry_price": _finite_float(pos["entry"]),
+            "leverage": _finite_float(pos["leverage"]),
+            "margin": _finite_float(pos["margin"]),
+            "unrealized_pnl": _finite_float(unrealized),
+            "pnl_pct": _finite_float(pnl_pct),
+            "current_price": px,
+        })
+    return out
+
+
+def _trade_history_for_state(runner: "StrategyRunner") -> List[dict]:
+    rows: List[dict] = []
+    for t in runner._trade_history[-200:]:
+        rows.append({
+            "symbol": t.get("symbol", ""),
+            "side": t.get("side", ""),
+            "entry_price": _finite_float(t.get("entry_price")),
+            "exit_price": _finite_float(t.get("exit_price")),
+            "size": _finite_float(t.get("size")),
+            "leverage": _finite_float(t.get("leverage")),
+            "margin": _finite_float(t.get("margin")),
+            "realized_pnl": _finite_float(t.get("realized_pnl")),
+            "pnl_pct": _finite_float(t.get("pnl_pct")),
+            "reason": str(t.get("reason", "")),
+            "fee_open": _finite_float(t.get("fee_open")),
+            "fee_close": _finite_float(t.get("fee_close")),
+            "gross_pnl": _finite_float(t.get("gross_pnl")),
+            "opened_at": _finite_float(t.get("opened_at")),
+            "closed_at": _finite_float(t.get("closed_at")),
+        })
+    return rows
+
+
+def _shark_api_token_configured() -> Optional[str]:
+    t = os.environ.get("SHARK_API_TOKEN", "").strip()
+    return t if t else None
+
+
+def _bearer_matches(got: str, expected: str) -> bool:
+    if got == "" or expected == "":
+        return False
+    if len(got) != len(expected):
+        return False
+    return secrets.compare_digest(got.encode("utf-8"), expected.encode("utf-8"))
+
+
+async def require_api_token(authorization: Optional[str] = Header(None)) -> None:
+    """若设置 SHARK_API_TOKEN，则要求 Authorization: Bearer <token>。"""
+    expected = _shark_api_token_configured()
+    if not expected:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    got = authorization[7:].strip()
+    if not _bearer_matches(got, expected):
+        raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 @app.get("/api/health")
 async def health(): return {"ok": True}
 
+
+@app.get("/api/bootstrap.js")
+async def api_bootstrap_js():
+    """运行时注入与 SHARK_API_TOKEN 一致的仪表板密钥（Docker 构建阶段无法读取 .env 中的 VITE_*）。"""
+    exp = _shark_api_token_configured()
+    body = "window.__SHARK_API_TOKEN__=%s;\n" % (json.dumps(exp or ""))
+    return Response(
+        content=body,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/api/snapshot")
+async def api_snapshot(token: Optional[str] = Query(None)):
+    """看板完整快照（与 WS 同源 JSON）。未设置 SHARK_API_TOKEN 时开放；设置时须带与 /ws 相同的 ?token=。"""
+    exp = _shark_api_token_configured()
+    if exp:
+        if not token or not _bearer_matches(token, exp):
+            raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return _state_for_websocket()
+
+
 @app.get("/api/status")
-async def status(): return _state
+async def status(_: None = Depends(require_api_token)): return _state
 
 @app.get("/api/history")
-async def trade_history(offset: int = 0, limit: int = 50):
+async def trade_history(
+    offset: int = 0,
+    limit: int = 50,
+    _: None = Depends(require_api_token),
+):
     trades = _state.get("trade_history", [])
     total = len(trades)
     page = list(reversed(trades))[offset:offset + limit]
     return {"trades": page, "total": total, "offset": offset, "limit": limit}
 
 @app.websocket("/ws")
-async def ws(ws: WebSocket):
-    await ws.accept()
-    while True:
-        try:
-            await ws.send_json(_state)
-            await asyncio.sleep(1)
-        except: break
+async def ws(
+    websocket: WebSocket,
+    token: Optional[str] = Query(default=None),
+):
+    hdr = websocket.headers.get("x-request-id") or websocket.headers.get("X-Request-ID")
+    hdr = hdr.strip() if hdr else ""
+    rid = (hdr if hdr else str(uuid.uuid4()))[:128]
+    ctx_tok = REQUEST_ID_CTX.set(rid)
+    try:
+        exp = _shark_api_token_configured()
+        await websocket.accept()
+        if exp:
+            if not token or not _bearer_matches(token, exp):
+                await websocket.close(code=1008)
+                return
+        await websocket.send_json(_state_for_websocket())
+        while True:
+            try:
+                await websocket.send_json(_state_for_websocket())
+                await asyncio.sleep(1)
+            except Exception as e:
+                _log.debug("ws send loop ended: %s", e)
+                break
+    finally:
+        REQUEST_ID_CTX.reset(ctx_tok)
+
+
+def _ensure_bootstrap_script(html: str) -> str:
+    """旧版构建产物未含 /api/bootstrap.js 时补上一行，避免 SHARK_API_TOKEN 与 VITE 构建不一致导致断连。"""
+    if "bootstrap.js" in html:
+        return html
+    if '<script type="module"' in html:
+        return html.replace(
+            "<script type=\"module\"",
+            '<script src="/api/bootstrap.js"></script>\n  <script type="module"',
+            1,
+        )
+    if "</body>" in html:
+        return html.replace(
+            "</body>",
+            '  <script src="/api/bootstrap.js"></script>\n</body>',
+            1,
+        )
+    return html
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     react_index = ROOT / "web" / "dist" / "index.html"
     if react_index.exists():
-        return HTMLResponse(react_index.read_text())
+        return HTMLResponse(_ensure_bootstrap_script(react_index.read_text()))
     return HTMLResponse(DASHBOARD)
 # Mount React static assets if available
 _react_dist = ROOT / "web" / "dist"
@@ -316,9 +515,43 @@ MAX_MARGIN_PER_POS = 5.0  # 单仓最大保证金
 _character_event_seq = 0
 
 
+async def _apply_loli_speech(ev: Dict[str, Any]) -> None:
+    """开/平仓后异步拉一句 LLM 台词，覆盖 pop_line 兜底；CHARACTER_LLM=0 或无密钥则跳过。"""
+    if os.environ.get("CHARACTER_LLM", "").strip() == "0":
+        return
+    url, key, model = character_llm_config()
+    if not url or not key:
+        return
+    seq = ev.get("_seq")
+    try:
+        async with aiohttp.ClientSession() as session:
+            out = await fetch_loli_dialogue(session, url, key, model, ev)
+    except Exception as e:
+        _log.debug("fetch_loli_dialogue failed: %s", e)
+        return
+    if not out:
+        return
+    cur = _state.get("character_event")
+    if not isinstance(cur, dict) or cur.get("_seq") != seq:
+        return
+    merged = dict(cur)
+    merged["Speech_Text"] = out["Speech"]
+    ac = out.get("Action") or ""
+    if ac:
+        merged["Action_Code"] = ac
+    _state["character_event"] = merged
+
+
+def _schedule_loli_speech(ev: Dict[str, Any]) -> None:
+    try:
+        asyncio.get_running_loop().create_task(_apply_loli_speech(dict(ev)))
+    except RuntimeError:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════════════
 class StrategyRunner:
-    def __init__(self, initial_balance=10000.0):
+    def __init__(self, initial_balance=10000.0, persistence: Optional[PersistenceBridge] = None):
         self._initial_capital = float(initial_balance)
         self.balance = initial_balance
         self.equity = initial_balance
@@ -342,7 +575,10 @@ class StrategyRunner:
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
         self._open_timestamps: list = []  # 开仓时间戳
         self._evolve_tick = 0  # 自进化计数器
+        self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
         self._evolve_patterns: list = []  # 检测到的模式
+        self._reflector = Reflector() if KLINE_ENABLED else None  # 止损反思器
+        self._persistence = persistence
 
     def _get_maker_fee(self, sym: str) -> float:
         """从合约API获取实时maker费率"""
@@ -378,11 +614,41 @@ class StrategyRunner:
                     rr = plan.get("risk_reward", 0)
                     print(f"[AI] {sym} 置信{conf} 盈亏比{rr:.1f} "
                           f"支撑{plan.get('supports',[])} 阻力{plan.get('resistances',[])}")
+            else:
+                # 否决/HOLD/无计划：清缓存，避免 120s 内沿用过期 LONG/SHORT
+                self._ai_signal_cache.pop(sym, None)
         except Exception as e:
             pass
 
     def update_contracts(self, specs: Dict[str, ContractSpec]):
         self._contract_specs = specs
+
+    def _persist_margin_delta(
+        self,
+        prices: Dict[str, float],
+        sym: str,
+        pos: dict,
+        delta_free_cash: float,
+        event_type: str,
+        note: str,
+    ) -> None:
+        if not self._persistence or not self._persistence.enabled_db():
+            return
+        oid = pos.get("order_id")
+        if isinstance(oid, str):
+            try:
+                oid = uuid.UUID(oid)
+            except ValueError:
+                oid = None
+        self._persistence.on_balance_adjustment(
+            self,
+            prices,
+            event_type=event_type,
+            delta_free_cash=delta_free_cash,
+            sym=sym,
+            note=note,
+            order_id=oid,
+        )
 
     def _quanto_for(self, sym: str) -> float:
         sp = self._contract_specs.get(sym)
@@ -422,6 +688,12 @@ class StrategyRunner:
             if "alt_pause" not in str(self._evolve_patterns):
                 self._evolve_patterns.append("alt_pause")
                 print(f"[进化] 连续{consecutive}次亏损，暂停山寨开仓", flush=True)
+        
+        # 止损反思 → 战术调整
+        if self._reflector:
+            adj = self._reflector.maybe_adjust()
+            if adj:
+                _log.info("[进化-反思] 调整: %s", adj)
 
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
@@ -479,10 +751,18 @@ class StrategyRunner:
             cfg = get_config(sym)
             is_st = is_stable(sym)
             
+            # 行情止损覆盖（开仓时判定的行情类型）
+            _rc = self._regime_cache.get(sym, {}).get("cfg", {})
+            _stop_ov = _rc.get("stop_pct")
+            _tp_ov = _rc.get("tp_pct")
+            
             # 波动率（24h变化% → 动态止损宽度）
             vol_chg = abs(pos.get("vol_chg", 3.0))
-            # 止损：稳定币宽、波动币紧
-            sl_base = cfg.get("stop_loss_base", -6.0)
+            # 止损：行情优先 > 策略默认
+            _base_sl = _stop_ov if _stop_ov is not None else cfg.get("stop_loss_base", -6.0)
+            # 反思器止损放宽（累积发现止损过紧）
+            _sl_boost = self._reflector.stop_boost if self._reflector else 0
+            sl_base = _base_sl - _sl_boost  # 更负=更宽
             sl_max = cfg.get("stop_loss_max", -200.0)
             dyn_sl = -max(abs(sl_base), min(abs(sl_max), vol_chg * 2.0))
             # 移动止盈
@@ -513,9 +793,9 @@ class StrategyRunner:
                             pos["size"] += add_s
                             pos["entry"] = (pos["entry"] * (pos["size"] - add_s) + px * add_s) / pos["size"]
                             self._osc_avg_count[sym] = avg_count + 1
-                            self.balance -= add_m
                             self.trades += 1
                             print(f"[补仓] {sym} {reason} 均价→{pos['entry']:.4f} 余{self._osc_avg_count[sym]}/2")
+                            self._persist_margin_delta(prices, sym, pos, -add_m, "margin_add", f"osc_avg:{reason}")
 
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
@@ -559,6 +839,7 @@ class StrategyRunner:
                                 pos["defense_used"] = True
                                 self.trades += 1
                                 print(f"[AI防守] {sym} 缩量补仓 {add_m:.2f}@ {px:.4f}")
+                                self._persist_margin_delta(prices, sym, pos, -add_m, "margin_add", "ai_defense_add")
                         else:  # 放量 → 减仓
                             reduce_ratio = 0.3
                             reduce_s = pos["size"] * reduce_ratio
@@ -605,6 +886,7 @@ class StrategyRunner:
                         self.total_fees += harvest_fee
                         self.closed_trades += 1
                         if net_harvest > 0: self.wins += 1
+                        self._persist_margin_delta(prices, sym, pos, net_harvest, "partial_realize", "ai_harvest_30pct")
                         
                         print(f"[AI收割] {sym} 平{harvest_ratio*100:.0f}%落袋 ${net_harvest:+.4f}")
                         
@@ -626,6 +908,9 @@ class StrategyRunner:
                             pos["trailing_stop"] = pos.get("ai_entry", pos["entry"])
                             pos[layer_key] = True
                             print(f"[AI加仓] {sym} 用利润${net_harvest:.4f} 加仓${add_margin:.2f} @{px:.4f} 止损→保本")
+                            self._persist_margin_delta(
+                                prices, sym, pos, -(add_margin + open_fee_est), "margin_add", "ai_pyramid_profit_add"
+                            )
                     elif act_type == "take_profit":
                         if ratio >= 0.8:  # 终极止盈 → 全平
                             fee_r = self._get_maker_fee(sym)
@@ -665,6 +950,7 @@ class StrategyRunner:
                             pos["pyramid_count"] = pos.get("pyramid_count", 0) + 1
                             self.trades += 1
                             # 加仓不单独扣费，费用已含在开仓中
+                            self._persist_margin_delta(prices, sym, pos, -add_m, "margin_add", "ai_targets_pyramid")
             # 金字塔加仓（仅主流币）
             pyramid_max = cfg.get("pyramid_levels", 0)
             if pyramid_max > 0 and pnl_pct > vol_chg and pos.get("pyramid_count", 0) < pyramid_max:
@@ -685,6 +971,7 @@ class StrategyRunner:
                         pos["pyramid_count"] = pos.get("pyramid_count", 0) + 1
                         pos["entry"] = (pos["entry"] * (pos["size"] - add_size) + px * add_size) / pos["size"]
                         self.trades += 1
+                        self._persist_margin_delta(prices, sym, pos, -add_margin, "margin_add", "funding_pyramid")
 
             # 移动止盈：从最高点回撤，覆盖手续费
             trail_bar = trail_trigger if not is_st else min(trail_trigger, 5.0)
@@ -793,7 +1080,35 @@ class StrategyRunner:
 
             # 保证金：余额动态比例 × 波动衰减（低波大仓，高波小仓）
             cfg = get_config(sym)
+            
+            # ── 行情检测：多因子判定行情类型，每币对独立判断 ──
+            _regime = None
+            _regime_cfg = {}
+            if KLINE_ENABLED:
+                try:
+                    detector = get_detector()
+                    if detector:
+                        _regime, _diag = detector.detect(sym)
+                        _regime_cfg = REGIME_CONFIG.get(_regime, {})
+                        # 乱震/死水 → 不开仓
+                        if _regime_cfg.get("allowed_dir") is None:
+                            continue
+                        # 缓存行情上下文
+                        self._regime_cache[sym] = {
+                            "regime": _regime.value,
+                            "diag": _diag,
+                            "cfg": _regime_cfg,
+                        }
+                except Exception:
+                    pass
+            
             base_pct = cfg.get("margin_pct", 0.01)
+            # 行情调整保证金倍率
+            if _regime_cfg.get("margin_mult"):
+                base_pct *= _regime_cfg["margin_mult"]
+            # 主流币额外加成：趋势中放大，震荡中也保持体量
+            if is_stable(sym):
+                base_pct *= 1.3
             vol_factor = max(0.4, 1.5 / (1 + chg_abs / 12))
             margin = self.balance * base_pct * vol_factor
 
@@ -839,49 +1154,90 @@ class StrategyRunner:
                 if same_type >= max_pos:
                     continue
 
-            # 方向信号：AI 多维度优先 > 震荡检测 > 费率
+            # 方向信号：纯AI委员会，无兜底
             funding = funding_rates.get(sym, 0)
             mark = mark_prices.get(sym, 0) if mark_prices else 0
             price_div = (px - mark) / mark * 100 if mark > 0 else 0
             
             # ── 层级1：AI 信号缓存（最高优先级） ──
             ai_cache = self._ai_signal_cache.get(sym)
-            ai_direction = None
+            ai_dir_raw = ""
             ai_confidence = 0
-            if ai_cache and now - ai_cache.get("ts", 0) < 120:
+            if ai_cache and now - ai_cache.get("ts", 0) < 180:
                 ai_plan = ai_cache.get("plan", {})
-                ai_direction = (ai_plan.get("direction") or "").upper()
-                ai_confidence = ai_plan.get("confidence", 0)
-            
-            # ── 层级2：震荡检测器 ──
-            osc_side = None
-            if self._oscillator and not ai_direction:
-                osc_side, osc_conf, osc_reason = self._oscillator.get_oscillation_signal(
-                    sym, px, funding)
-                if osc_side:
-                    signal_src = f"震荡{osc_reason} 信{osc_conf}"
-            
-            if ai_direction and ai_confidence >= 45:
-                # AI 优先
-                side = "long" if ai_direction == "LONG" else "short"
-                signal_src = f"AI多维 信{ai_confidence}"
-            elif osc_side:
-                side = osc_side
+                ai_dir_raw = (ai_plan.get("direction") or "").strip().upper()
+                ai_confidence = float(ai_plan.get("confidence", 0) or 0)
+            _ai_conf_min = 45 + (self._reflector.ai_boost if self._reflector else 0)
+            ai_use = ai_dir_raw in ("LONG", "SHORT") and ai_confidence >= _ai_conf_min
+
+            # ── 方向信号判定 ──
+            if ai_use:
+                side = "long" if ai_dir_raw == "LONG" else "short"
+                signal_src = f"AI多维 信{int(ai_confidence)}"
             else:
-                # 费率/趋势兜底
+                # ── 多方信号兜底（5因子投票，≥3票同向 + 非费率票≥1）──
+                fb_votes = {"long": 0, "short": 0}
+                fb_tags = []
+                
+                # 因子1: 资金费率均值回归
+                if abs(funding) > 0.0005:
+                    d = "short" if funding > 0 else "long"
+                    fb_votes[d] += 1; fb_tags.append(f"费率{funding*100:+.3f}%→{d}")
+                
+                # 因子2: RSI超买超卖 (5m)
+                try:
+                    kc = get_kline_cache()
+                    if kc:
+                        r = kc.rsi(sym, period=14, interval="5m")
+                        if 0 < r < 35:
+                            fb_votes["long"] += 1; fb_tags.append(f"RSI={r:.0f}超卖")
+                        elif r > 65:
+                            fb_votes["short"] += 1; fb_tags.append(f"RSI={r:.0f}超买")
+                except Exception: pass
+                
+                # 因子3: 多交易所共识
+                if MULTI_ENABLED:
+                    try:
+                        feed_m = get_multi_feed()
+                        if feed_m:
+                            ms = feed_m.direction_signal(sym)
+                            if ms['divergence'] <= 0.5 and ms['bias'] != 'neutral':
+                                fb_votes[ms['bias']] += 1; fb_tags.append(f"多所→{ms['bias']}")
+                    except Exception: pass
+                
+                # 因子4: ADX趋势
+                try:
+                    kc = get_kline_cache()
+                    if kc:
+                        a = kc.adx(sym, period=14, interval="1m")
+                        t = kc.ma_trend(sym, fast=9, slow=21, interval="1m")
+                        if a > 20 and t in ("up", "down"):
+                            d2 = "long" if t == "up" else "short"
+                            fb_votes[d2] += 1; fb_tags.append(f"ADX={a:.0f}趋势{t}")
+                except Exception: pass
+                
+                # 因子5: 成交量+价格动量
+                mv = cfg.get("min_volume", 500000)
+                mc = cfg.get("min_change", 1.5)
+                if vol > mv * 2 and abs(change) > mc * 2:
+                    d3 = "long" if change > 0 else "short"
+                    fb_votes[d3] += 1; fb_tags.append(f"量价{change:+.1f}%")
+                
+                best_dir = max(fb_votes, key=fb_votes.get)
+                best_cnt = fb_votes[best_dir]
+                non_fee = sum(1 for t in fb_tags if not t.startswith("费率"))
+                
+                # 主流币放宽：≥1非费率票即开；山寨：≥2票且非费率≥1
                 if is_stable(sym):
-                    if funding > 0:
-                        side, signal_src = "long", f"主流费率{funding*100:+.3f}%"
-                    elif funding < 0:
-                        side, signal_src = "short", f"主流费率{funding*100:+.3f}%"
-                    else:
-                        side, signal_src = "long" if change >= 0 else "short", "主流趋势"
-                elif funding != 0:
-                    side = "short" if funding > 0 else "long"
-                    signal_src = f"费率{funding*100:+.3f}%"
+                    ok = non_fee >= 1 and best_dir in ("long", "short")
                 else:
-                    side = "short" if change >= 0 else "long"
-                    signal_src = "均值回归"
+                    ok = best_cnt >= 2 and non_fee >= 1 and best_dir in ("long", "short")
+                
+                if ok:
+                    side = best_dir
+                    signal_src = f"多方兜底 {'|'.join(fb_tags)} ✓{best_cnt}"
+                else:
+                    continue
 
             # ── 多交易所方向确认（自进化v2）──
             if MULTI_ENABLED:
@@ -892,12 +1248,26 @@ class StrategyRunner:
                         # 交易所间价差过大 → 方向不确定 → 跳过
                         if sig['divergence'] > 0.5:
                             continue
-                        # 多交易所共识方向与AI方向相反 → 跳过
+                        # 多交易所共识方向与开仓方向相反 → 跳过
                         if sig['bias'] != 'neutral' and sig['bias'] != side:
-                            if ai_direction and ai_confidence < 70:
-                                continue  # AI信心不足时相信多交易所
-                except:
-                    pass
+                            if ai_use:
+                                if ai_confidence < 70:
+                                    continue  # AI信心不足时相信多交易所
+                            elif sig.get('confidence', 0) > 40:
+                                continue  # 兜底信号时多交易所信心>40则跳过
+                except Exception as e:
+                    _log.warning("multi_exchange direction_signal failed for %s: %s", sym, e)
+
+            # ── 行情方向约束：趋势行情禁止逆势开仓 ──
+            _rc = self._regime_cache.get(sym, {}).get("cfg", {})
+            _allowed = _rc.get("allowed_dir")
+            if _allowed and _allowed != "both" and side != _allowed:
+                continue  # 趋势方向不符 → 不逆势
+
+            # 行情止损/止盈覆盖
+            _stop_override = _rc.get("stop_pct")
+            _tp_override = _rc.get("tp_pct")
+            _pyramid_override = _rc.get("pyramid")
 
             self.positions[sym] = {
                 "side": side, "entry": entry_price, "size": size,
@@ -905,6 +1275,9 @@ class StrategyRunner:
                 "fee_open": fee, "vol_chg": chg_abs,
                 "best_pnl": -999, "pyramid_count": 0,
                 "ai_targets": None,
+                "order_id": uuid.uuid4(),
+                "signal_src": signal_src,
+                "ai_confidence": ai_confidence if ai_use else 0,
             }
             
             # AI分析（异步，不阻塞开仓）
@@ -918,10 +1291,24 @@ class StrategyRunner:
             fee_str = f" 手续费={fee:.4f}" if fee > 0.0001 else ""
             stype = "主流" if is_stable(sym) else "山寨"
             msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}"
+            if _regime:
+                msg += f" 行情={_regime.value}"
+            if _stop_override:
+                msg += f" SL={_stop_override}%"
+            if _tp_override:
+                msg += f" TP={_tp_override}%"
             
             # 所有检查通过，扣费开仓（冻结保证金 + 手续费）
             self.balance -= margin + fee
             self.total_fees += fee
+            if self._persistence and self._persistence.enabled_db():
+                oid = self.positions[sym]["order_id"]
+                self._persistence.on_position_open(
+                    self, prices,
+                    order_id=oid,
+                    sym=sym, side=side, entry_price=entry_price,
+                    size=size, margin=margin, lev=float(lev), fee=fee, opened_ts=now,
+                )
             
             self._log.append(msg)
             print(msg, flush=True)
@@ -943,6 +1330,7 @@ class StrategyRunner:
                 "_seq": seq,
             }
             _state["character_event"] = ev_open
+            _schedule_loli_speech(ev_open)
 
             opened += 1
 
@@ -950,6 +1338,8 @@ class StrategyRunner:
 
     def _close_position(self, sym, px, reason, pnl_pct, prices=None):
         pos = self.positions.pop(sym)
+        oid = pos.get("order_id")
+        bal_before = self.balance
         self._osc_avg_count.pop(sym, None)  # 清补仓计数
 
         spec = self._contract_specs.get(sym)
@@ -983,6 +1373,7 @@ class StrategyRunner:
             self.peak_static_equity = self.static_equity
 
         # 记录到交易历史
+        closed_ts = time.time()
         self._trade_history.append({
             "symbol": sym, "side": pos["side"],
             "entry_price": pos["entry"], "exit_price": px,
@@ -992,8 +1383,34 @@ class StrategyRunner:
             "fee_open": pos.get("fee_open", 0),
             "fee_close": fee_close,
             "gross_pnl": gross,
-            "opened_at": pos["opened"], "closed_at": time.time(),
+            "opened_at": pos["opened"], "closed_at": closed_ts,
+            "signal_src": pos.get("signal_src", ""),
+            "ai_confidence": pos.get("ai_confidence", 0),
         })
+        if self._persistence and self._persistence.enabled_db() and oid:
+            ou = oid if isinstance(oid, uuid.UUID) else uuid.UUID(str(oid))
+            self._persistence.on_position_close(
+                self,
+                prices,
+                order_id=ou,
+                trade_id=uuid.uuid4(),
+                sym=sym,
+                side=pos["side"],
+                entry_price=float(pos["entry"]),
+                exit_price=float(px),
+                size=float(pos["size"]),
+                leverage=float(pos["leverage"]),
+                margin=float(pos["margin"]),
+                gross_pnl=gross_pnl,
+                fee_open=float(fee_open),
+                fee_close=float(fee_close),
+                realized=float(realized),
+                pnl_pct=float(pnl_pct),
+                reason=reason,
+                opened_ts=float(pos["opened"]),
+                closed_ts=float(closed_ts),
+                free_cash_before_release=bal_before,
+            )
 
         msg = (
             f"[平仓] {sym} {reason} 盈亏={realized:+.4f} ({pnl_pct:+.1f}%) "
@@ -1001,6 +1418,11 @@ class StrategyRunner:
         )
         self._log.append(msg)
         print(msg, flush=True)
+
+        # ── 止损反思：多维分析亏损原因 ──
+        if self._reflector and realized < 0:
+            self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
+                                    self._regime_cache, None)
 
         # Alpha角色事件：平仓
         is_tp = "止盈" in reason
@@ -1035,6 +1457,7 @@ class StrategyRunner:
             "_seq": seq,
         }
         _state["character_event"] = ev_close
+        _schedule_loli_speech(ev_close)
 
         # 平仓后冷却，避免立即重开（止损更长）
         cooldown_sec = 120 if reason == "止损" else 30
@@ -1047,6 +1470,20 @@ class StrategyRunner:
             px = prices.get(sym, pos["entry"])
             unrealized += self._gross_pnl_usd(sym, pos, px)
         self.equity = self.balance + locked + unrealized
+
+    def _fund_snapshot(self, prices: Dict[str, float]) -> Dict[str, float]:
+        self._recalc_equity(prices)
+        locked = sum(p["margin"] for p in self.positions.values())
+        uc = self._initial_capital
+        total_balance = uc + self.gross_realized - self.total_fees
+        unrealized = self.equity - self.balance - locked
+        return {
+            "equity": self.equity,
+            "free_cash": self.balance,
+            "total_balance": total_balance,
+            "margin_locked": locked,
+            "unrealized": unrealized,
+        }
 
     def _update_state(self, prices):
         self._recalc_equity(prices)
@@ -1070,10 +1507,27 @@ class StrategyRunner:
         _state["total_fees"] = self.total_fees
         _state["gross_realized"] = self.gross_realized  # 毛利累计
         _state["total_slippage"] = self.total_slippage
-        _state["trade_history"] = self._trade_history[-200:]
+        _state["trade_history"] = _trade_history_for_state(self)
         _state["margin_locked"] = locked
+        _state["position_list"] = _position_list_for_state(self, prices)
 
+        # 反思器状态供API/战报使用
+        if self._reflector:
+            _state["reflect"] = {
+                "summary": self._reflector.summary(),
+                "ai_boost": self._reflector.ai_boost,
+                "stop_boost": self._reflector.stop_boost,
+            }
 
+        if self._persistence:
+            self._persistence.schedule_state_redis(
+                {k: _state[k] for k in (
+                    "equity", "balance", "free_cash", "initial_capital",
+                    "unrealized_pnl", "realized_pnl", "win_rate", "positions",
+                    "trades", "wins", "total_fees", "gross_realized", "margin_locked",
+                    "symbol_count",
+                ) if k in _state}
+            )
 # ═══════════════════════════════════════════════════════════════════════
 # 价格推送循环
 # ═══════════════════════════════════════════════════════════════════════
@@ -1097,20 +1551,6 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
                 sym: {"price": px, "change": changes.get(sym, 0)}
                 for sym, px in prices.items()
             }
-            # 实时更新持仓盈亏（与 KPI 同一套 prices）
-            pos_list = []
-            for sym, pos in runner.positions.items():
-                px = prices.get(sym, pos["entry"])
-                unrealized = runner._gross_pnl_usd(sym, pos, px)
-                pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
-                pos_list.append({
-                    "symbol": sym, "side": pos["side"],
-                    "size": pos["size"], "entry_price": pos["entry"],
-                    "leverage": pos["leverage"], "margin": pos["margin"],
-                    "unrealized_pnl": unrealized, "pnl_pct": pnl_pct,
-                    "current_price": px,
-                })
-            _state["position_list"] = pos_list
         except Exception as e:
             print(f"[价格推送错误] {e}", flush=True)
         await asyncio.sleep(interval)
@@ -1130,8 +1570,11 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
     except Exception as e:
         print(f"[警告] 合约规格获取失败: {e}，使用默认值", flush=True)
 
+    _kline_inited = False
+    _tick = 0
     while True:
         try:
+            _tick += 1
             symbols = await fetch_top_symbols(n=30)
             # 强制加入 BTC/ETH，山寨只保留高波动精选
             MUST_HAVE = ["BTC/USDT", "ETH/USDT"]
@@ -1144,6 +1587,30 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             seen = set()
             symbols = [s for s in symbols if not (s in seen or seen.add(s))]
             await feed.refresh(symbols)
+            
+            # 初始化K线缓存（首次）
+            if not _kline_inited:
+                try:
+                    await init_kline_cache(symbols)
+                    print(f"📊 K线缓存初始化完成: {len(symbols)} 个币对", flush=True)
+                    # 初始化行情检测器（依赖K线缓存）
+                    kc = get_kline_cache()
+                    if kc:
+                        init_detector(kc)
+                        print(f"🔍 行情检测器就绪", flush=True)
+                    _kline_inited = True
+                except Exception as e:
+                    print(f"[警告] K线缓存初始化失败: {e}", flush=True)
+            
+            # 定期刷新K线（每60s更新一次，保持RSI/ADX新鲜）
+            if _kline_inited and _tick % 10 == 0:
+                try:
+                    kc = get_kline_cache()
+                    if kc:
+                        for s in symbols:
+                            await kc.update(s)
+                except Exception:
+                    pass
             prices = feed.get_prices()
             volumes = {s: t.volume_24h for s, t in feed._cache.items()}
             changes = feed.get_changes()
@@ -1152,22 +1619,8 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             await runner.tick(prices, volumes, changes, funding_rates, mark_prices)
             _state["symbols"] = list(symbols)
 
-            # 填充仓位列表
-            pos_list = []
-            for sym, pos in runner.positions.items():
-                px = prices.get(sym, pos["entry"])
-                unrealized = runner._gross_pnl_usd(sym, pos, px)
-                pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
-                pos_list.append({
-                    "symbol": sym, "side": pos["side"],
-                    "size": pos["size"], "entry_price": pos["entry"],
-                    "leverage": pos["leverage"], "margin": pos["margin"],
-                    "unrealized_pnl": unrealized, "pnl_pct": pnl_pct,
-                    "current_price": px,
-                })
-            _state["position_list"] = pos_list
         except Exception as e:
-            print(f"[错误] 交易循环: {e}", flush=True)
+            _log.error("交易循环: %s", e, exc_info=True)
         await asyncio.sleep(interval)
 
 
@@ -1175,9 +1628,22 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
 # 启动
 # ═══════════════════════════════════════════════════════════════════════
 async def main():
+    configure_logging()
+    set_dialogue_store(DialogueStore(resolve_sync_psycopg_url()))
+    seed_offline_dialogue_if_needed()
+    global _storage_bridge
+    _, session_factory = create_engine_and_sessionmaker()
+    repo = AccountRepository(session_factory) if session_factory else None
+    redis_url = os.environ.get("SHARK_REDIS_URL", "").strip()
+    redis_client = await create_redis(redis_url) if redis_url else None
+    _storage_bridge = PersistenceBridge(repository=repo, redis_client=redis_client)
+    if repo:
+        _log.info("Postgres persistence enabled (orders/trades/balance_logs)")
+    if redis_client:
+        _log.info("Redis enabled (state cache + gate REST rate limit)")
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
-    runner = StrategyRunner(initial_balance=200.0)
+    runner = StrategyRunner(initial_balance=200.0, persistence=_storage_bridge)
     _state["initial_capital"] = runner._initial_capital
     _state["free_cash"] = runner.balance
     _state["balance"] = runner.balance
@@ -1205,7 +1671,7 @@ async def main():
                 try:
                     await feed_m.refresh()
                 except Exception as e:
-                    pass
+                    _log.debug("multi_feed refresh: %s", e)
                 await asyncio.sleep(5)
         
         await init_multi_feed()

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useStore } from './store/useStore'
+import { useStore, type Status } from './store/useStore'
 import Dashboard from './components/Dashboard'
 import PositionsTable from './components/PositionsTable'
 import TradeHistory from './components/TradeHistory'
@@ -15,11 +15,64 @@ function Clock() {
   return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-muted)' }}>{time}</span>
 }
 
+function num(v: unknown, fallback: number): number {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string' && v.trim() !== '') {
+    const x = Number(v)
+    if (Number.isFinite(x)) return x
+  }
+  return fallback
+}
+
+function bool(v: unknown, fallback: boolean): boolean {
+  if (typeof v === 'boolean') return v
+  return fallback
+}
+
+/** Docker/生产同源服务用 /api/bootstrap.js 注入；本地 dev 可用 VITE_SHARK_API_TOKEN */
+function dashboardApiToken(): string {
+  const b = typeof window !== 'undefined' ? window.__SHARK_API_TOKEN__ : undefined
+  if (typeof b === 'string' && b.trim() !== '') return b.trim()
+  return import.meta.env.VITE_SHARK_API_TOKEN?.trim() ?? ''
+}
+
+function applyDashboardPayload(
+  data: Record<string, unknown>,
+  setStatus: (s: Partial<Status>) => void,
+) {
+  if (!data || typeof data !== 'object') return
+  const prev = useStore.getState().status
+  setStatus({
+    equity: num(data.equity, prev.equity),
+    balance: num(data.balance, prev.balance),
+    free_cash: num(data.free_cash, prev.free_cash),
+    initial_capital: num(data.initial_capital, prev.initial_capital),
+    unrealized_pnl: num(data.unrealized_pnl, prev.unrealized_pnl),
+    positions: num(data.positions, prev.positions),
+    realized_pnl: num(data.realized_pnl, prev.realized_pnl),
+    win_rate: num(data.win_rate, prev.win_rate),
+    safety_blocked: bool(data.safety_blocked, prev.safety_blocked),
+    position_list: Array.isArray(data.position_list) ? data.position_list : prev.position_list,
+    live_prices: data.live_prices && typeof data.live_prices === 'object'
+      ? (data.live_prices as Status['live_prices'])
+      : prev.live_prices,
+    total_fees: num(data.total_fees, prev.total_fees),
+    total_slippage: num(data.total_slippage, prev.total_slippage),
+    trade_history: Array.isArray(data.trade_history) ? data.trade_history : prev.trade_history,
+    margin_locked: num(data.margin_locked, prev.margin_locked),
+    character_event: (data.character_event as Status['character_event']) || undefined,
+  })
+}
+
+/** 超过此时长未收到快照/WL 推送则视为断连（与轮询 2.5s 对齐） */
+const DATA_STALE_MS = 12_000
+
 export default function App() {
   const { status, connected, setStatus, setConnected } = useStore()
   const wsRef = useRef<WebSocket>()
-  const pendingRef = useRef<any>(null)  // rAF节流缓冲区
   const [uptime, setUptime] = useState(0)
+  const [pollLatencyMs, setPollLatencyMs] = useState<number | null>(null)
+  const lastDataAtRef = useRef(0)
 
   // ═══ Starfield animation ═══
   useEffect(() => {
@@ -74,49 +127,68 @@ export default function App() {
     const start = Date.now()
     const id = setInterval(() => setUptime(Math.floor((Date.now() - start) / 1000)), 1000)
 
+    const markDataOk = () => {
+      lastDataAtRef.current = Date.now()
+      setConnected(true)
+    }
+
+    const pollSnapshot = async () => {
+      const t0 = performance.now()
+      try {
+        const tok = dashboardApiToken()
+        const q = tok ? `?token=${encodeURIComponent(tok)}` : ''
+        const r = await fetch(`/api/snapshot${q}`, { cache: 'no-store' })
+        if (!r.ok) {
+          setPollLatencyMs(null)
+          return
+        }
+        const d = (await r.json()) as Record<string, unknown>
+        applyDashboardPayload(d, setStatus)
+        setPollLatencyMs(Math.round(performance.now() - t0))
+        markDataOk()
+      } catch {
+        setPollLatencyMs(null)
+      }
+    }
+
+    const staleCheck = () => {
+      if (Date.now() - lastDataAtRef.current > DATA_STALE_MS)
+        setConnected(false)
+    }
+    const staleId = setInterval(staleCheck, 1500)
+
     const connect = () => {
-      const ws = new WebSocket(`ws://${location.host}/ws`)
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const tok = dashboardApiToken()
+      const path = tok
+        ? `/ws?token=${encodeURIComponent(tok)}`
+        : '/ws'
+      const ws = new WebSocket(`${proto}//${location.host}${path}`)
       wsRef.current = ws
-      ws.onopen = () => setConnected(true)
-      ws.onclose = () => { setConnected(false); setTimeout(connect, 2000) }
+      ws.onopen = () => {
+        void pollSnapshot()
+      }
+      ws.onclose = () => { setTimeout(connect, 2000) }
       ws.onmessage = (e) => {
         try {
-          const d = JSON.parse(e.data)
-          // rAF节流：累积到下一帧统一更新，防止高频WebSocket导致连锁re-render
-          if (!pendingRef.current) {
-            pendingRef.current = d
-            requestAnimationFrame(() => {
-              const data = pendingRef.current
-              pendingRef.current = null
-              if (!data) return
-              const prev = useStore.getState().status
-              setStatus({
-                equity: typeof data.equity === 'number' ? data.equity : prev.equity,
-                balance: typeof data.balance === 'number' ? data.balance : prev.balance,
-                free_cash: typeof data.free_cash === 'number' ? data.free_cash : prev.free_cash,
-                initial_capital: typeof data.initial_capital === 'number' ? data.initial_capital : prev.initial_capital,
-                unrealized_pnl: typeof data.unrealized_pnl === 'number' ? data.unrealized_pnl : prev.unrealized_pnl,
-                positions: typeof data.positions === 'number' ? data.positions : prev.positions,
-                realized_pnl: typeof data.realized_pnl === 'number' ? data.realized_pnl : prev.realized_pnl,
-                win_rate: typeof data.win_rate === 'number' ? data.win_rate : prev.win_rate,
-                safety_blocked: typeof data.safety_blocked === 'boolean' ? data.safety_blocked : prev.safety_blocked,
-                position_list: Array.isArray(data.position_list) ? data.position_list : prev.position_list,
-                live_prices: data.live_prices && typeof data.live_prices === 'object' ? data.live_prices : prev.live_prices,
-                total_fees: typeof data.total_fees === 'number' ? data.total_fees : prev.total_fees,
-                total_slippage: typeof data.total_slippage === 'number' ? data.total_slippage : prev.total_slippage,
-                trade_history: Array.isArray(data.trade_history) ? data.trade_history : prev.trade_history,
-                margin_locked: typeof data.margin_locked === 'number' ? data.margin_locked : prev.margin_locked,
-                character_event: data.character_event || undefined,
-              })
-            })
-          } else {
-            pendingRef.current = d  // 覆盖为最新数据
-          }
-        } catch {}
+          const d = JSON.parse(e.data) as Record<string, unknown>
+          // 直接同步应用（1Hz 无需 rAF；避免后台标签/部分环境下帧回调不跑导致界面卡死）
+          applyDashboardPayload(d, setStatus)
+          markDataOk()
+        } catch (err) {
+          console.warn('[shark] ws message parse failed', err)
+        }
       }
     }
     connect()
-    return () => { clearInterval(id); wsRef.current?.close() }
+    const pollId = setInterval(() => { void pollSnapshot() }, 2500)
+    void pollSnapshot()
+    return () => {
+      clearInterval(id)
+      clearInterval(staleId)
+      clearInterval(pollId)
+      wsRef.current?.close()
+    }
   }, [])
 
   const equityChange = status.equity - status.initial_capital
@@ -181,15 +253,12 @@ export default function App() {
           <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
             <div className="card-header">风控状态</div>
             <div className="card-body" style={{ flex: 1 }}>
-              <SafetyPanel blocked={status.safety_blocked} connected={connected} />
-            </div>
-            <div style={{
-              padding: '8px 16px', borderTop: '1px solid var(--border-subtle)',
-              fontSize: '10px', color: 'var(--text-muted)',
-              display: 'flex', justifyContent: 'space-between',
-            }}>
-              <span>运行时长</span>
-              <span style={{ fontFamily: 'var(--font-mono)' }}>{fmtUptime}</span>
+              <SafetyPanel
+                blocked={status.safety_blocked}
+                connected={connected}
+                latencyMs={pollLatencyMs}
+                uptimeLabel={fmtUptime}
+              />
             </div>
           </div>
         </div>

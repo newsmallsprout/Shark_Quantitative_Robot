@@ -6,9 +6,12 @@
 """
 
 import asyncio, aiohttp, time, json
+import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -83,7 +86,8 @@ class MultiExchangeFeed:
                         }
                         break
             return result
-        except:
+        except Exception as e:
+            _log.debug("multi_exchange binance: %s", e)
             return {}
 
     async def _fetch_bybit(self, session) -> dict:
@@ -105,7 +109,8 @@ class MultiExchangeFeed:
                         }
                         break
             return result
-        except:
+        except Exception as e:
+            _log.debug("multi_exchange bybit: %s", e)
             return {}
 
     async def _fetch_okx(self, session) -> dict:
@@ -122,7 +127,8 @@ class MultiExchangeFeed:
                         result[base] = {"price": float(item["markPrice"])}
                         break
             return result
-        except:
+        except Exception as e:
+            _log.debug("multi_exchange okx: %s", e)
             return {}
 
     async def _fetch_gate(self, session) -> dict:
@@ -143,10 +149,11 @@ class MultiExchangeFeed:
                         }
                         break
             return result
-        except:
+        except Exception as e:
+            _log.debug("multi_exchange gate: %s", e)
             return {}
 
-    async def refresh(self):
+    async def refresh(self) -> None:
         """刷新所有交易所数据"""
         async with aiohttp.ClientSession() as session:
             tasks = [

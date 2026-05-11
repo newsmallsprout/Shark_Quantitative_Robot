@@ -3,7 +3,9 @@ __pycache__
 .git
 logs
 data
-.env.example
+.env
+.env.*
+!.env.example
 *.md
 .DS_Store
 web/node_modules

@@ -1,4 +1,29 @@
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shark
+      POSTGRES_PASSWORD: shark
+      POSTGRES_DB: shark
+    volumes:
+      - shark_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shark -d shark"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - shark_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   shark:
     build: .
     container_name: shark2
@@ -7,14 +32,27 @@ services:
     env_file:
       - .env
     environment:
-      - TZ=UTC
-      - PYTHONUNBUFFERED=1
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: postgresql://shark:shark@db:5432/shark
+      SHARK_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+    working_dir: /app
+    command: ["sh", "-c", "alembic upgrade head && exec python main.py"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/api/health"]
       interval: 15s
       timeout: 5s
       retries: 3
+
+volumes:
+  shark_pgdata:
+  shark_redis:

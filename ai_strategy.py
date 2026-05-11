@@ -1,7 +1,10 @@
 """Shark 2.0 AI 策略引擎 v5 — 三模型委员会（DeepSeek主分析 + Qwen复核 + 豆包情绪）"""
 
 import asyncio, json, os, re, time
+import logging
 import aiohttp
+
+_log = logging.getLogger(__name__)
 
 # ── API endpoints ──
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -70,6 +73,7 @@ SYSTEM_ANALYST = """你是全球顶级加密货币量化交易分析师。基于
   "reasoning": "分析摘要20字内"
 }
 - 尽量给出LONG或SHORT，仅在完全无方向时才HOLD
+- 多空需对称：不得默认偏多；上涨末端慎追多、下跌末端慎追空；证据不足用HOLD
 - targets按价格排序，ratio总和≤1.0
 - stop_loss基于强支撑/阻力位"""
 
@@ -96,7 +100,8 @@ async def _fetch_timeframe_candles(sym: str, interval: str, limit: int = 20) -> 
             return []
         return [{"o": float(r["o"]), "h": float(r["h"]), "l": float(r["l"]),
                  "c": float(r["c"]), "v": float(r.get("sum", 0))} for r in data]
-    except:
+    except Exception as e:
+        _log.debug("fetch candlesticks failed sym=%s: %s", sym, e)
         return []
 
 
@@ -150,7 +155,8 @@ async def _fetch_orderbook(sym: str, depth: int = 10) -> str:
         else:
             wall = f"均衡({ratio:.1f}x)"
         return f"盘口:{wall} 价差{spread:.3f}%"
-    except:
+    except Exception as e:
+        _log.debug("fetch orderbook failed sym=%s: %s", sym, e)
         return ""
 
 
@@ -167,25 +173,25 @@ def _safe_json_parse(text: str) -> dict:
     if m:
         try:
             return json.loads(m.group(1))
-        except:
-            pass
+        except Exception as e:
+            _log.debug("safe_json_parse markdown block: %s", e)
     # 策略1: 直接解析
     try:
         return json.loads(text)
-    except:
-        pass
+    except Exception as e:
+        _log.debug("safe_json_parse direct: %s", e)
     # 策略2: regex 提取最外层 {...}
     m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group())
-        except:
-            pass
+        except Exception as e:
+            _log.debug("safe_json_parse regex: %s", e)
     # 策略3: 宽松模式
     try:
         return json.loads(text, strict=False)
-    except:
-        pass
+    except Exception as e:
+        _log.debug("safe_json_parse strict=False: %s", e)
     return {}
 
 

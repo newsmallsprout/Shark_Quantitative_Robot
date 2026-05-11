@@ -5,6 +5,7 @@ Shark 自进化引擎 — AI驱动的策略持续优化
 """
 
 import json, time, os, sys, re
+import logging
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -14,6 +15,7 @@ import urllib.request
 BASE = Path(__file__).resolve().parent
 API = os.environ.get("SHARK_API", "http://localhost:80/api")
 EVOLVE_LOG = BASE / "evolve_history.json"
+_log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════
 # Phase 1: 交易分析 — 找出血亏模式
@@ -34,7 +36,8 @@ def fetch_status():
     try:
         with urllib.request.urlopen(f"{API}/status", timeout=10) as r:
             return json.loads(r.read())
-    except:
+    except Exception as e:
+        _log.warning("evolve fetch_status: %s", e)
         return {}
 
 def analyze_trades(trades: list) -> dict:
@@ -353,8 +356,8 @@ def save_evolution(plan: dict):
     if EVOLVE_LOG.exists():
         try:
             history = json.loads(EVOLVE_LOG.read_text())
-        except:
-            pass
+        except Exception as e:
+            _log.warning("evolve save_evolution: corrupt log, truncating: %s", e)
     history.append(plan)
     EVOLVE_LOG.write_text(json.dumps(history, indent=2, ensure_ascii=False))
 

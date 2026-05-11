@@ -1,6 +1,10 @@
 interface Props {
   blocked: boolean
   connected: boolean
+  /** 最近一次 /api/snapshot 往返 ms，失败为 null */
+  latencyMs: number | null
+  /** 与顶栏一致的页面会话时长 HH:MM:SS */
+  uptimeLabel: string
 }
 
 const BREAKERS: Array<{ name: string; limit: string; status: string }> = [
@@ -10,7 +14,7 @@ const BREAKERS: Array<{ name: string; limit: string; status: string }> = [
   { name: 'API 错误', limit: '3次/分', status: 'OK' },
 ]
 
-export default function SafetyPanel({ blocked, connected }: Props) {
+export default function SafetyPanel({ blocked, connected, latencyMs, uptimeLabel }: Props) {
   if (blocked) {
     BREAKERS[0].status = '触发'
   } else {
@@ -76,11 +80,13 @@ export default function SafetyPanel({ blocked, connected }: Props) {
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
           <span style={{ color: 'var(--text-secondary)' }}>延迟</span>
-          <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>~120ms</span>
+          <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            {latencyMs != null ? `~${latencyMs}ms` : '—'}
+          </span>
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
           <span style={{ color: 'var(--text-secondary)' }}>运行时长</span>
-          <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>--:--:--</span>
+          <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>{uptimeLabel}</span>
         </div>
       </div>
     </div>

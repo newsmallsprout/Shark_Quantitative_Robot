@@ -6,15 +6,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Optional
 
 import aiohttp
 
 from character_voice import _extract_json_obj, _truncate_speech, character_llm_config
+from persistence.dialogue_store import DialogueStore
 
 # ── 配置 ─────────────────────────────────────────────────────────────
 LOW_WATER = 3
@@ -32,6 +32,14 @@ _OFFLINE_BY_CAT: Dict[str, List[str]] = {
         "收钱！今晚加餐！",
         "赚到了！别贪！",
         "卧槽起飞！狗庄叫爹！",
+        "会所嫩模在招手！",
+        "这波插眼满分！",
+        "一眼丁真：赢！",
+        "拔网线也没用，我赚了！",
+        "送外卖暂停，开香槟！",
+        "庄家急了？我收了！",
+        "浮盈变现，真香！",
+        "小目标又近一步！",
     ],
     "loss": [
         "淦！还我血汗钱！",
@@ -39,6 +47,11 @@ _OFFLINE_BY_CAT: Dict[str, List[str]] = {
         "妈的这阴线跟狼牙棒一样！",
         "狗庄还我鲨鱼钱！",
         "破防了别理我！",
+        "上天台排队拿号…",
+        "赛博精神病发作了！",
+        "账户绿得发光！",
+        "这波被骗炮了！",
+        "CPU干烧也救不回！",
     ],
     "boring": [
         "死鱼盘，老娘网线要生锈了。",
@@ -46,6 +59,12 @@ _OFFLINE_BY_CAT: Dict[str, List[str]] = {
         "画门呢？眼都花了。",
         "这破盒子快发霉了。",
         "没波动，打螺丝去了。",
+        "庄在装死，我先摸鱼。",
+        "K线比我的耐心还直。",
+        "时间仿佛凝固了…",
+        "看盘看到意识模糊。",
+        "波动呢？急死老娘！",
+        "内存泄漏式横盘！",
     ],
     "stoploss": [
         "止损…我破防了！",
@@ -53,11 +72,28 @@ _OFFLINE_BY_CAT: Dict[str, List[str]] = {
         "刀切下来了快溜！",
         "认怂跑路别探头！",
         "风控刀也太狠了吧！",
+        "割了，留得青山在！",
+        "纪律保命，认了！",
+        "再扛要清零了！",
     ],
 }
 
 _POOL_LOCK = threading.Lock()
 _POOLS: Dict[str, Deque[str]] = {k: deque() for k in CATEGORIES}
+# 弹夹空且未启用 LLM 批次进货时的离线轮换指针（避免 random 重复感）
+_OFFLINE_RR: Dict[str, int] = {}
+
+# Postgres 弹药库（有 DATABASE_URL 时启用）；无则退回内存队列
+_DIALOGUE_STORE: Optional[DialogueStore] = None
+
+
+def set_dialogue_store(store: Optional[DialogueStore]) -> None:
+    global _DIALOGUE_STORE
+    _DIALOGUE_STORE = store
+
+
+def _db_enabled() -> bool:
+    return _DIALOGUE_STORE is not None and _DIALOGUE_STORE.enabled()
 
 _last_refill_mono = 0.0
 _refill_lock = asyncio.Lock()
@@ -103,25 +139,66 @@ def ammo_enabled() -> bool:
 
 
 def pool_counts() -> Dict[str, int]:
+    if _db_enabled():
+        got = _DIALOGUE_STORE.counts()
+        return {k: int(got.get(k, 0)) for k in CATEGORIES}
     with _POOL_LOCK:
         return {k: len(v) for k, v in _POOLS.items()}
 
 
 def _needs_refill() -> bool:
+    if _db_enabled():
+        return any(_DIALOGUE_STORE.count_for_category(k) < LOW_WATER for k in CATEGORIES)
     with _POOL_LOCK:
         return any(len(_POOLS[k]) < LOW_WATER for k in CATEGORIES)
 
 
+def seed_offline_dialogue_if_needed() -> None:
+    """无 LLM 弹夹时：有 DB 则把离线句灌进表（仅空分类）；否则灌内存队列。"""
+    if _db_enabled():
+        for cat in CATEGORIES:
+            lines = _OFFLINE_BY_CAT.get(cat) or ()
+            trimmed = [_truncate_speech(str(x).strip(), 15) for x in lines]
+            trimmed = [t for t in trimmed if t]
+            if trimmed:
+                _DIALOGUE_STORE.seed_category_if_empty(cat, trimmed)
+        return
+    if ammo_enabled():
+        return
+    with _POOL_LOCK:
+        for cat in CATEGORIES:
+            if _POOLS[cat]:
+                continue
+            for line in _OFFLINE_BY_CAT.get(cat, ()):
+                t = _truncate_speech(str(line).strip(), 15)
+                if t:
+                    _POOLS[cat].append(t)
+
+
 def pop_line(category: str) -> str:
-    """行情线程同步 pop；弹夹空则本地轮换句，再没有则唯一兜底。"""
+    """有数据库时：`ORDER BY random()` 取一句；否则内存 pop 或离线轮换。"""
     cat = category if category in _POOLS else "boring"
+    if _db_enabled():
+        raw = _DIALOGUE_STORE.random_line(cat)
+        if raw:
+            t = _truncate_speech(raw, 15)
+            if t:
+                return t
+        alt = _OFFLINE_BY_CAT.get(cat) or ()
+        if alt:
+            i = _OFFLINE_RR.get(cat, 0) % len(alt)
+            _OFFLINE_RR[cat] = i + 1
+            return _truncate_speech(alt[i], 15)
+        return EMPTY_FALLBACK
     with _POOL_LOCK:
         dq = _POOLS[cat]
         if dq:
             return dq.popleft()
     alt = _OFFLINE_BY_CAT.get(cat) or ()
     if alt:
-        return _truncate_speech(random.choice(alt), 15)
+        i = _OFFLINE_RR.get(cat, 0) % len(alt)
+        _OFFLINE_RR[cat] = i + 1
+        return _truncate_speech(alt[i], 15)
     return EMPTY_FALLBACK
 
 
@@ -135,7 +212,7 @@ def trade_category_for_close(reason: str, realized: float) -> str:
     r = reason or ""
     if "止损" in r:
         return "stoploss"
-    if "止盈" in r or "移动止盈" in r or "AI目标" in r or "AI终极止盈" in r:
+    if "止盈" in r or "移动止盈" in r or "AI目标" in r or "AI终极止盈" in r or "收割" in r:
         return "profit"
     if realized < 0:
         return "loss"
@@ -143,6 +220,23 @@ def trade_category_for_close(reason: str, realized: float) -> str:
 
 
 def _ingest_batch(obj: Dict[str, Any]) -> int:
+    if _db_enabled():
+        norm: Dict[str, List[str]] = {}
+        for cat in CATEGORIES:
+            raw = obj.get(cat)
+            if not isinstance(raw, list):
+                continue
+            lines: List[str] = []
+            seen: set[str] = set()
+            for item in raw:
+                line = _truncate_speech(str(item).strip(), 15)
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                lines.append(line)
+            if lines:
+                norm[cat] = lines
+        return _DIALOGUE_STORE.ingest_from_batch(CATEGORIES, norm)
     added = 0
     with _POOL_LOCK:
         seen = {x for dq in _POOLS.values() for x in dq}

@@ -12,6 +12,7 @@ Shark 自进化引擎 v2 — 实时模式
 """
 
 import time, json, os, sys
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +24,7 @@ BASE = Path(__file__).resolve().parent
 API = os.environ.get("SHARK_API", "http://localhost:80/api")
 EVOLVE_LOG = BASE / "evolve_v2_history.json"
 STATE_FILE = BASE / "evolve_v2_state.json"
+_log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════
@@ -103,7 +105,7 @@ def _multi_exchange_confirm(self, sym, side):
                 return False, f"多交易所方向不一致(sig={sig['bias']})"
             if sig['divergence'] > 0.5:
                 return False, f"交易所价差过大({sig['divergence']:.2f}%)"
-    except:
+    except Exception:
         pass
     return True, "OK"
 """
@@ -224,7 +226,7 @@ def _adaptive_stop_pct(self, sym, base_sl=-6.0):
             # ATR波动率越高中止损越宽（避免被噪音震出）
             adaptive = max(base_sl, -atr_pct * 3)
             return max(adaptive, -15.0)  # 上限-15%
-    except:
+    except Exception:
         pass
     return base_sl
 """
@@ -383,8 +385,8 @@ class EvolutionEngine:
                 state = json.loads(STATE_FILE.read_text())
                 self.applied_tactics = set(state.get("applied", []))
                 self.cooldowns = state.get("cooldowns", {})
-            except:
-                pass
+            except Exception as e:
+                _log.warning("evolve_v2 _load_state: %s", e)
     
     def _save_state(self):
         STATE_FILE.write_text(json.dumps({
@@ -474,14 +476,16 @@ def fetch_trades(limit=100):
         url = f"{API}/history?offset=0&limit={limit}"
         with urllib.request.urlopen(url, timeout=10) as r:
             return json.loads(r.read()).get("trades", [])
-    except:
+    except Exception as e:
+        _log.warning("evolve_v2 fetch_trades: %s", e)
         return []
 
 def fetch_status():
     try:
         with urllib.request.urlopen(f"{API}/status", timeout=10) as r:
             return json.loads(r.read())
-    except:
+    except Exception as e:
+        _log.warning("evolve_v2 fetch_status: %s", e)
         return {}
 
 def analyze_batch(trades: list, status: dict) -> dict:

@@ -131,6 +131,7 @@ cd web && npm ci && npm run dev
 
 - Primary reference: **`.env.example`**. After copying to `.env`, set variables required for your deployment.  
 - **HTTP:** `SHARK_HTTP_PORT` (default 80 inside container when using the provided Compose file).  
+- **Logging:** `SHARK_LOG_LEVEL` (default `INFO`). Stderr lines include `[rid=…]` from `X-Request-ID` on HTTP requests (or `-` for background tasks).  
 - **LLM (optional AI path):** e.g. `DEEPSEEK_API_KEY`, `VOLC_KEY`, `QWEN_KEY` — must be non-empty only if you enable those call paths in `ai_strategy.py`.  
 - **API hardening (when implemented in your fork):** `SHARK_API_TOKEN` and matching frontend token for Bearer authentication.  
 - **License / fingerprint:** If your distribution uses license checks, follow comments in `.env.example` for `SKIP_LICENSE_CHECK` and `SHARK_LICENSE_FINGERPRINT`.
@@ -139,6 +140,7 @@ cd web && npm ci && npm run dev
 
 - 以 **`.env.example`** 为准，复制为 `.env` 后在本地填写。  
 - **HTTP：** `SHARK_HTTP_PORT`（与 Compose 端口映射配合）。  
+- **日志：** `SHARK_LOG_LEVEL`（默认 `INFO`）。标准错误输出含 `[rid=…]`：与 HTTP 请求头 `X-Request-ID` 对应；后台任务无请求时为 `-`。  
 - **LLM：** 如启用 `ai_strategy.py` 中对应提供方，需在环境中配置 `DEEPSEEK_API_KEY`、`VOLC_KEY`、`QWEN_KEY` 等，且**不得**写入 Git。  
 - **鉴权：** 若分支中实现了 Bearer 校验，需与前端 `VITE_*` 等变量保持一致。  
 - **许可证：** 若使用许可证校验，参见 `.env.example` 中 `SKIP_LICENSE_CHECK`、`SHARK_LICENSE_FINGERPRINT` 说明。
@@ -147,7 +149,7 @@ cd web && npm ci && npm run dev
 
 ## HTTP API · 接口
 
-**English** — Endpoints exposed by `main.py` (typical deployment):
+**English** — Endpoints exposed by `main.py` (only supported stack):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -155,6 +157,12 @@ cd web && npm ci && npm run dev
 | GET | `/api/status` | Aggregated runtime state snapshot |
 | GET | `/api/history` | Paginated trade history (`offset`, `limit`) |
 | WS | `/ws` | ~1 Hz JSON push of dashboard state |
+
+Canonical ASGI: **`main:app`**. The former second app in `api/server.py` was removed; see `adr/0001-single-http-entrypoint.md`.
+
+**Correlation ID:** HTTP responses echo `X-Request-ID`. Send your own id to trace a call across logs; if omitted the server generates one. WebSocket clients may send `X-Request-ID` on the handshake (non-browser clients); the same id is used for log context during that connection.
+
+**Optional API token:** When `SHARK_API_TOKEN` is set, `GET /api/status` and `GET /api/history` require `Authorization: Bearer <token>`. The WebSocket must pass the same secret as query `?token=<token>` (browser `WebSocket` cannot send custom headers). Leave unset for open local dev. Use `VITE_SHARK_API_TOKEN` under `web/` (same value) so the dashboard connects.
 
 **中文** — `main.py` 默认路由：
 
@@ -165,7 +173,11 @@ cd web && npm ci && npm run dev
 | GET | `/api/history` | 历史成交分页 |
 | WS | `/ws` | 约每秒推送 JSON 状态 |
 
-An alternate FastAPI app under `api/server.py` exists for orchestrator-centric deployments; integrate it only if your process wiring depends on it.
+**单一入口：** 对外 HTTP/WebSocket 仅 **`main:app`**（`python main.py`）。`api/server.py` 已改为显式占位（若调用 `create_api_server` 会报错）；说明见 `adr/0001-single-http-entrypoint.md`。
+
+**请求关联：** HTTP 响应带回 `X-Request-ID`。可自带该头以便在日志中对齐一次调用；未带则由服务端生成。WebSocket 握手可带 `X-Request-ID`（浏览器原生 API 无法自定义头，多用于非浏览器客户端），连接期间日志使用同一 `rid`。
+
+**可选鉴权：** 若环境变量设置了 `SHARK_API_TOKEN`，则 `/api/status`、`/api/history` 须带请求头 `Authorization: Bearer <token>`；`/ws` 须带查询参数 `?token=<token>`（与令牌相同）。未设置时保持原先开放行为。前端开发时在 `web/.env.local` 配置 `VITE_SHARK_API_TOKEN` 与之一致。
 
 ---
 
@@ -182,7 +194,11 @@ Shark_Quantitative_Robot/
 ├── ai/                  # Brain / heuristics (engineered AI layer)
 ├── engine/              # Orchestrator, safety, paper engine, rate limiting
 ├── strategies/          # Strategy implementations
-├── api/                 # Standalone API module (optional integration)
+├── api/                 # 迁移占位（历史第二入口已移除；见 adr/0001）
+├── adr/                 # 架构决策记录 (ADR)
+├── domain/              # 领域模型骨架（交易订单/状态；见 adr/0002）
+├── observability/       # 请求关联 ID、根日志格式
+├── tools/               # 开发工具（如 profile 基线脚本）
 ├── web/                 # React (Vite) dashboard source + dist after build
 ├── Dockerfile           # Multi-stage image
 ├── docker-compose.yml
@@ -199,15 +215,17 @@ Shark_Quantitative_Robot/
 
 - **Secrets:** Keep `.env` out of version control; rotate any key previously exposed in logs or chat. Do not bake `.env` into images in production—inject at runtime (Compose `env_file`, orchestrator secrets, etc.).  
 - **Network exposure:** Default Compose publishes port 80 on the host. Restrict firewalls or place an authenticated reverse proxy in untrusted networks. REST and WebSocket data can include PnL and positions—treat as sensitive.  
-- **Dependencies:** `requirements.txt` uses lower bounds (`>=`); for reproducible builds, pin versions or adopt a lockfile in regulated environments.  
-- **Observability:** Application logs go under `./logs` when using the bundled Compose volume mapping; Uvicorn access logging may be reduced in code for noise control—verify your observability stack separately.
+- **Dependencies:** `requirements.txt` lists direct imports used by the default `main.py` stack; optional packages are commented at the file bottom—uncomment and pin when enabling those code paths. For reproducible builds, pin versions or use a lockfile.  
+- **Observability:** Application logs go under `./logs` when using the bundled Compose volume mapping; Uvicorn access logging may be reduced in code for noise control—verify your observability stack separately.  
+- **CPU baseline (no network):** Run `python tools/profile_tick_baseline.py` from the repo root (optional env `PROFILE_TICKS`, `PROFILE_TOP`). On a typical dev machine, cumulative time is dominated by `StrategyRunner.tick`, then per-symbol work in `oscillation.py` (`OscillationDetector.feed`) and frequent `dual_strategy.get_config` calls—use this as a before/after when optimizing the inner loop.
 
 **中文**
 
 - **密钥：** `.env` 不提交；曾泄露的 Key 应在云控制台轮换；生产环境勿将 `.env` `COPY` 进镜像，应在运行时注入。  
 - **网络：** 默认映射宿主机 80 端口，公网部署请加防火墙或前置带鉴权的反向代理；`/api/*` 与 `/ws` 可能包含仓位与盈亏，按敏感数据处理。  
-- **依赖：** `requirements.txt` 为下限版本；合规或生产可锁定版本或使用锁文件。  
-- **可观测性：** Compose 挂载 `./logs`；代码中可能关闭部分访问日志以降低噪音——生产请用独立监控与告警。
+- **依赖：** 根目录 `requirements.txt` 仅保留当前代码路径实际使用的直接依赖；可选包以注释形式列于文件末尾，启用时再取消注释并建议锁定版本。  
+- **可观测性：** Compose 挂载 `./logs`；代码中可能关闭部分访问日志以降低噪音——生产请用独立监控与告警。  
+- **CPU 基线（无网络）：** 在仓库根执行 `python tools/profile_tick_baseline.py`（可用环境变量 `PROFILE_TICKS`、`PROFILE_TOP`）。开发机上累计耗时多在 `StrategyRunner.tick`、各 symbol 的 `oscillation.py`（`OscillationDetector.feed`）以及高频的 `dual_strategy.get_config`——作内层循环优化时可对比前后 profile。
 
 ---
 
