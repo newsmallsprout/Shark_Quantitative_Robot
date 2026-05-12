@@ -24,9 +24,11 @@ func NewMacroBuilder() *MacroBuilder {
 
 // Fetch 从 Gate.io 拉取日K线 + 计算宏观指标
 func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
-	// Gate.io 日K线端点
-	url := fmt.Sprintf("https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=%s&interval=1d&limit=30",
-		stringsReplace(symbol, "/", "_"))
+	// USDT 永续 K 线（与 SlowLoop 的 futures 盘口、ticker 同一标的）
+	contract := stringsReplace(symbol, "/", "_")
+	url := fmt.Sprintf(
+		"https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=%s&interval=1d&limit=30",
+		contract)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := m.client.Do(req)
@@ -35,7 +37,11 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 	}
 	defer resp.Body.Close()
 
-	var raw [][]string
+	var raw []struct {
+		C string `json:"c"`
+		H string `json:"h"`
+		L string `json:"l"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return err
 	}
@@ -44,17 +50,14 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 		return fmt.Errorf("insufficient data: %d candles", len(raw))
 	}
 
-	// 解析K线: [timestamp, volume, close, high, low, open]
 	closes := make([]float64, len(raw))
 	highs := make([]float64, len(raw))
 	lows := make([]float64, len(raw))
 	for i, r := range raw {
-		closes[i] = parseFloat(r[2])
-		highs[i] = parseFloat(r[3])
-		lows[i] = parseFloat(r[4])
+		closes[i] = parseFloat(r.C)
+		highs[i] = parseFloat(r.H)
+		lows[i] = parseFloat(r.L)
 	}
-
-	
 
 	// ATR14
 	atr := calcATR(highs, lows, closes, 14)
@@ -76,11 +79,19 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 		regime = RegimeRange
 	}
 
+	n := len(lows)
+	win := 20
+	if n < win {
+		win = n
+	}
+	lowSlice := lows[n-win:]
+	highSlice := highs[n-win:]
+
 	macro := &MacroContext{
 		Symbol:    symbol,
 		Regime:    regime,
-		RangeLow:  minFloat(lows[len(lows)-20:]...) * 0.99,
-		RangeHigh: maxFloat(highs[len(highs)-20:]...) * 1.01,
+		RangeLow:  minFloat(lowSlice...) * 0.99,
+		RangeHigh: maxFloat(highSlice...) * 1.01,
 		ATR14:     atr,
 		VolPct:    volPct,
 		TrendStr:  trend,
@@ -95,7 +106,7 @@ func (m *MacroBuilder) Get(symbol string) *MacroContext {
 	if c, ok := m.cache[symbol]; ok {
 		return c
 	}
-	return &MacroContext{Symbol: symbol, Regime: RegimeUnknown, ATR14: 1000}
+	return &MacroContext{Symbol: symbol, Regime: RegimeUnknown, ATR14: 0}
 }
 
 // ── 计算工具 ──

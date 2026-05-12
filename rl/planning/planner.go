@@ -409,10 +409,29 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 		px = 80000
 	}
 
+	pxPlan := px
+	if depth != nil && depth.SupportPrice > 0 && depth.ResistancePrice > depth.SupportPrice {
+		midBook := (depth.SupportPrice + depth.ResistancePrice) / 2
+		if midBook > 0 {
+			if pxPlan <= 0 {
+				pxPlan = midBook
+			} else {
+				dv := math.Abs(midBook-pxPlan) / pxPlan
+				if dv <= 0.05 {
+					// 订单簿重心与 ticker 接近时，用中间价减少区间锚在「错价」上
+					pxPlan = (pxPlan + midBook) / 2
+				}
+			}
+		}
+	}
+	if pxPlan <= 0 {
+		pxPlan = px
+	}
+
 	e := p.evo
 	atr := macro.ATR14
 	if atr <= 0 {
-		atr = px * 0.02
+		atr = pxPlan * 0.02
 	}
 
 	plan := &RangePlan{
@@ -422,30 +441,38 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 		ATR14:       atr,
 	}
 
-	// 区间 = ATR × 进化倍率
-	plan.RangeLow = px - atr*e.AtRMult
-	plan.RangeHigh = px + atr*e.AtRMult
+	// 区间：ATR 带，并至少覆盖订单簿支撑/压力
+	plan.RangeLow = pxPlan - atr*e.AtRMult
+	plan.RangeHigh = pxPlan + atr*e.AtRMult
+	if depth != nil && depth.SupportPrice > 0 && depth.ResistancePrice > depth.SupportPrice {
+		plan.RangeLow = math.Min(plan.RangeLow, depth.SupportPrice)
+		plan.RangeHigh = math.Max(plan.RangeHigh, depth.ResistancePrice)
+	}
 
 	// 方向 + 入场带
 	switch {
 	case macro.Regime == RegimeTrendUp && depth.SupportStrength > 0.5:
 		plan.Bias = "long"
 		plan.EntryZoneLow = depth.SupportPrice
-		plan.EntryZoneHigh = px - atr*e.EntryMargin
+		plan.EntryZoneHigh = pxPlan - atr*e.EntryMargin
 		plan.StopLoss = depth.SupportPrice - atr*e.StopOffset
 	case macro.Regime == RegimeTrendDown && depth.ResistanceStrength > 0.5:
 		plan.Bias = "short"
-		plan.EntryZoneLow = px + atr*e.EntryMargin
+		plan.EntryZoneLow = pxPlan + atr*e.EntryMargin
 		plan.EntryZoneHigh = depth.ResistancePrice
 		plan.StopLoss = depth.ResistancePrice + atr*e.StopOffset
 	default:
 		plan.Bias = "long"
 		plan.EntryZoneLow = depth.SupportPrice
-		plan.EntryZoneHigh = px - atr*e.EntryMargin
+		plan.EntryZoneHigh = pxPlan - atr*e.EntryMargin
 		plan.StopLoss = depth.SupportPrice - atr*e.StopOffset
 	}
 
-	plan.TakeProfit = []float64{px + atr*e.TpMult, px + atr*e.TpMult*2}
+	if plan.Bias == "short" {
+		plan.TakeProfit = []float64{pxPlan - atr*e.TpMult, pxPlan - atr*e.TpMult*2}
+	} else {
+		plan.TakeProfit = []float64{pxPlan + atr*e.TpMult, pxPlan + atr*e.TpMult*2}
+	}
 
 	plan.SupportStrength = depth.SupportStrength
 	plan.ResistanceStrength = depth.ResistanceStrength
@@ -454,7 +481,7 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 	plan.MacroRegime = macro.Regime
 	plan.FundingRate = funding
 
-	clampPlan(plan, px)
+	clampPlan(plan, pxPlan)
 	return plan
 }
 
@@ -477,11 +504,25 @@ func clampPlan(plan *RangePlan, px float64) {
 	if plan.EntryZoneHigh > px*1.1 || plan.EntryZoneHigh <= 0 {
 		plan.EntryZoneHigh = px * 1.01
 	}
-	if plan.RangeLow < px*0.85 || plan.RangeLow <= 0 {
-		plan.RangeLow = px * 0.85
+	if plan.RangeLow > plan.RangeHigh {
+		plan.RangeLow, plan.RangeHigh = plan.RangeHigh, plan.RangeLow
 	}
-	if plan.RangeHigh > px*1.15 || plan.RangeHigh <= 0 {
-		plan.RangeHigh = px * 1.15
+	if plan.RangeLow <= 0 {
+		plan.RangeLow = px * 0.99
+	}
+	if plan.RangeHigh <= 0 {
+		plan.RangeHigh = px * 1.01
+	}
+	// 避免退化成一条线；不再把区间硬夹到 ±15%（会砍掉真实支撑/压力）
+	if plan.RangeHigh-plan.RangeLow < px*1e-4 {
+		plan.RangeLow = px * 0.995
+		plan.RangeHigh = px * 1.005
+	}
+	if px > 0 && px < plan.RangeLow {
+		plan.RangeLow = math.Min(plan.RangeLow, px*0.995)
+	}
+	if px > 0 && px > plan.RangeHigh {
+		plan.RangeHigh = math.Max(plan.RangeHigh, px*1.005)
 	}
 	if plan.Bias == "long" {
 		if plan.StopLoss >= plan.EntryZoneLow || plan.StopLoss < px*0.85 || plan.StopLoss <= 0 {
