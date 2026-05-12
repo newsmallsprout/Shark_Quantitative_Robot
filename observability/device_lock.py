@@ -174,6 +174,8 @@ def _http_path_exempt_from_mac(path: str) -> bool:
     # 只读接口：旧版内联脚本或外部工具可能只带 Bearer 不带 MAC；IP 已放行时不再强制 MAC
     if path == "/api/live/status" or path == "/api/evo/pending":
         return True
+    if path == "/api/plans":
+        return True
     if path.startswith("/assets/") or path.startswith("/public/") or path.startswith("/video/"):
         return True
     # 本地 vite 直连后端时模块入口

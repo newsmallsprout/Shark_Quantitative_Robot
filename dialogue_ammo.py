@@ -261,7 +261,7 @@ def seed_offline_dialogue_if_needed() -> None:
 
 
 def pop_line(category: str) -> str:
-    """有数据库时：`ORDER BY random()` 取一句；否则内存 pop 或离线轮换。"""
+    """仅从数据库随机获取；无数据时从 LLM 生成后重试。"""
     cat = category if category in _POOLS else "boring"
     if _db_enabled():
         raw = _DIALOGUE_STORE.random_line(cat)
@@ -269,22 +269,8 @@ def pop_line(category: str) -> str:
             t = _truncate_speech(raw, 15)
             if t:
                 return t
-        alt = _OFFLINE_BY_CAT.get(cat) or ()
-        if alt:
-            i = _OFFLINE_RR.get(cat, 0) % len(alt)
-            _OFFLINE_RR[cat] = i + 1
-            return _truncate_speech(alt[i], 15)
-        return EMPTY_FALLBACK
-    with _POOL_LOCK:
-        dq = _POOLS[cat]
-        if dq:
-            return dq.popleft()
-    alt = _OFFLINE_BY_CAT.get(cat) or ()
-    if alt:
-        i = _OFFLINE_RR.get(cat, 0) % len(alt)
-        _OFFLINE_RR[cat] = i + 1
-        return _truncate_speech(alt[i], 15)
-    return EMPTY_FALLBACK
+    # DB空 → 返回空串，由 LLM 补货循环填充
+    return ""
 
 
 def trade_category_for_open() -> str:

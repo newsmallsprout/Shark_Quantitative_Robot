@@ -15,6 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"shark-rl"
+	"shark-rl/planning"
 )
 
 func main() {
@@ -63,6 +64,15 @@ func main() {
 	// ── Training + Action loop ──
 	go trainingLoop(kb, ga, agent, server, rdb)
 
+	// ── SlowLoop Planning (30m) ──
+	plannerCtx, plannerCancel := context.WithCancel(context.Background())
+	defer plannerCancel()
+	go func() {
+		sched := planning.NewScheduler(rdb, planning.LargeCapSymbols)
+		sched.Start(plannerCtx)
+	}()
+	log.Printf("[Planning] SlowLoop 已启动（每30分钟生成RangePlan，覆盖%d个大市值币对）", len(planning.LargeCapSymbols))
+
 	// ── TradingView 知识学习 ──
 	tv := rl.NewTVScraper()
 	tv.StartTVLearning(kb, 30*time.Minute)
@@ -82,14 +92,20 @@ func main() {
 func trainingLoop(kb *rl.KnowledgeBase, ga *rl.GAPopulation, agent *rl.DQNAgent,
 	server *rl.WebhookServer, rdb *redis.Client) {
 
-	// 用真实价格数据训练（从Redis读取，fallback到合成数据）
+	// 用真实价格数据训练（从Redis读取，无真价格则等待）
 	prices := fetchRealPrices(rdb)
 	if len(prices) < 100 {
-		log.Println("[Train] Redis无足够价格数据，使用合成数据")
-		prices = generateSyntheticPrices(500)
-	} else {
-		log.Printf("[Train] 使用Redis真实价格数据 (%d条)", len(prices))
+		log.Println("[Train] Redis无足够价格数据，等待30秒重试...")
+		for retries := 0; retries < 10 && len(prices) < 100; retries++ {
+			time.Sleep(30 * time.Second)
+			prices = fetchRealPrices(rdb)
+		}
+		if len(prices) < 100 {
+			log.Println("[Train] 等待超时，RL训练延后到下一个价格周期")
+			return
+		}
 	}
+	log.Printf("[Train] 使用Redis真实价格数据 (%d条)", len(prices))
 
 	// Phase 1: GA evolution
 	log.Println("[Train] Starting initial GA evolution...")
@@ -253,7 +269,6 @@ func publishActions(rdb *redis.Client, agent *rl.DQNAgent, kb *rl.KnowledgeBase,
 		}
 		data, _ := json.Marshal(msg)
 		rdb.Publish(ctx, "shark:rl:action", data)
-		log.Printf("[Action] %s → %s", sym, side)
 	}
 }
 

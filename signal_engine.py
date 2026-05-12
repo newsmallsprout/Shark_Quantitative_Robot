@@ -1,7 +1,8 @@
 """
-Signal Engine — 方向信号决策层
-从 tick() 抽取，负责 AI 委员会 + 多方兜底 + 方向确认
-返回统一 SignalResult，策略层只消费结果
+Signal Engine — 方向信号决策层（v2 纯AI版）
+从 tick() 抽取，只负责 AI 委员会信号判定。
+已移除所有兜底逻辑（费率/RSI/多交易所/ADX/量价投票）。
+无AI信号 = 跳过开仓。FastLoop 门禁由 PlanGate 负责。
 """
 
 from typing import Optional, Tuple
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 @dataclass
 class SignalResult:
     side: str = ""             # "long" / "short" / "" (skip)
-    signal_src: str = ""       # "AI多维 信70" / "多方兜底 ..."
+    signal_src: str = ""       # "AI多维 信70"
     ai_confidence: int = 0
     ai_use: bool = False       # 是否来自AI委员会
     learner_feat: list = field(default_factory=list)
@@ -20,19 +21,15 @@ class SignalResult:
 
 
 class SignalEngine:
-    """方向信号决策引擎：AI优先 → 多方兜底 → 多交易所确认"""
+    """方向信号决策引擎：纯AI委员会"""
 
     def decide(self, runner, sym: str, px: float, funding: float,
                change: float, vol: float, cfg: dict, now: float,
                regime_cache: dict, _regime) -> SignalResult:
         """
         判定开仓方向，返回 SignalResult。
-        无可用信号时返回 side=""。
+        无AI信号时返回 side="" — 上游 PlanGate 决定是否放行。
         """
-        from main import KLINE_ENABLED, MULTI_ENABLED
-        from kline_cache import get_kline_cache
-        from multi_exchange import get_multi_feed
-
         r = SignalResult()
 
         # ── AI 信号缓存 ──
@@ -71,100 +68,12 @@ class SignalEngine:
         r.ai_use = ai_use
         r.learner_feat = _learner_feat
 
-        # ── 方向判定 ──
-        side = ""
-        signal_src = ""
-
+        # ── 方向判定：纯AI，无兜底 ──
         if ai_use:
-            side = "long" if ai_dir_raw == "LONG" else "short"
-            signal_src = f"AI多维 信{int(ai_confidence)}"
-        else:
-            # 多方信号兜底
-            fb_votes = {"long": 0, "short": 0}
-            fb_tags = []
+            r.side = "long" if ai_dir_raw == "LONG" else "short"
+            r.signal_src = f"AI多维 信{int(ai_confidence)}"
 
-            if abs(funding) > 0.0005:
-                d = "short" if funding > 0 else "long"
-                fb_votes[d] += 1; fb_tags.append(f"费率{funding*100:+.3f}%")
-
-            try:
-                kc = get_kline_cache() if KLINE_ENABLED else None
-                if kc:
-                    rsi_v = kc.rsi(sym, period=14, interval="5m")
-                    if 0 < rsi_v < 35:
-                        fb_votes["long"] += 1; fb_tags.append(f"RSI={rsi_v:.0f}超卖")
-                    elif rsi_v > 65:
-                        fb_votes["short"] += 1; fb_tags.append(f"RSI={rsi_v:.0f}超买")
-            except Exception: pass
-
-            if MULTI_ENABLED:
-                try:
-                    feed_m = get_multi_feed()
-                    if feed_m:
-                        ms = feed_m.direction_signal(sym)
-                        if ms['divergence'] <= 0.5 and ms['bias'] != 'neutral':
-                            fb_votes[ms['bias']] += 1; fb_tags.append(f"多所→{ms['bias']}")
-                except Exception: pass
-
-            try:
-                kc = get_kline_cache() if KLINE_ENABLED else None
-                if kc:
-                    a = kc.adx(sym, period=14, interval="1m")
-                    t = kc.ma_trend(sym, fast=9, slow=21, interval="1m")
-                    if a > 20 and t in ("up", "down"):
-                        d2 = "long" if t == "up" else "short"
-                        fb_votes[d2] += 1; fb_tags.append(f"ADX={a:.0f}趋势{t}")
-            except Exception: pass
-
-            mv = cfg.get("min_volume", 500000)
-            mc = cfg.get("min_change", 1.5)
-            if vol > mv * 2 and abs(change) > mc * 2:
-                d3 = "long" if change > 0 else "short"
-                fb_votes[d3] += 1; fb_tags.append(f"量价{change:+.1f}%")
-
-            best_dir = max(fb_votes, key=fb_votes.get)
-            best_cnt = fb_votes[best_dir]
-            non_fee = sum(1 for t in fb_tags if not t.startswith("费率"))
-
-            if _is_stable_sym(sym):
-                ok = non_fee >= 1 and best_dir in ("long", "short")
-            else:
-                ok = best_cnt >= 2 and non_fee >= 1 and best_dir in ("long", "short")
-
-            if ok:
-                side = best_dir
-                signal_src = f"多方兜底 {'|'.join(fb_tags)} ✓{best_cnt}"
-
-        if not side:
-            return r
-
-        # ── 多交易所方向确认 ──
-        if MULTI_ENABLED:
-            try:
-                feed_m = get_multi_feed()
-                if feed_m:
-                    sig = feed_m.direction_signal(sym)
-                    if sig['divergence'] > 0.5:
-                        return r  # skip
-                    if sig['bias'] != 'neutral' and sig['bias'] != side:
-                        if ai_use:
-                            if ai_confidence < 70:
-                                return r
-                        elif sig.get('confidence', 0) > 40:
-                            return r
-            except Exception:
-                pass
-
-        # ── 行情方向约束 ──
-        _rc = regime_cache.get(sym, {}).get("cfg", {})
-        _allowed = _rc.get("allowed_dir")
-        if _allowed and _allowed != "both" and side != _allowed:
-            return r  # 趋势不符
-
-        r.side = side
-        r.signal_src = signal_src
-        r.stop_mult = _rc.get("stop_atr_mult", 2.0)
-        r.tp_mult = _rc.get("tp_atr_mult", 3.0)
+        # 无AI信号 = side="" → 跳过
         return r
 
 

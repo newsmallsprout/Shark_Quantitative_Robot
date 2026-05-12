@@ -4,6 +4,7 @@ COPY go.mod go.sum ./
 COPY vendor/ ./vendor/
 COPY *.go ./
 COPY cmd/ ./cmd/
+COPY planning/ ./planning/
 RUN CGO_ENABLED=0 go build -mod=vendor -o shark-rl ./cmd/
 
 FROM alpine:3.20

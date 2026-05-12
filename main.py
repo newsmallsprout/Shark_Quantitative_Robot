@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shark 2.0 — 真实模拟量化交易机器人。手续费、滑点、资金费率、合约最大杠杆全部实盘规格。"""
 
-import asyncio, os, sys, time, json, secrets, uuid, math
+import asyncio, os, sys, time, json, secrets, uuid, math, random
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -91,19 +91,15 @@ except ImportError:
     KLINE_ENABLED = False
 
 # 多交易所价格聚合
-try:
-    from multi_exchange import MultiExchangeFeed, init_multi_feed, get_multi_feed
-    MULTI_ENABLED = True
-except ImportError:
-    MULTI_ENABLED = False
-
 # ═══════════════════════════════════════════════════════════════════════
 # 手续费 / 滑点 / 真实参数
 # ═══════════════════════════════════════════════════════════════════════
 TAKER_FEE = 0.0005        # Gate.io taker 费率 0.05%
 MAKER_FEE = 0.0002        # Gate.io maker 费率 0.02%
 SLIPPAGE_MAX = 0.0003     # 最大滑点 0.03%
-COOLDOWN_SEC = 10         # 同币对冷却 10s
+# 连续止损熔断：第 4 笔止损触发（streak>3）；新开单冷却阶梯；非止损平仓重置档位
+_FUSE_SL_STREAK_LIMIT = 3
+_FUSE_COOLDOWNS_SEC = (60.0, 180.0, 300.0, 86400.0)
 TRADE_INTERVAL = 1        # 交易循环间隔 1s（200ms盘口匹配）
 # TP_PCT = 2.0              # 已废弃：止盈改为 ATR 动态计算
 SL_PCT = -6.0             # 止损 -6%
@@ -198,11 +194,36 @@ class MarketDataFeed:
         if not isinstance(symbols, (list, tuple)):
             symbols = []
         url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        _log.warning(
+                            "MarketDataFeed: tickers HTTP %s, keep previous cache",
+                            resp.status,
+                        )
+                        return
+                    # 部分 CDN/错误页 Content-Type 非 json，仍尝试解析
+                    data = await resp.json(content_type=None)
+        except asyncio.TimeoutError:
+            _log.warning("MarketDataFeed: tickers timeout, keep previous cache")
+            return
+        except aiohttp.ClientError as e:
+            _log.warning("MarketDataFeed: tickers client error %s, keep previous cache", e)
+            return
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            _log.warning("MarketDataFeed: tickers invalid JSON %s, keep previous cache", e)
+            return
+        if not isinstance(data, list):
+            _log.warning(
+                "MarketDataFeed: tickers payload is %s not list, keep previous cache",
+                type(data).__name__,
+            )
+            return
         tickers = {}
         for t in data:
+            if not isinstance(t, dict):
+                continue
             sym = str(t.get("contract","")).replace("_USDT","/USDT")
             if sym in symbols:
                 tickers[sym] = LiveTicker(
@@ -520,6 +541,35 @@ async def trade_history(
     page = list(reversed(trades))[offset:offset + limit]
     return {"trades": page, "total": total, "offset": offset, "limit": limit}
 
+@app.get("/api/plans")
+async def plans_dashboard():
+    """计划看板：直接读取 Redis 中所有 RangePlan + 熔断状态"""
+    pg = _state.get("_plan_gate")
+    fuse_info = None
+    plans = {}
+
+    if pg and pg.is_fused:
+        fuse_info = {
+            "triggered": True,
+            "remaining": pg.fuse_remaining,
+            "reason": pg.fuse_reason,
+        }
+
+    # 直接从 Redis 读取所有计划
+    redis_client = _state.get("_redis_client")
+    if redis_client:
+        try:
+            async for key in redis_client.scan_iter(match="shark:plan:*", count=100):
+                sym = key.replace("shark:plan:", "")
+                raw = await redis_client.get(key)
+                if raw:
+                    plan = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+                    plans[sym] = plan
+        except Exception:
+            pass
+
+    return {"plans": plans, "fuse": fuse_info, "_plan_count": len(plans)}
+
 @app.websocket("/ws")
 async def ws(
     websocket: WebSocket,
@@ -576,6 +626,45 @@ def _ensure_bootstrap_script(html: str) -> str:
         )
     return html
 
+_PLAN_PANEL_SCRIPT = """
+<script>
+(function(){var p;function panel(){
+if(p)return p;p=document.createElement('div');p.id='plan-panel'
+p.style.cssText='position:fixed;bottom:12px;right:12px;z-index:99999;background:rgba(10,10,30,0.92);border:1px solid rgba(0,255,200,0.3);border-radius:10px;padding:10px 14px;font:11px/1.5 monospace;color:#0f8;min-width:220px;max-height:280px;overflow-y:auto;backdrop-filter:blur(8px);'
+document.body.appendChild(p);return p}
+function f(n){return n>0?n.toFixed(0):'--'}
+function ft(n){if(!n)return'';var m=Math.floor(n/60),s=Math.floor(n%60);return m+':'+s.toString().padStart(2,'0')}
+function badge(b){return b==='long'?'<b style=color:#0f0>LONG</b>':b==='short'?'<b style=color:#f44>SHORT</b>':'<span style=color:#888>--</span>'}
+function rsk(lv){return lv>=2?'<span style=color:red>⚠ </span>':lv>=1?'<span style=color:#fa0>⚡</span>':''}
+function render(){
+var pd=panel()
+fetch('/api/plans').then(function(r){return r.json()}).then(function(d){
+var plans=d.plans||{},fuse=d.fuse,ks=Object.keys(plans).sort()
+var h=[]
+if(ks.length===0){h.push('<div style=color:#888>等待 SlowLoop 生成计划...</div>')}
+else{
+var n=Math.min(ks.length,8)
+h.push('<table style=width:100%;border-collapse:collapse>')
+for(var i=0;i<n;i++){var sym=ks[i],p=plans[sym]
+h.push('<tr><td>'+sym.replace('/USDT','')+'</td><td>'+badge(p.bias)+'</td><td>'+f(p.entry_zone_low)+'~'+f(p.entry_zone_high)+'</td><td>'+rsk(p.news_risk_level)+'</td></tr>')
+h.push('<tr><td colspan=4 style=font-size:9px;color:#555>区间 '+f(p.range_low)+'~'+f(p.range_high)+' SL'+f(p.stop_loss)+' '+p.macro_regime+'</td></tr>')}
+if(ks.length>n)h.push('<tr><td colspan=4 style=font-size:9px;color:#555>... 还有'+(ks.length-n)+'个计划</td></tr>')
+h.push('</table>')}
+if(fuse&&fuse.triggered)h.push('<div style=color:red;font-weight:bold;margin-top:4px>⛔ 熔断中 '+ft(fuse.remaining)+' '+fuse.reason+'</div>')
+else h.push('<div style=font-size:9px;color:#555;margin-top:4px>'+ks.length+'个计划 · 无熔断</div>')
+pd.innerHTML='<div style=font-weight:bold;color:#0ff;margin-bottom:4px>📊 RangePlan</div>'+h.join('')
+}).catch(function(e){panel().innerHTML='<div style=color:#f44>📊 Plan API 错误</div>'})}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){render();setInterval(render,5000)})
+else{render();setInterval(render,5000)}
+})()
+</script>"""
+
+def _inject_plan_panel(html: str) -> str:
+    """注入计划看板浮动面板（右下角）"""
+    if "</body>" in html:
+        return html.replace("</body>", _PLAN_PANEL_SCRIPT + "\n</body>", 1)
+    return html + _PLAN_PANEL_SCRIPT
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -583,6 +672,7 @@ async def index():
     if react_index.exists():
         html = react_index.read_text()
         html = _ensure_bootstrap_script(html)
+        html = _inject_plan_panel(html)
         return HTMLResponse(html)
     return HTMLResponse(DASHBOARD)
 # Mount React static assets if available
@@ -716,11 +806,12 @@ class StrategyRunner:
         self.wins = 0            # 盈利平仓次数
         self.total_fees = 0.0
         self.total_slippage = 0.0
-        self._cooldowns: Dict[str, float] = {}
+        self._fuse_sl_streak: Dict[str, int] = {}      # 单币对连续止损笔数
+        self._fuse_escalation: Dict[str, int] = {}    # 熔断档位 0..3，非止损平掉后清零
+        self._fuse_block_until: Dict[str, float] = {}  # 该币对禁止新开仓直到该时间戳
         self._log: List[str] = []
         self._trade_history: List[dict] = []
         self._contract_specs: Dict[str, ContractSpec] = {}
-        self._ai_cooldowns: Dict[str, float] = {}
         self._oscillator = OscillationDetector() if OSC_ENABLED else None
         self._osc_avg_count: Dict[str, int] = {}  # 每币对补仓次数
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
@@ -741,6 +832,7 @@ class StrategyRunner:
         self._evo_skip_alts = False         # 进化暂停山寨
         self._evo_cooldown_bonus = 0        # 进化额外冷却
         self._persistence = persistence
+        self._plan_gate = None  # FastLoop 门禁，由 main() 注入
 
     def switch_mode(self, mode: str) -> dict:
         """运行时切换 paper/live 模式，重新初始化实盘引擎"""
@@ -835,33 +927,21 @@ class StrategyRunner:
                 adj = result.get("adjustments", {})
                 if adj:
                     msg = self._reflector.apply_ai_adjustments(adj)
-                    cause = result.get("root_cause", "")
-                    confidence = result.get("confidence", 0)
-                    dims = result.get("dimensions", [])
-                    next_act = result.get("next_action", "")
-                    print(f"[AI反思] {sym} 根因: {cause} (置信{confidence}%)", flush=True)
-                    for d in dims:
-                        print(f"  → {d}", flush=True)
                     if msg:
                         print(f"[AI调整] {msg}", flush=True)
-                    if next_act:
-                        print(f"[AI建议] {next_act}", flush=True)
                     self._reflector.ai_insights.append({
-                        "sym": sym, "ts": time.time(), "cause": cause,
-                        "adjustments": adj, "confidence": confidence,
+                        "sym": sym, "ts": time.time(),
+                        "cause": result.get("root_cause", ""),
+                        "adjustments": adj,
+                        "confidence": result.get("confidence", 0),
                     })
         except Exception as e:
             print(f"[AI反思] 调用失败: {e}", flush=True)
 
     async def _fetch_ai_plan(self, sym: str, px: float, funding: float,
                              change: float, vol: float):
-        """异步获取AI多层仓位计划（限流：每币对5分钟一次）"""
+        """异步获取AI多层仓位计划（无限流；由上游信号与熔断控制开仓）"""
         now = time.time()
-        last_ai = self._ai_cooldowns.get(sym, 0)
-        if now - last_ai < 300:  # 5分钟冷却
-            return
-        self._ai_cooldowns[sym] = now
-        
         try:
             plan = await get_ai_targets(sym, px, funding, change, vol)
             if plan and plan.get("targets"):
@@ -1061,6 +1141,31 @@ class StrategyRunner:
         net = gross - est
         return net >= max(0.05, 0.25 * est)
 
+    def _apply_stop_loss_fuse(self, sym: str, reason: str) -> None:
+        """单币对：连续止损次数 > _FUSE_SL_STREAK_LIMIT 后阶梯禁止新开（60s→180s→300s→24h）；非止损平仓重置连亏与档位。"""
+        r = str(reason)
+        is_sl = "止损" in r and "止盈" not in r
+        now = time.time()
+        n_tiers = len(_FUSE_COOLDOWNS_SEC)
+        if is_sl:
+            st = self._fuse_sl_streak.get(sym, 0) + 1
+            self._fuse_sl_streak[sym] = st
+            if st > _FUSE_SL_STREAK_LIMIT:
+                tier = min(self._fuse_escalation.get(sym, 0), n_tiers - 1)
+                dur = _FUSE_COOLDOWNS_SEC[tier]
+                self._fuse_block_until[sym] = now + dur
+                self._fuse_escalation[sym] = min(tier + 1, n_tiers - 1)
+                self._fuse_sl_streak[sym] = 0
+                dlab = f"{dur/3600:.0f}h" if dur >= 3600 else f"{int(dur)}s"
+                print(
+                    f"[熔断] {sym} 连续止损>{_FUSE_SL_STREAK_LIMIT}次 → {dlab} 内禁止新开 "
+                    f"(阶梯 {tier + 1}/{n_tiers})",
+                    flush=True,
+                )
+        else:
+            self._fuse_sl_streak[sym] = 0
+            self._fuse_escalation[sym] = 0
+
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
                    mark_prices: Dict[str, float] = None):
@@ -1110,8 +1215,17 @@ class StrategyRunner:
                     self._close_position(sym, px, "手动停止(模拟)", 0, prices)
             print("[模拟] 已平掉所有持仓", flush=True)
 
-        # 清理过期冷却
-        self._cooldowns = {k: v for k, v in self._cooldowns.items() if now < v}
+        # 清理已过期的单币对熔断窗口
+        self._fuse_block_until = {k: v for k, v in self._fuse_block_until.items() if now < v}
+
+        # 偶尔飙句骚话调节气氛（5%概率/tick，不在交易时触发）
+        if len(self.positions) == 0 and random.random() < 0.05:
+            speech = pop_line("boring")
+            if speech:
+                _state["character_event"] = {
+                    "Event_Type": "闲聊", "Speech_Text": speech,
+                    "Facial_Expression": "idle", "Emotion_Index": 5,
+                }
 
         # ── 实盘安全 + 持仓同步 ──
         if self._live and self._live.active:
@@ -1425,6 +1539,14 @@ class StrategyRunner:
         if not _is_live_mode and not self._paper_trading_enabled:
             self._update_state(prices)
             return  # 模拟盘模式但开关关闭，不交易
+
+        # ── Fuse 熔断检查（1分钟波动>3% → PAUSED 5分钟）──
+        if self._plan_gate:
+            fuse_reason = self._plan_gate.check_fuse(prices)
+            if fuse_reason:
+                self._update_state(prices)
+                return  # 熔断中，跳过本tick
+
         # ── 启动预热：等K线+行情就绪后再开仓（持仓管理不受影响）──
         _can_open = True
         if not self._warmup_done:
@@ -1438,7 +1560,8 @@ class StrategyRunner:
                 _can_open = False  # 跳过开仓，但持仓管理继续
         scored = []
         for sym in prices:
-            if sym in self._cooldowns: continue
+            if now < self._fuse_block_until.get(sym, 0):
+                continue
             if sym in self.positions: continue
 
             vol = volumes.get(sym, 0)
@@ -1471,8 +1594,6 @@ class StrategyRunner:
         for psym, _, _, _ in scored[:35]:
             if len(prefetch_tasks) >= 4:
                 break
-            if now - self._ai_cooldowns.get(psym, 0) < 300:
-                continue
             prefetch_tasks.append(
                 self._fetch_ai_plan(psym, prices[psym],
                                     funding_rates.get(psym, 0),
@@ -1607,6 +1728,12 @@ class StrategyRunner:
             _rv = _regime.value if _regime else "unknown"
             entry_price = self._strategic_entry(sym, side, entry_price, _rv)
 
+            # ── FastLoop 计划门禁：无计划/走廊外/熔断/方向不匹配 → 禁止开仓 ──
+            if self._plan_gate:
+                can, reason = self._plan_gate.can_open(sym, side, entry_price)
+                if not can:
+                    continue
+
             # ── 统一下单通道 → Redis → Go 执行器 ──
             _live_oid = None
             _is_live = self._live and self._live.active
@@ -1652,7 +1779,6 @@ class StrategyRunner:
                     entry_price=entry_price, leverage=lev, margin=margin,
                     order_id=str(uuid.uuid4()), opened_at=now,
                 )
-            self._cooldowns[sym] = now + COOLDOWN_SEC + float(self._evo_cooldown_bonus or 0)
             self.trades += 1
             total_margin += margin
 
@@ -1901,9 +2027,7 @@ class StrategyRunner:
         _state["character_event"] = ev_close
         _schedule_loli_speech(ev_close)
 
-        # 平仓后冷却，避免立即重开（止损更长）；进化 cooldown_bonus 叠加
-        cooldown_sec = (120 if reason == "止损" else 30) + float(self._evo_cooldown_bonus or 0)
-        self._cooldowns[sym] = time.time() + cooldown_sec
+        self._apply_stop_loss_fuse(sym, reason)
 
     def _recalc_equity(self, prices):
         locked = sum(p["margin"] for p in self.positions.values())
@@ -2015,7 +2139,8 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
                 for sym, px in prices.items()
             }
         except Exception as e:
-            print(f"[价格推送错误] {e}", flush=True)
+            detail = str(e).strip() or repr(e)
+            print(f"[价格推送错误] {type(e).__name__}: {detail}", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -2107,6 +2232,15 @@ async def main():
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
     runner = StrategyRunner(initial_balance=200.0, persistence=_storage_bridge)
+    # FastLoop 门禁注入
+    if redis_client:
+        from execution.plan_gate import PlanGate
+        # PlanGate 需要 sync Redis 客户端（async 客户端在同步上下文中不可用）
+        import redis as sync_redis
+        sync_rdb = sync_redis.from_url(redis_url or "redis://redis:6379/0", decode_responses=True)
+        runner._plan_gate = PlanGate(sync_rdb)
+        _state["_plan_gate"] = runner._plan_gate
+        _state["_redis_client"] = redis_client  # 供 Plans API 直接读取（async）
     _state["initial_capital"] = runner._initial_capital
     _state["free_cash"] = runner.balance
     _state["balance"] = runner.balance
@@ -2129,24 +2263,6 @@ async def main():
     _live_state = "关闭" if not _state.get("live_trading") else "开启"
     print(f"📋 当前模式: {_shark_mode} | 模拟盘: {_paper_state} | 实盘: {_live_state}", flush=True)
     print(f"💡 提示: 前端点击「开始交易」后才开仓", flush=True)
-    
-    # 多交易所价格聚合
-    multi_feed_task = None
-    if MULTI_ENABLED:
-        from multi_exchange import init_multi_feed, get_multi_feed
-        
-        async def multi_loop():
-            feed_m = get_multi_feed()
-            while True:
-                try:
-                    await feed_m.refresh()
-                except Exception as e:
-                    _log.debug("multi_feed refresh: %s", e)
-                await asyncio.sleep(5)
-        
-        await init_multi_feed()
-        multi_feed_task = asyncio.create_task(multi_loop())
-        print("[多交易所] 价格聚合已启动 (Binance/Bybit/OKX/Gate)", flush=True)
     
     async def hydrate_evo_pending_from_redis() -> None:
         """进程重启后从 LPUSH 列表恢复待审批项（missed pub/sub）。LRANGE 0.. 为最新优先，反向合并使同 type 保留最新。"""
@@ -2213,7 +2329,6 @@ async def main():
                     mode = "live" if (runner._live and runner._live.active) else "paper"
                     cmd = json.dumps({"symbol": sym, "side": side, "action": "open", "mode": mode, "source": "rl-agent"})
                     await redis_client.publish("shark:orders:new", cmd)
-                    print(f"[RL动作] {sym} {side.upper()} ({mode})", flush=True)
             except Exception as e:
                 _log.debug("rl_action_subscriber: %s", e)
 
