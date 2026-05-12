@@ -1,4 +1,4 @@
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, type Plugin } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -79,6 +79,12 @@ function webVideoDirPlugin(): Plugin {
 
 export default defineConfig({
   plugins: [react(), webVideoDirPlugin()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    globals: false,
+    passWithNoTests: true,
+  },
   build: {
     target: 'es2020',
     minify: 'esbuild',
