@@ -632,7 +632,7 @@ _PLAN_PANEL_SCRIPT = """
 if(p)return p;p=document.createElement('div');p.id='plan-panel'
 p.style.cssText='position:fixed;bottom:12px;right:12px;z-index:99999;background:rgba(10,10,30,0.92);border:1px solid rgba(0,255,200,0.3);border-radius:10px;padding:10px 14px;font:11px/1.5 monospace;color:#0f8;min-width:220px;max-height:280px;overflow-y:auto;backdrop-filter:blur(8px);'
 document.body.appendChild(p);return p}
-function f(n){return n>0?n.toFixed(0):'--'}
+function f(n){var x=Number(n);if(!Number.isFinite(x))return '--';var ax=Math.abs(x);if(ax===0)return '0';if(ax>=1000)return x.toFixed(1);if(ax>=1)return x.toFixed(4);if(ax>=0.01)return x.toFixed(6);return x.toFixed(8)}
 function ft(n){if(!n)return'';var m=Math.floor(n/60),s=Math.floor(n%60);return m+':'+s.toString().padStart(2,'0')}
 function badge(b){return b==='long'?'<b style=color:#0f0>LONG</b>':b==='short'?'<b style=color:#f44>SHORT</b>':'<span style=color:#888>--</span>'}
 function rsk(lv){return lv>=2?'<span style=color:red>⚠ </span>':lv>=1?'<span style=color:#fa0>⚡</span>':''}
