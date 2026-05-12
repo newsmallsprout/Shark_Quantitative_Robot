@@ -3,8 +3,7 @@ import type { Position } from '../store/useStore'
 export default function PositionsTable({ positions }: { positions: Position[] }) {
   if (!positions.length) {
     return (
-      <div className="empty-state">
-        <div className="empty-icon">📊</div>
+      <div className="empty-state empty-state--pro">
         <div className="empty-text">暂无持仓 — 等待交易信号</div>
       </div>
     )

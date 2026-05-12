@@ -271,7 +271,7 @@ export default function App() {
     window.addEventListener('resize', resize)
 
     // Create stars
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 48; i++) {
       stars.push({
         x: Math.random() * canvas.width,
         y: Math.random() * canvas.height,
@@ -291,7 +291,7 @@ export default function App() {
         ctx!.beginPath()
         ctx!.arc(s.x, s.y, s.r, 0, Math.PI * 2)
         ctx!.fillStyle = s.c
-        ctx!.globalAlpha = Math.max(0.1, s.o)
+        ctx!.globalAlpha = Math.max(0.06, s.o)
         ctx!.fill()
       }
       ctx!.globalAlpha = 1
@@ -469,7 +469,7 @@ export default function App() {
       <div className="shark-confirm-overlay" role="presentation" onClick={(e) => { if (e.target === e.currentTarget) setShowEvoPanel(false) }}>
         <div className="shark-confirm-panel" role="dialog" aria-modal="true" style={{ maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
           <div className="shark-confirm-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>🧬 自进化审批</span>
+            <span>自进化审批</span>
             <button onClick={() => setShowEvoPanel(false)} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 16 }}>✕</button>
           </div>
           <div className="shark-confirm-body" style={{ maxHeight: 360, overflowY: 'auto' }}>
@@ -512,8 +512,16 @@ export default function App() {
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* 顶栏 */}
       <div className="topbar">
-        <div className="topbar-brand">
-          <span className="accent">🦈 Shark 2.0</span>
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4 }}>
+          <div className="topbar-brand">
+            <span className="accent">Shark 2.0</span>
+          </div>
+          <nav className="topbar-section-links" aria-label="段落跳转">
+            <a href="#section-kpi">KPI</a>
+            <a href="#section-room">舱室</a>
+            <a href="#section-positions">持仓</a>
+            <a href="#section-history">历史</a>
+          </nav>
         </div>
         <div className="topbar-right">
           <div className="topbar-controls-trading">
@@ -554,7 +562,7 @@ export default function App() {
                   fontFamily: 'var(--font-display)',
                 }}
               >
-                🧬 {status.evo_pending!.length}
+                进化 {status.evo_pending!.length}
               </button>
             )}
             <span className={`status-dot ${status.safety_blocked ? 'blocked' : connected ? 'live' : 'disconnected'}`} />
@@ -568,25 +576,23 @@ export default function App() {
 
       {/* 主内容 */}
       <div style={{ flex: 1, padding: '16px 20px', maxWidth: '1440px', margin: '0 auto', width: '100%' }}>
-        {/* KPI 面板 */}
-        <Dashboard
-          equity={status.equity}
-          balance={status.balance}
-          freeCash={status.free_cash}
-          realizedPnl={status.realized_pnl}
-          winRate={status.win_rate}
-          positions={status.positions}
-          equityChange={equityChange}
-          safetyBlocked={status.safety_blocked}
-          totalFees={status.total_fees}
-          marginLocked={status.margin_locked}
-        />
+        <div id="section-kpi">
+          <Dashboard
+            equity={status.equity}
+            balance={status.balance}
+            freeCash={status.free_cash}
+            realizedPnl={status.realized_pnl}
+            winRate={status.win_rate}
+            positions={status.positions}
+            equityChange={equityChange}
+            safetyBlocked={status.safety_blocked}
+            totalFees={status.total_fees}
+            marginLocked={status.margin_locked}
+          />
+        </div>
 
-        {/* 宠物舱 + 风控 */}
-        <div style={{
-          display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '10px', marginTop: '10px',
-        }}>
-          <div className="card">
+        <div className="layout-room-risk" id="section-room">
+          <div className="layout-room-risk__room card">
             <div className="card-header">shark 领域</div>
             <div
               className="card-body"
@@ -602,7 +608,7 @@ export default function App() {
               <LoliRoom />
             </div>
           </div>
-          <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
+          <div className="layout-room-risk__risk card" style={{ display: 'flex', flexDirection: 'column' }}>
             <div className="card-header">风控状态</div>
             <div className="card-body" style={{ flex: 1 }}>
               <SafetyPanel
@@ -615,8 +621,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* 持仓 */}
-        <div className="card" style={{ marginTop: '10px' }}>
+        <div className="card" style={{ marginTop: '10px' }} id="section-positions">
           <div className="card-header">
             <span>当前持仓 ({status.position_list?.length || 0})</span>
           </div>
@@ -625,8 +630,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* 交易历史 */}
-        <div className="card" style={{ marginTop: '10px' }}>
+        <div className="card" style={{ marginTop: '10px' }} id="section-history">
           <div className="card-header">
             <span>交易记录 ({status.trade_history?.length || 0})</span>
           </div>

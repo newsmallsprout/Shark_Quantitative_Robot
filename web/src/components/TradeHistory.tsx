@@ -28,8 +28,7 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
 
   if (!trades || !trades.length) {
     return (
-      <div className="empty-state">
-        <div className="empty-icon">📋</div>
+      <div className="empty-state empty-state--pro">
         <div className="empty-text">暂无交易记录</div>
       </div>
     )

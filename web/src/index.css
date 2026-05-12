@@ -326,7 +326,22 @@ body::before {
 }
 .topbar-brand .accent {
   color: var(--accent-cyan);
-  text-shadow: 0 0 10px rgba(0,240,255,0.5);
+  text-shadow: none;
+}
+.topbar-section-links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: 8px;
+  font-size: 10px;
+  font-family: var(--font-display);
+}
+.topbar-section-links a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.topbar-section-links a:hover {
+  color: var(--text-secondary);
 }
 .topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .topbar-controls-trading {
@@ -465,12 +480,45 @@ body::before {
   background: rgba(0, 240, 255, 0.06);
 }
 
+.layout-room-risk {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 10px;
+  align-items: stretch;
+  margin-top: 10px;
+}
+
+.layout-room-risk__room,
+.layout-room-risk__risk {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .layout-room-risk {
+    grid-template-columns: 1fr;
+  }
+  .layout-room-risk__risk {
+    order: -1;
+  }
+  .layout-room-risk__room {
+    order: 1;
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════
    EMPTY STATE
    ═══════════════════════════════════════════════════════════ */
 .empty-state { padding: 40px 20px; text-align: center; color: var(--text-muted); }
 .empty-state .empty-icon { font-size: 32px; margin-bottom: 8px; opacity: 0.4; }
 .empty-state .empty-text { font-size: 12px; font-family: var(--font-mono); }
+.empty-state.empty-state--pro .empty-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-family: inherit;
+}
+.empty-state.empty-state--pro {
+  padding: 32px 16px;
+}
 
 /* ═══════════════════════════════════════════════════════════
    SHARK AVATAR — 虚拟角色
