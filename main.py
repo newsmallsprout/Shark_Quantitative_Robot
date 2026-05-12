@@ -53,6 +53,9 @@ try:
 except ImportError:
     AI_ENABLED = False
 
+# 开仓方向：plan = 仅 Redis RangePlan（默认，与 SlowLoop 一致）；ai = DeepSeek 预取缓存
+SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
+
 # 导入AI仓位管理
 try:
     from ai_position import AIPositionManager
@@ -943,8 +946,9 @@ class StrategyRunner:
         """异步获取AI多层仓位计划（无限流；由上游信号与熔断控制开仓）"""
         now = time.time()
         try:
-            plan = await get_ai_targets(sym, px, funding, change, vol)
-            if plan and plan.get("targets"):
+            pack = await get_ai_targets(sym, px, change, vol, funding)
+            plan = pack[0] if isinstance(pack, (list, tuple)) and pack else None
+            if isinstance(plan, dict) and plan.get("targets"):
                 # 存入信号缓存（开仓前用）
                 self._ai_signal_cache[sym] = {"plan": plan, "ts": now}
                 if sym in self.positions:
@@ -1590,17 +1594,19 @@ class StrategyRunner:
         scored = scored_stable + scored_alt
 
         # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
-        prefetch_tasks = []
-        for psym, _, _, _ in scored[:35]:
-            if len(prefetch_tasks) >= 4:
-                break
-            prefetch_tasks.append(
-                self._fetch_ai_plan(psym, prices[psym],
-                                    funding_rates.get(psym, 0),
-                                    changes.get(psym, 0),
-                                    volumes.get(psym, 0)))
-        if prefetch_tasks:
-            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+        # 仅 ai 模式预取 LLM；plan 模式由 SignalEngine 读 RangePlan，避免每 tick 打爆 DeepSeek
+        if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
+            prefetch_tasks = []
+            for psym, _, _, _ in scored[:35]:
+                if len(prefetch_tasks) >= 4:
+                    break
+                prefetch_tasks.append(
+                    self._fetch_ai_plan(psym, prices[psym],
+                                        funding_rates.get(psym, 0),
+                                        changes.get(psym, 0),
+                                        volumes.get(psym, 0)))
+            if prefetch_tasks:
+                await asyncio.gather(*prefetch_tasks, return_exceptions=True)
 
         opened = 0
         for sym, score, vol, chg_abs in scored:
@@ -1768,8 +1774,9 @@ class StrategyRunner:
             }
             
             # AI分析（异步，不阻塞开仓）
-            if AI_ENABLED:
-                asyncio.create_task(self._fetch_ai_plan(sym, px, funding_rates.get(sym, 0),
+            if AI_ENABLED and SHARK_SIGNAL_SOURCE == "ai":
+                asyncio.create_task(self._fetch_ai_plan(sym, px,
+                                        funding_rates.get(sym, 0),
                                         changes.get(sym, 0), vol))
 
             # 实盘记录

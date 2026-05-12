@@ -1,10 +1,9 @@
 """
-Signal Engine — 方向信号决策层（v2 纯AI版）
-从 tick() 抽取，只负责 AI 委员会信号判定。
-已移除所有兜底逻辑（费率/RSI/多交易所/ADX/量价投票）。
-无AI信号 = 跳过开仓。FastLoop 门禁由 PlanGate 负责。
+Signal Engine — 方向来自 RangePlan（默认）或 AI 委员会缓存。
+无兜底量价投票。PlanGate 负责入场带/熔断。
 """
 
+import os
 from typing import Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -21,16 +20,33 @@ class SignalResult:
 
 
 class SignalEngine:
-    """方向信号决策引擎：纯AI委员会"""
+    """方向：SHARK_SIGNAL_SOURCE=plan 读 Redis；=ai 读 _ai_signal_cache。"""
 
     def decide(self, runner, sym: str, px: float, funding: float,
                change: float, vol: float, cfg: dict, now: float,
                regime_cache: dict, _regime) -> SignalResult:
         """
         判定开仓方向，返回 SignalResult。
-        无AI信号时返回 side="" — 上游 PlanGate 决定是否放行。
+        SHARK_SIGNAL_SOURCE=plan：只认 Redis RangePlan.bias，不调 LLM。
+        SHARK_SIGNAL_SOURCE=ai：依赖 _ai_signal_cache（DeepSeek 等预取）。
+        无有效信号时 side=""。PlanGate 再做过期/入场带/方向二次校验。
         """
         r = SignalResult()
+        src = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
+
+        if src == "plan" and getattr(runner, "_plan_gate", None):
+            pl = runner._plan_gate.get_plan(sym)
+            if pl:
+                b = (pl.get("bias") or "").lower()
+                expired = pl.get("valid_until", 0) < now
+                paused = pl.get("state") == "PAUSED" or pl.get("news_risk_level", 0) >= 2
+                if not expired and not paused and b in ("long", "short"):
+                    r.side = b
+                    r.signal_src = "RangePlan"
+                    r.ai_confidence = 50
+                    r.ai_use = False
+                    return r
+            return r
 
         # ── AI 信号缓存 ──
         ai_cache = runner._ai_signal_cache.get(sym)

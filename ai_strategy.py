@@ -27,6 +27,12 @@ _qwen_exhausted = set()
 _last_slack_alert = 0.0
 
 FULL_MODE = os.environ.get("AI_COMMITTEE_FULL", "0") == "1"
+
+
+def _ai_committee_verbose() -> bool:
+    return os.environ.get("AI_COMMITTEE_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+
+
 TOK_DEEPSEEK = 1536 if FULL_MODE else 900
 TOK_QWEN = 800 if FULL_MODE else 380
 TOK_DOUBAO = 600 if FULL_MODE else 280
@@ -75,7 +81,8 @@ async def _call_llm(url, key, model, system, prompt, max_tokens, json_mode=True,
                         async with aiohttp.ClientSession() as s:
                             await s.post(wh, json={"text":"Qwen全部模型额度耗尽"})
                 except: pass
-            print(f"[AI委] {label} Qwen全部耗尽", flush=True)
+            if _ai_committee_verbose():
+                print(f"[AI委] {label} Qwen全部耗尽", flush=True)
             return None, 0, 0
 
     payload = {"model":actual_model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":temperature,"max_tokens":max_tokens}
@@ -111,7 +118,8 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
     
     ds_dir = (ds_result.get("direction") or "").upper()
     ds_conf = ds_result.get("confidence", 0)
-    print(f"[AI委] {symbol} DeepSeek dir={ds_dir} conf={ds_conf}", flush=True)
+    if _ai_committee_verbose():
+        print(f"[AI委] {symbol} DeepSeek dir={ds_dir} conf={ds_conf}", flush=True)
     
     if ds_dir == "HOLD" or ds_conf < 35:
         return None, ds_in+ds_out, "hold", {}
@@ -121,11 +129,13 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
         qw_result, qw_in, qw_out = await _call_llm(QWEN_URL, QWEN_KEY, "qwen-max", SYSTEM_REVIEW, f"{symbol} {analysis_prompt}\n计划:{json.dumps(ds_result,ensure_ascii=False)}", TOK_QWEN, label=f"{symbol} QW", timeout=20)
         if qw_result and qw_result.get("approved"):
             vote_score += 1.0
-            print(f"[AI委] {symbol} Qwen approved", flush=True)
+            if _ai_committee_verbose():
+                print(f"[AI委] {symbol} Qwen approved", flush=True)
     
     if VOLC_KEY:
         db_result, db_in, db_out = await _call_llm(VOLC_URL, VOLC_KEY, "doubao-1-5-lite-32k-250115", SYSTEM_SENTIMENT, f"{symbol} {analysis_prompt}", TOK_DOUBAO, json_mode=False, label=f"{symbol} DB", timeout=15)
         if db_result:
-            print(f"[AI委] {symbol} 豆包 sentiment={db_result.get('sentiment')}", flush=True)
+            if _ai_committee_verbose():
+                print(f"[AI委] {symbol} 豆包 sentiment={db_result.get('sentiment')}", flush=True)
     
     return ds_result, ds_in+ds_out, "ai_committee", {"vote": vote_score, "conf": ds_conf}
