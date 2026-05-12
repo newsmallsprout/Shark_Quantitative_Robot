@@ -174,6 +174,71 @@ body::before {
 .flash-down { animation: flash-down 0.5s ease-out; }
 
 /* ═══════════════════════════════════════════════════════════
+   KPI TABLE — Pro Desk strip
+   ═══════════════════════════════════════════════════════════ */
+.kpi-strip-scroll {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  background: rgba(15, 22, 40, 0.45);
+  border: 1px solid rgba(0, 240, 255, 0.06);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+}
+
+.kpi-table-desk {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.kpi-table-desk thead th {
+  text-align: right;
+  padding: 6px 8px 4px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: none;
+  border-bottom: 1px solid rgba(0, 240, 255, 0.06);
+  letter-spacing: 0.02em;
+}
+
+.kpi-table-desk thead th:first-child {
+  text-align: left;
+}
+
+.kpi-table-desk tbody td {
+  text-align: right;
+  padding: 8px 8px 10px;
+  border-bottom: 1px solid rgba(0, 240, 255, 0.06);
+  font-variant-numeric: tabular-nums;
+  vertical-align: top;
+}
+
+.kpi-table-desk tbody td:first-child {
+  text-align: left;
+}
+
+.kpi-table-value {
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.kpi-table-sub {
+  font-size: 10px;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 900px) {
+  .kpi-table-desk {
+    min-width: 640px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
    TABLE
    ═══════════════════════════════════════════════════════════ */
 .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }

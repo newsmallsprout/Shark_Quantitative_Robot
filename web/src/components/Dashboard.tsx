@@ -13,79 +13,112 @@ function useFlashRef(value: number) {
     if (!ref.current) return
     const el = ref.current
     if (value > prev.current) {
-      el.classList.remove('flash-up'); void el.offsetWidth; el.classList.add('flash-up')
+      el.classList.remove('flash-down')
+      void el.offsetWidth
+      el.classList.add('flash-up')
     } else if (value < prev.current) {
-      el.classList.remove('flash-down'); void el.offsetWidth; el.classList.add('flash-down')
+      el.classList.remove('flash-up')
+      void el.offsetWidth
+      el.classList.add('flash-down')
     }
     prev.current = value
   }, [value])
   return ref
 }
 
-function KpiCard({ label, value, sub, cls }: { label: string; value: string; sub?: string; cls: string }) {
-  const flashRef = useFlashRef(parseFloat(value.replace(/[^0-9.-]/g, '')) || 0)
-  return (
-    <div className="kpi">
-      <div className="kpi-label">{label}</div>
-      <div ref={flashRef} className={`kpi-value ${cls}`}>{value}</div>
-      {sub && <div className="kpi-sub" style={{ color: 'var(--text-muted)' }}>{sub}</div>}
-    </div>
-  )
-}
+export default function Dashboard({
+  equity,
+  balance,
+  freeCash,
+  realizedPnl,
+  winRate,
+  positions,
+  equityChange,
+  safetyBlocked,
+  totalFees,
+  marginLocked,
+}: Props) {
+  const refEq = useFlashRef(equity)
+  const refBal = useFlashRef(balance)
+  const refMargin = useFlashRef(marginLocked)
+  const refFree = useFlashRef(freeCash)
+  const refReal = useFlashRef(realizedPnl)
+  const refWin = useFlashRef(winRate)
+  const refPos = useFlashRef(positions)
+  const refSafe = useFlashRef(safetyBlocked ? 1 : 0)
+  const refFees = useFlashRef(totalFees)
 
-export default function Dashboard({ equity, balance, freeCash, realizedPnl, winRate, positions, equityChange, safetyBlocked, totalFees, marginLocked }: Props) {
+  const equityCls = equity >= 100 ? 'pnl-up' : 'pnl-down'
+
   return (
-    <div style={{
-      display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
-      gap: '8px',
-    }}>
-      <KpiCard
-        label="总权益"
-        value={`$${equity.toFixed(2)}`}
-        sub={`${equityChange >= 0 ? '+' : ''}${equityChange.toFixed(2)} USDT`}
-        cls={equity >= 100 ? 'pnl-up' : 'pnl-down'}
-      />
-      <KpiCard
-        label="余额"
-        value={`$${balance.toFixed(2)}`}
-        cls="pnl-neutral"
-      />
-      <KpiCard
-        label="锁定保证金"
-        value={`$${marginLocked.toFixed(2)}`}
-        cls="pnl-neutral"
-      />
-      <KpiCard
-        label="可用"
-        value={`$${freeCash.toFixed(2)}`}
-        cls={freeCash > 0 ? 'pnl-up' : 'pnl-down'}
-      />
-      <KpiCard
-        label="已实现盈亏"
-        value={`${realizedPnl >= 0 ? '+' : ''}${realizedPnl.toFixed(4)}`}
-        cls={realizedPnl >= 0 ? 'pnl-up' : 'pnl-down'}
-      />
-      <KpiCard
-        label="胜率"
-        value={`${(winRate * 100).toFixed(1)}%`}
-        cls={winRate >= 0.5 ? 'pnl-up' : 'pnl-down'}
-      />
-      <KpiCard
-        label="持仓数"
-        value={`${positions}`}
-        cls="pnl-neutral"
-      />
-      <KpiCard
-        label="风控"
-        value={safetyBlocked ? '熔断' : '正常'}
-        cls={safetyBlocked ? 'pnl-down' : 'pnl-up'}
-      />
-      <KpiCard
-        label="累计手续费"
-        value={`$${totalFees.toFixed(4)}`}
-        cls="pnl-neutral"
-      />
+    <div className="kpi-strip-scroll">
+      <table className="kpi-table-desk" aria-label="KPI overview">
+        <thead>
+          <tr>
+            <th scope="col">总权益</th>
+            <th scope="col">余额</th>
+            <th scope="col">锁定保证金</th>
+            <th scope="col">可用</th>
+            <th scope="col">已实现盈亏</th>
+            <th scope="col">胜率</th>
+            <th scope="col">持仓数</th>
+            <th scope="col">风控</th>
+            <th scope="col">累计手续费</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>
+              <div ref={refEq} className={`kpi-table-value ${equityCls}`}>
+                ${equity.toFixed(2)}
+              </div>
+              <div className="kpi-table-sub" style={{ color: 'var(--text-muted)' }}>
+                {equityChange >= 0 ? '+' : ''}
+                {equityChange.toFixed(2)} USDT
+              </div>
+            </td>
+            <td>
+              <div ref={refBal} className="kpi-table-value pnl-neutral">
+                ${balance.toFixed(2)}
+              </div>
+            </td>
+            <td>
+              <div ref={refMargin} className="kpi-table-value pnl-neutral">
+                ${marginLocked.toFixed(2)}
+              </div>
+            </td>
+            <td>
+              <div ref={refFree} className={`kpi-table-value ${freeCash > 0 ? 'pnl-up' : 'pnl-down'}`}>
+                ${freeCash.toFixed(2)}
+              </div>
+            </td>
+            <td>
+              <div ref={refReal} className={realizedPnl >= 0 ? 'kpi-table-value pnl-up' : 'kpi-table-value pnl-down'}>
+                {realizedPnl >= 0 ? '+' : ''}
+                {realizedPnl.toFixed(4)}
+              </div>
+            </td>
+            <td>
+              <div ref={refWin} className={winRate >= 0.5 ? 'kpi-table-value pnl-up' : 'kpi-table-value pnl-down'}>
+                {(winRate * 100).toFixed(1)}%
+              </div>
+            </td>
+            <td>
+              <div ref={refPos} className="kpi-table-value pnl-neutral">{positions}</div>
+            </td>
+            <td>
+              <div ref={refSafe} className={safetyBlocked ? 'kpi-table-value pnl-down' : 'kpi-table-value pnl-up'}>
+                {safetyBlocked ? '熔断' : '正常'}
+              </div>
+            </td>
+            <td>
+              <div ref={refFees} className="kpi-table-value pnl-neutral">
+                ${totalFees.toFixed(4)}
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   )
 }
