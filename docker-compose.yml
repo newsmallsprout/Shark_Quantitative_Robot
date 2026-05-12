@@ -53,6 +53,49 @@ services:
       timeout: 5s
       retries: 3
 
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    container_name: shark-executor
+    env_file:
+      - .env
+    environment:
+      GATE_API_KEY: ${GATE_API_KEY}
+      GATE_API_SECRET: ${GATE_API_SECRET}
+      SHARK_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  matcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.matcher
+    container_name: shark-matcher
+    environment:
+      SHARK_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  evolver:
+    build:
+      context: ./rl
+      dockerfile: Dockerfile
+    container_name: shark-evolver
+    ports:
+      - "8081:8081"
+    environment:
+      SHARK_REDIS_URL: redis://redis:6379/0
+      RL_HTTP_PORT: "8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   shark_pgdata:
   shark_redis:

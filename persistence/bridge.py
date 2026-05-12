@@ -141,10 +141,12 @@ class PersistenceBridge:
             locked = sum(p["margin"] for p in runner.positions.values())
             uc = runner._initial_capital
             total_balance = uc + runner.gross_realized - runner.total_fees
+            free_cash = total_balance - locked
             unrealized = runner.equity - runner.balance - locked
+            equity = total_balance + unrealized
             snap = {
-                "equity": runner.equity,
-                "free_cash": runner.balance,
+                "equity": equity,
+                "free_cash": free_cash,
                 "total_balance": total_balance,
                 "margin_locked": locked,
                 "unrealized": unrealized,

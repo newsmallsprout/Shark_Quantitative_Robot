@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import aiohttp
+from fastapi import Request
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -82,6 +83,9 @@ try:
     from kline_cache import KlineCache, init_kline_cache, get_kline_cache
     from market_regime import RegimeDetector, REGIME_CONFIG, init_detector, get_detector
     from trade_reflector import Reflector, LossReason
+    from online_learner import OnlineLearner, FeatureExtractor, compute_reward
+    from live_engine import LiveEngine, create_live_engine
+    from signal_engine import SignalEngine
     KLINE_ENABLED = True
 except ImportError:
     KLINE_ENABLED = False
@@ -101,7 +105,7 @@ MAKER_FEE = 0.0002        # Gate.io maker 费率 0.02%
 SLIPPAGE_MAX = 0.0003     # 最大滑点 0.03%
 COOLDOWN_SEC = 10         # 同币对冷却 10s
 TRADE_INTERVAL = 1        # 交易循环间隔 1s（200ms盘口匹配）
-TP_PCT = 2.0              # 止盈 2%（微利策略：5x手续费即走）
+# TP_PCT = 2.0              # 已废弃：止盈改为 ATR 动态计算
 SL_PCT = -6.0             # 止损 -6%
 TIMEOUT_SEC = 300         # 超时平仓 5min
 MAX_TOTAL_EXPOSURE = 0.95 # 最大总风险敞口 95%
@@ -234,13 +238,22 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from observability.context import REQUEST_ID_CTX, RequestIdMiddleware, configure_logging
+from observability.device_lock import (
+    DeviceLockMiddleware,
+    bootstrap_client_mac_js_value,
+    init_device_lock,
+    websocket_connection_allowed,
+)
 
 app = FastAPI(title="Shark 2.0")
+init_device_lock(ROOT)
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(DeviceLockMiddleware)
 _state = {"equity": 100.0, "balance": 100.0, "free_cash": 100.0, "initial_capital": 100.0,
           "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
           "positions": 0, "safety_blocked": False, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
-          "position_list": [], "trade_history": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0}
+          "position_list": [], "trade_history": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0,
+          "paper_trading": False, "live_trading": False, "shark_mode": "paper"}
 
 
 def _finite_float(v, default: float = 0.0) -> float:
@@ -349,7 +362,12 @@ async def health(): return {"ok": True}
 async def api_bootstrap_js():
     """运行时注入与 SHARK_API_TOKEN 一致的仪表板密钥（Docker 构建阶段无法读取 .env 中的 VITE_*）。"""
     exp = _shark_api_token_configured()
-    body = "window.__SHARK_API_TOKEN__=%s;\n" % (json.dumps(exp or ""))
+    mac = bootstrap_client_mac_js_value()
+    lines = [
+        "window.__SHARK_API_TOKEN__=%s;" % json.dumps(exp or ""),
+        "window.__SHARK_CLIENT_MAC__=%s;\n" % json.dumps(mac or ""),
+    ]
+    body = "\n".join(lines)
     return Response(
         content=body,
         media_type="application/javascript",
@@ -367,8 +385,129 @@ async def api_snapshot(token: Optional[str] = Query(None)):
     return _state_for_websocket()
 
 
+@app.get("/api/evo/pending")
+async def evo_pending(_: None = Depends(require_api_token)):
+    """待审批的进化修改列表"""
+    return {"changes": _state.get("evo_pending", [])}
+
+@app.post("/api/evo/approve/{change_id}")
+async def evo_approve(change_id: int, _: None = Depends(require_api_token)):
+    """审批通过一个进化修改"""
+    pending = _state.get("evo_pending", [])
+    change = next((c for c in pending if c.get("id") == change_id), None)
+    if not change:
+        return {"error": f"修改 #{change_id} 不存在"}
+    # 应用修改（实际调用在 StrategyRunner 中）
+    _state["evo_apply"] = change
+    _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
+    # 审批后冷却：直接写入 _state 消除竞态
+    cd = _state.setdefault("evo_cooldowns", {})
+    cd[change["type"]] = time.time() + 300
+    # 同时保留队列给 tick 同步到 runner._evo_cooldown_types
+    _state.setdefault("evo_cooldown_queue", []).append({
+        "type": change["type"], "until": time.time() + 300
+    })
+    return {"ok": True, "applied": change["type"], "id": change_id}
+
+@app.post("/api/evo/reject/{change_id}")
+async def evo_reject(change_id: int, _: None = Depends(require_api_token)):
+    """拒绝一个进化修改"""
+    pending = _state.get("evo_pending", [])
+    rejected = next((c for c in pending if c.get("id") == change_id), None)
+    if not rejected:
+        return {"error": f"修改 #{change_id} 不存在"}
+    _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
+    # 记录被拒绝的类型供冷却
+    cd = _state.setdefault("evo_cooldowns", {})
+    cd[rejected["type"]] = time.time() + 300
+    print(f"[进化审批] 已拒绝 #{change_id} ({rejected['type']})，冷却5分钟", flush=True)
+    _state.setdefault("evo_cooldown_queue", []).append({
+        "type": rejected["type"], "until": time.time() + 300
+    })
+    return {"ok": True, "rejected": change_id}
+
+
+@app.get("/api/evo/metrics")
+async def evo_metrics(_: None = Depends(require_api_token)):
+    """进化层奖励分解：优先读 C++ evolver 写入的 shark:evo:metrics；无 Redis 时用当前看板 trade_history 本地计算。"""
+    global _storage_bridge
+    if _storage_bridge and _storage_bridge.redis:
+        try:
+            raw = await _storage_bridge.redis.get("shark:evo:metrics")
+            if raw:
+                s = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                return json.loads(s)
+        except Exception as e:
+            _log.debug("evo_metrics redis: %s", e)
+    from evolution.reward_signal import compute_reward_breakdown
+
+    ic = float(_state.get("initial_capital") or 200.0)
+    return compute_reward_breakdown(_state.get("trade_history") or [], initial_equity=ic)
+
+
 @app.get("/api/status")
 async def status(_: None = Depends(require_api_token)): return _state
+
+@app.get("/api/live/status")
+async def live_status(_: None = Depends(require_api_token)):
+    """实盘状态"""
+    live_data = _state.get("live", {})
+    if not live_data.get("active"):
+        return {"active": False, "trading_enabled": False}
+    return live_data
+
+@app.post("/api/live/toggle")
+async def live_toggle(_: None = Depends(require_api_token)):
+    """切换实盘交易开关"""
+    live_data = _state.get("live", {})
+    if not live_data.get("active"):
+        return {"error": "实盘引擎未激活"}
+    new_val = not _state.get("live_trading", False)
+    _state["live_trading"] = new_val
+    _state["live"]["trading_enabled"] = new_val
+    if not new_val:
+        # 停止交易 → 标记平掉所有持仓
+        _state["live_close_all"] = True
+    return {"trading_enabled": new_val}
+
+@app.get("/api/paper/status")
+async def paper_status(_: None = Depends(require_api_token)):
+    """模拟盘状态"""
+    return {"active": True, "trading_enabled": _state.get("paper_trading", False)}
+
+@app.post("/api/paper/toggle")
+async def paper_toggle(_: None = Depends(require_api_token)):
+    """切换模拟盘交易开关"""
+    new_val = not _state.get("paper_trading", False)
+    _state["paper_trading"] = new_val
+    if not new_val:
+        _state["paper_close_all"] = True
+    return {"trading_enabled": new_val}
+
+@app.post("/api/shark/mode")
+async def set_shark_mode(request: Request, _: None = Depends(require_api_token)):
+    """切换模拟盘/实盘模式"""
+    try:
+        body = await request.json()
+        new_mode = str(body.get("mode", "")).strip().lower()
+    except Exception:
+        return {"error": "请提供 {\"mode\": \"paper\"|\"live\"}"}
+    if new_mode not in ("paper", "live"):
+        return {"error": "mode 必须是 paper 或 live"}
+    # 通过 _state 通知 tick 循环切换模式 + 标志位即时生效
+    _state["shark_mode"] = new_mode
+    _state["switch_mode_request"] = new_mode
+    if new_mode == "live":
+        if "live" not in _state:
+            _state["live"] = {"active": False, "trading_enabled": False}
+        _state["live"]["active"] = True
+        _state["paper_trading"] = False
+    else:
+        _state["paper_trading"] = False
+        _state["live_trading"] = False
+        if "live" in _state:
+            _state["live"]["active"] = False
+    return {"ok": True, "mode": new_mode}
 
 @app.get("/api/history")
 async def trade_history(
@@ -385,7 +524,17 @@ async def trade_history(
 async def ws(
     websocket: WebSocket,
     token: Optional[str] = Query(default=None),
+    device_mac: Optional[str] = Query(default=None),
 ):
+    scope = websocket.scope
+    _client = scope.get("client")
+    _host = _client[0] if _client else ""
+    _hdrs = list(scope.get("headers") or [])
+    _ws_ok, _ws_reason = websocket_connection_allowed(_host, _hdrs, device_mac)
+    if not _ws_ok:
+        _log.warning("[device_lock] ws 拒绝 %s", _ws_reason)
+        await websocket.close(code=1008)
+        return
     hdr = websocket.headers.get("x-request-id") or websocket.headers.get("X-Request-ID")
     hdr = hdr.strip() if hdr else ""
     rid = (hdr if hdr else str(uuid.uuid4()))[:128]
@@ -432,7 +581,9 @@ def _ensure_bootstrap_script(html: str) -> str:
 async def index():
     react_index = ROOT / "web" / "dist" / "index.html"
     if react_index.exists():
-        return HTMLResponse(_ensure_bootstrap_script(react_index.read_text()))
+        html = react_index.read_text()
+        html = _ensure_bootstrap_script(html)
+        return HTMLResponse(html)
     return HTMLResponse(DASHBOARD)
 # Mount React static assets if available
 _react_dist = ROOT / "web" / "dist"
@@ -574,14 +725,75 @@ class StrategyRunner:
         self._osc_avg_count: Dict[str, int] = {}  # 每币对补仓次数
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
         self._open_timestamps: list = []  # 开仓时间戳
-        self._evolve_tick = 0  # 自进化计数器
         self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
-        self._evolve_patterns: list = []  # 检测到的模式
         self._reflector = Reflector() if KLINE_ENABLED else None  # 止损反思器
-        self._evo_margin_mult = 1.0      # 进化保证金倍率
-        self._evo_skip_alts = False       # 进化暂停山寨
-        self._evo_cooldown_bonus = 0      # 进化额外冷却
+        self._learner = OnlineLearner() if KLINE_ENABLED else None  # 在线学习器
+        self._signal_engine = SignalEngine()  # 信号决策引擎
+        self._live = create_live_engine()  # 实盘引擎（paper模式返回None）
+        self._live_trading_enabled = False  # 默认不开实盘，需前端手动开启
+        self._paper_trading_enabled = False # 默认不开模拟盘，需前端手动开启
+        self._warmup_ticks = 0              # 启动预热计数器
+        self._warmup_done = False           # 预热完成标志
+        self._pending_evo_changes = []       # 待审批的进化修改
+        self._evo_cooldown_types: Dict[str, float] = {}  # type → cooldown_until
+        self._evo_change_id = 0             # 修改ID计数器
+        self._evo_margin_mult = 1.0         # 进化保证金倍率
+        self._evo_skip_alts = False         # 进化暂停山寨
+        self._evo_cooldown_bonus = 0        # 进化额外冷却
         self._persistence = persistence
+
+    def switch_mode(self, mode: str) -> dict:
+        """运行时切换 paper/live 模式，重新初始化实盘引擎"""
+        mode = mode.strip().lower()
+        if mode not in ("paper", "live"):
+            return {"error": f"无效模式: {mode}"}
+        if mode == "live":
+            engine = create_live_engine(mode="live")
+            if engine is None:
+                return {"error": "实盘引擎初始化失败，请检查 GATE_API_KEY/SECRET 和网络"}
+            # 保存纸盘余额
+            self._paper_balance = self.balance
+            self._paper_equity = self.equity
+            # 清空纸盘统计
+            self.realized_pnl = 0.0
+            self.gross_realized = 0.0
+            self.total_fees = 0.0
+            self.total_slippage = 0.0
+            self.wins = 0
+            self.closed_trades = 0
+            _state["realized_pnl"] = 0.0
+            _state["gross_realized"] = 0.0
+            _state["total_fees"] = 0.0
+            _state["win_rate"] = 0.0
+            self._live = engine
+            self._live_trading_enabled = False
+            try:
+                self.balance = engine.get_balance()
+                self._initial_capital = self.balance
+                _state["initial_capital"] = self.balance
+                _state["balance"] = self.balance
+                _state["free_cash"] = self.balance
+                _state["equity"] = self.balance
+            except Exception:
+                pass
+            print(f"🔥 已切换到实盘模式 (余额=${self.balance:.2f})", flush=True)
+        else:
+            self._live = None
+            self._live_trading_enabled = False
+            # 恢复纸盘余额+清空实盘统计
+            if hasattr(self, '_paper_balance'):
+                self.balance = self._paper_balance
+                self.equity = self._paper_equity
+                self._initial_capital = 200.0
+                self.gross_realized = 0.0
+                self.total_fees = 0.0
+                self.realized_pnl = 0.0
+                _state["balance"] = self.balance
+                _state["equity"] = self.equity
+                _state["free_cash"] = self.balance
+                _state["initial_capital"] = 200.0
+            print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})", flush=True)
+        return {"ok": True, "mode": mode, "balance": self.balance}
 
     def _get_maker_fee(self, sym: str) -> float:
         """从合约API获取实时maker费率"""
@@ -591,6 +803,55 @@ class StrategyRunner:
         if spec:
             return spec.maker_fee
         return MAKER_FEE
+
+    async def _ai_reflect(self, sym, pos, realized, pnl_pct, reason, px, local_tags):
+        """AI深度诊断亏损原因 → 多维度调整策略"""
+        try:
+            import aiohttp
+            prompt = self._reflector.build_ai_prompt(sym, pos, realized, pnl_pct, reason, px,
+                                                      self._regime_cache, local_tags)
+            # 优先用 DeepSeek（便宜快速）
+            api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("QWEN_KEY") or os.environ.get("VOLC_KEY")
+            if not api_key:
+                return
+            endpoint = "https://api.deepseek.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3, "max_tokens": 400,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+            # 提取JSON
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(content[start:end])
+                adj = result.get("adjustments", {})
+                if adj:
+                    msg = self._reflector.apply_ai_adjustments(adj)
+                    cause = result.get("root_cause", "")
+                    confidence = result.get("confidence", 0)
+                    dims = result.get("dimensions", [])
+                    next_act = result.get("next_action", "")
+                    print(f"[AI反思] {sym} 根因: {cause} (置信{confidence}%)", flush=True)
+                    for d in dims:
+                        print(f"  → {d}", flush=True)
+                    if msg:
+                        print(f"[AI调整] {msg}", flush=True)
+                    if next_act:
+                        print(f"[AI建议] {next_act}", flush=True)
+                    self._reflector.ai_insights.append({
+                        "sym": sym, "ts": time.time(), "cause": cause,
+                        "adjustments": adj, "confidence": confidence,
+                    })
+        except Exception as e:
+            print(f"[AI反思] 调用失败: {e}", flush=True)
 
     async def _fetch_ai_plan(self, sym: str, px: float, funding: float,
                              change: float, vol: float):
@@ -657,11 +918,82 @@ class StrategyRunner:
         sp = self._contract_specs.get(sym)
         return float(sp.quanto_multiplier) if sp else 1.0
 
-    def _check_evolution(self):
+    def merge_evo_suggestion(self, change: dict) -> None:
+        """合并 C++ evolution 建议：同 type 仅保留一条，保留 id/params 与 Redis 一致便于 approve。
+        审批/拒绝后的冷却期内（5min）同类型建议直接丢弃。"""
+        ctype = str(change.get("type") or "unknown")
+        
+        # ── 冷却期检查（内存 + _state 双检，消除 approve/reject 竞态）──
+        now = time.time()
+        cooldown_until = self._evo_cooldown_types.get(ctype, 0)
+        state_cd = (_state.get("evo_cooldowns") or {}).get(ctype, 0)
+        if state_cd > cooldown_until:
+            cooldown_until = state_cd
+        if now < cooldown_until:
+            return  # 冷却中，丢弃
+        raw_id = change.get("id")
+        cid: Optional[int] = None
+        if raw_id is not None:
+            try:
+                cid = int(raw_id)
+            except (TypeError, ValueError):
+                cid = None
+        if cid is None:
+            self._evo_change_id += 1
+            cid = self._evo_change_id
+        else:
+            self._evo_change_id = max(self._evo_change_id, cid)
+        # 操作 _state["evo_pending"]（唯一真相源），同时同步 runner 用于前端展示
+        pending = _state.setdefault("evo_pending", [])
+        _state["evo_pending"] = [c for c in pending if c.get("type") != ctype]
+        params = change.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        created = change.get("created_at")
+        try:
+            created_f = float(created) if created is not None else time.time()
+        except (TypeError, ValueError):
+            created_f = time.time()
+        _state["evo_pending"].append({
+            "id": cid,
+            "type": ctype,
+            "description": str(change.get("description") or ""),
+            "params": params,
+            "created_at": created_f,
+        })
+
+    def _apply_evo_change(self, change: dict):
+        """应用审批通过的进化修改"""
+        ct = change.get("type", "")
+        params = change.get("params", {})
+        if ct == "margin_mult":
+            self._evo_margin_mult = params.get("value", self._evo_margin_mult)
+            print(f"[进化] 保证金倍率 → {self._evo_margin_mult}", flush=True)
+        elif ct == "skip_alts":
+            self._evo_skip_alts = params.get("value", self._evo_skip_alts)
+            print(f"[进化] 暂停山寨 → {self._evo_skip_alts}", flush=True)
+        elif ct == "cooldown_bonus":
+            self._evo_cooldown_bonus = params.get("value", self._evo_cooldown_bonus)
+            print(f"[进化] 额外冷却 → {self._evo_cooldown_bonus}", flush=True)
+        elif ct == "ai_threshold":
+            # 更新 Reflector 的 AI 阈值
+            if self._reflector:
+                self._reflector.ai_boost = params.get("value", self._reflector.ai_boost)
+            print(f"[进化] AI阈值 → {params.get('value')}", flush=True)
+        elif ct == "ga_best_params":
+            # Go RL 引擎 GA 最优参数
+            if "margin_pct" in params:
+                self._evo_margin_mult = params["margin_pct"] / 0.02  # 转换为倍率
+            if "stop_atr_mult" in params and self._reflector:
+                self._reflector.stop_boost = params["stop_atr_mult"]
+            if "max_drawdown_limit" in params:
+                pass  # 记录但不自动应用（需人工确认）
+            print(f"[进化] GA最优参数已应用 (fitness={params.get('fitness','?')})", flush=True)
+        else:
+            print(f"[进化] 未知类型 {ct}，跳过", flush=True)
 
     def _strategic_entry(self, sym: str, side: str, px: float, regime_value: str) -> float:
-        """根据行情类型计算策略性入场价，而非市价盲入。
-        趋势市回调入场，震荡市边界入场，突破市追入。"""
+        """根据行情类型计算策略性入场价：趋势市回调入场，震荡市边界入场，突破市追入"""
         try:
             kc = get_kline_cache() if KLINE_ENABLED else None
             if not kc:
@@ -672,108 +1004,42 @@ class StrategyRunner:
             if len(closes) < 10:
                 return px
 
-            hh = max(highs[-20:])   # 20根K线高点
-            ll = min(lows[-20:])     # 20根K线低点
+            hh = max(highs[-20:])
+            ll = min(lows[-20:])
             ema9 = kc.ema(sym, 9, "5m")
-            ema21 = kc.ema(sym, 21, "5m")
             rng = hh - ll
 
-            # ── 强趋势：回调/反弹到EMA入场 ──
             if "strong_trend" in regime_value:
                 if "up" in regime_value and side == "long":
-                    # 做多：等回调到EMA9，不超过现价1%
                     target = ema9 if ema9 < px else px * 0.995
                     return max(target, px * 0.99)
                 elif "down" in regime_value and side == "short":
                     target = ema9 if ema9 > px else px * 1.005
                     return min(target, px * 1.01)
 
-            # ── 弱趋势：小幅偏向趋势方向 ──
             elif "weak_trend" in regime_value:
                 if "up" in regime_value and side == "long":
-                    return px * 0.997  # 微回调入场
+                    return px * 0.997
                 elif "down" in regime_value and side == "short":
                     return px * 1.003
 
-            # ── 震荡：靠边界入场（做多近支撑，做空近阻力）──
             elif "ranging" in regime_value:
                 if side == "long":
-                    # 靠近区间下沿30%处
                     target = ll + rng * 0.3
-                    return max(target, px * 0.985)  # 最多偏1.5%
+                    return max(target, px * 0.985)
                 else:
                     target = hh - rng * 0.3
                     return min(target, px * 1.015)
 
-            # ── 突破：追在突破点上方 ──
             elif "breakout" in regime_value:
                 if "up" in regime_value and side == "long":
-                    return min(hh * 1.002, px * 1.01)  # 略高于前高，但不超过1%
+                    return min(hh * 1.002, px * 1.01)
                 elif "down" in regime_value and side == "short":
                     return max(ll * 0.998, px * 0.99)
 
-            # ── 乱震/默认：市价 ──
             return px
-
         except Exception:
             return px
-        """实时自进化：分析交易模式 → 即时调整参数"""
-        recent = self._trade_history[-30:]
-        if len(recent) < 3:
-            return
-        
-        # 心跳：确认引擎在跑
-        stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
-        wins = sum(1 for t in recent if t["realized_pnl"] > 0)
-        consecutive = 0
-        for t in reversed(recent):
-            if t["realized_pnl"] <= 0:
-                consecutive += 1
-            else:
-                break
-
-        # 连亏3+ → 缩减仓位
-        if consecutive >= 3:
-            self._evo_margin_mult = max(0.25, 1.0 - consecutive * 0.15)
-            print(f"[进化] 连亏{consecutive}笔，保证金缩至{self._evo_margin_mult:.0%}", flush=True)
-
-        # 止盈后恢复仓位
-        if consecutive == 0 and self._evo_margin_mult < 1.0:
-            self._evo_margin_mult = min(1.0, self._evo_margin_mult + 0.1)
-            if self._evo_margin_mult >= 1.0:
-                print("[进化] 仓位恢复正常", flush=True)
-
-        # 止损率过高 → 放宽止损
-        stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
-        if len(recent) >= 5 and stops > len(recent) * 0.35:
-            if self._reflector:
-                self._reflector.stop_boost = min(4, self._reflector.stop_boost + 1.0)
-            print(f"[进化] 止损率{stops}/{len(recent)}={stops/len(recent):.0%}，止损+1%", flush=True)
-
-        # 连亏5+ → 暂停山寨
-        if consecutive >= 5:
-            self._evo_skip_alts = True
-            print(f"[进化] 连亏{consecutive}笔，暂停山寨开仓", flush=True)
-        elif consecutive == 0:
-            self._evo_skip_alts = False
-
-        # 盈利后放宽AI门槛
-        wins_recent = sum(1 for t in recent[-10:] if t["realized_pnl"] > 0)
-        if wins_recent >= 6 and self._reflector and self._reflector.ai_boost > 0:
-            self._reflector.ai_boost = max(0, self._reflector.ai_boost - 3)
-            print(f"[进化] 近10笔胜{wins_recent}，AI阈值恢复-3", flush=True)
-
-        # 反思器调整（更激进：5笔亏损就触发）
-        if self._reflector and self._reflector.total_losses >= 5:
-            adj = self._reflector.maybe_adjust()
-            if adj:
-                print(f"[进化-反思] {adj}", flush=True)
-        
-        # 引擎心跳（每次检查都打印关键指标）
-        _stops = sum(1 for t in recent if "止损" in t.get("reason", ""))
-        _wins = sum(1 for t in recent if t["realized_pnl"] > 0)
-        print(f"[进化] tick={self._evolve_tick} 交易{len(recent)}笔 连亏{consecutive} 止损率{_stops}/{len(recent)} "
-              f"保证金×{self._evo_margin_mult:.1f} AI阈值+{self._reflector.ai_boost if self._reflector else 0}", flush=True)
 
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
@@ -800,13 +1066,64 @@ class StrategyRunner:
                    mark_prices: Dict[str, float] = None):
         now = time.time()
 
+        # 同步实盘/模拟盘开关
+        self._live_trading_enabled = _state.get("live_trading", False)
+        self._paper_trading_enabled = _state.get("paper_trading", False)
+
+        # 处理审批通过的进化修改
+        evo_apply = _state.pop("evo_apply", None)
+        if evo_apply:
+            self._apply_evo_change(evo_apply)
+
+        # 处理进化冷却队列（审批/拒绝后5分钟不重复推送同类型）
+        for item in list(_state.pop("evo_cooldown_queue", [])):
+            self._evo_cooldown_types[item["type"]] = item["until"]
+
+        # 处理模式切换请求（前端点击切换 paper/live）
+        switch_req = _state.pop("switch_mode_request", None)
+        if switch_req:
+            result = self.switch_mode(switch_req)
+            if "error" in result:
+                print(f"[模式切换] 失败: {result['error']}", flush=True)
+
+        # 发布价格到 Redis（Go matcher 撮合用，必须在开仓前）
+        try:
+            import redis as _rp
+            _r = _rp.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            for sym, px in prices.items():
+                if px > 0:
+                    _r.set(f"shark:price:{sym}", px, ex=10)
+        except Exception:
+            pass
+
+        # 停止交易 → 平掉所有持仓
+        if _state.pop("live_close_all", False):
+            for sym in list(self.positions):
+                px = prices.get(sym, 0)
+                if px > 0:
+                    self._close_position(sym, px, "手动停止", 0, prices)
+            print("[实盘] 已平掉所有持仓", flush=True)
+        if _state.pop("paper_close_all", False):
+            for sym in list(self.positions):
+                px = prices.get(sym, 0)
+                if px > 0:
+                    self._close_position(sym, px, "手动停止(模拟)", 0, prices)
+            print("[模拟] 已平掉所有持仓", flush=True)
+
         # 清理过期冷却
         self._cooldowns = {k: v for k, v in self._cooldowns.items() if now < v}
 
-        # ── 自进化实时检测（每50 tick）──
-        self._evolve_tick += 1
-        if self._evolve_tick % 20 == 0 and len(self._trade_history) >= 3:
-            self._check_evolution()
+        # ── 实盘安全 + 持仓同步 ──
+        if self._live and self._live.active:
+            if not self._live.is_healthy:
+                return  # 熔断：暂停交易
+            # 每60秒同步一次交易所持仓
+            if now - self._live._last_sync > 60:
+                real = self._live.sync_positions()
+                # 对账：paper有但交易所没有 → 警告
+                for sym in list(self.positions):
+                    if sym not in real:
+                        _log.warning("⚠ 对账异常: %s paper有持仓但交易所无", sym)
 
         # 喂震荡检测器
         if self._oscillator:
@@ -833,21 +1150,38 @@ class StrategyRunner:
             
             # 行情止损覆盖（开仓时判定的行情类型）
             _rc = self._regime_cache.get(sym, {}).get("cfg", {})
-            _stop_ov = _rc.get("stop_pct")
-            _tp_ov = _rc.get("tp_pct")
+            _stop_mult = _rc.get("stop_atr_mult", 2.0)
+            _tp_mult = _rc.get("tp_atr_mult", 3.0)
             
-            # 波动率（24h变化% → 动态止损宽度）
+            # ── ATR 实时止损/止盈（5分钟ATR，避免1分钟噪声）──
             vol_chg = abs(pos.get("vol_chg", 3.0))
-            # 止损：行情优先 > 策略默认
-            _base_sl = _stop_ov if _stop_ov is not None else cfg.get("stop_loss_base", -6.0)
-            # 反思器止损放宽（累积发现止损过紧）
+            atr_pct = 0.0
+            try:
+                kc = get_kline_cache() if KLINE_ENABLED else None
+                if kc:
+                    atr_val = kc.atr(sym, period=14, interval="5m")
+                    if atr_val > 0 and px > 0:
+                        atr_pct = atr_val / px * 100
+            except Exception:
+                pass
+            if atr_pct <= 0:
+                atr_pct = vol_chg * 0.3  # 日波动30% ≈ 5m ATR
+            
+            # 止损地板：不低于 2%（确保手续费+滑点有空间，不是噪音止损）
+            sl_raw = atr_pct * _stop_mult
+            sl_floor = 2.0  # 最低 2% 价格止损
+            sl_raw = max(sl_raw, sl_floor)
+            # 反思器额外放宽
             _sl_boost = self._reflector.stop_boost if self._reflector else 0
-            sl_base = _base_sl - _sl_boost  # 更负=更宽
-            sl_max = cfg.get("stop_loss_max", -200.0)
-            dyn_sl = -max(abs(sl_base), min(abs(sl_max), vol_chg * 2.0))
-            # 移动止盈
-            trail_trigger = cfg.get("trail_trigger", vol_chg * 0.8)
-            trail_ratio = cfg.get("trail_pct", 0.3)
+            dyn_sl = -(sl_raw + _sl_boost)
+            dyn_sl = max(dyn_sl, -25.0)  # 上限 25%
+            
+            # 止盈 = ATR% × 行情倍率（不低于地板 3%）
+            dyn_tp = max(atr_pct * _tp_mult, 3.0)
+            
+            # 移动止盈：ATR × 3 触发或最低 4%
+            trail_trigger = max(atr_pct * 3.0, 4.0)
+            trail_ratio = 0.3
 
             # 更新最高盈利
             if pnl_pct > pos.get("best_pnl", -999):
@@ -1062,13 +1396,9 @@ class StrategyRunner:
                         self._close_position(sym, px, "移动止盈", pnl_pct, prices)
                         continue
 
-            # 固定止盈（兜底）：主流用「波动 × 系数」但封顶，避免 vol_chg 大时永远达不到线
-            if is_st:
-                fixed_tp_pct = max(4.0, min(vol_chg * 0.85, 6.5))
-            else:
-                fixed_tp_pct = vol_chg * 1.5
-            if pnl_pct >= fixed_tp_pct and self._take_profit_net_ok(sym, pos, px):
-                self._close_position(sym, px, "止盈", pnl_pct, prices)
+            # ── ATR动态止盈（无固定值）──
+            if pnl_pct >= dyn_tp and self._take_profit_net_ok(sym, pos, px):
+                self._close_position(sym, px, "ATR止盈", pnl_pct, prices)
                 continue
 
             # 动态止损
@@ -1087,6 +1417,25 @@ class StrategyRunner:
             return
 
         # 开仓：对所有符合条件的币对尽可能开单
+        # ── 开关检查：实盘/模拟盘都需手动开启 ──
+        _is_live_mode = self._live and self._live.active
+        if _is_live_mode and not self._live_trading_enabled:
+            self._update_state(prices)
+            return  # 实盘模式但开关关闭，不交易
+        if not _is_live_mode and not self._paper_trading_enabled:
+            self._update_state(prices)
+            return  # 模拟盘模式但开关关闭，不交易
+        # ── 启动预热：等K线+行情就绪后再开仓（持仓管理不受影响）──
+        _can_open = True
+        if not self._warmup_done:
+            self._warmup_ticks += 1
+            kc = get_kline_cache() if KLINE_ENABLED else None
+            detector = get_detector() if KLINE_ENABLED else None
+            if self._warmup_ticks >= 5 and kc and detector:
+                self._warmup_done = True
+                print(f"🔥 预热完成 (tick={self._warmup_ticks})，开始交易", flush=True)
+            else:
+                _can_open = False  # 跳过开仓，但持仓管理继续
         scored = []
         for sym in prices:
             if sym in self._cooldowns: continue
@@ -1134,6 +1483,9 @@ class StrategyRunner:
 
         opened = 0
         for sym, score, vol, chg_abs in scored:
+            # 启动预热中 → 不开新仓
+            if not _can_open:
+                break
             # 进化引擎：连亏时暂停山寨
             if self._evo_skip_alts and not is_stable(sym):
                 continue
@@ -1237,124 +1589,44 @@ class StrategyRunner:
                 if same_type >= max_pos:
                     continue
 
-            # 方向信号：纯AI委员会，无兜底
-            funding = funding_rates.get(sym, 0)
-            mark = mark_prices.get(sym, 0) if mark_prices else 0
-            price_div = (px - mark) / mark * 100 if mark > 0 else 0
-            
-            # ── 层级1：AI 信号缓存（最高优先级） ──
-            ai_cache = self._ai_signal_cache.get(sym)
-            ai_dir_raw = ""
-            ai_confidence = 0
-            if ai_cache and now - ai_cache.get("ts", 0) < 180:
-                ai_plan = ai_cache.get("plan", {})
-                ai_dir_raw = (ai_plan.get("direction") or "").strip().upper()
-                ai_confidence = float(ai_plan.get("confidence", 0) or 0)
-            _ai_conf_min = 45 + (self._reflector.ai_boost if self._reflector else 0)
-            ai_use = ai_dir_raw in ("LONG", "SHORT") and ai_confidence >= _ai_conf_min
-
-            # ── 方向信号判定 ──
-            if ai_use:
-                side = "long" if ai_dir_raw == "LONG" else "short"
-                signal_src = f"AI多维 信{int(ai_confidence)}"
-            else:
-                # ── 多方信号兜底（5因子投票，≥3票同向 + 非费率票≥1）──
-                fb_votes = {"long": 0, "short": 0}
-                fb_tags = []
-                
-                # 因子1: 资金费率均值回归
-                if abs(funding) > 0.0005:
-                    d = "short" if funding > 0 else "long"
-                    fb_votes[d] += 1; fb_tags.append(f"费率{funding*100:+.3f}%→{d}")
-                
-                # 因子2: RSI超买超卖 (5m)
-                try:
-                    kc = get_kline_cache()
-                    if kc:
-                        r = kc.rsi(sym, period=14, interval="5m")
-                        if 0 < r < 35:
-                            fb_votes["long"] += 1; fb_tags.append(f"RSI={r:.0f}超卖")
-                        elif r > 65:
-                            fb_votes["short"] += 1; fb_tags.append(f"RSI={r:.0f}超买")
-                except Exception: pass
-                
-                # 因子3: 多交易所共识
-                if MULTI_ENABLED:
-                    try:
-                        feed_m = get_multi_feed()
-                        if feed_m:
-                            ms = feed_m.direction_signal(sym)
-                            if ms['divergence'] <= 0.5 and ms['bias'] != 'neutral':
-                                fb_votes[ms['bias']] += 1; fb_tags.append(f"多所→{ms['bias']}")
-                    except Exception: pass
-                
-                # 因子4: ADX趋势
-                try:
-                    kc = get_kline_cache()
-                    if kc:
-                        a = kc.adx(sym, period=14, interval="1m")
-                        t = kc.ma_trend(sym, fast=9, slow=21, interval="1m")
-                        if a > 20 and t in ("up", "down"):
-                            d2 = "long" if t == "up" else "short"
-                            fb_votes[d2] += 1; fb_tags.append(f"ADX={a:.0f}趋势{t}")
-                except Exception: pass
-                
-                # 因子5: 成交量+价格动量
-                mv = cfg.get("min_volume", 500000)
-                mc = cfg.get("min_change", 1.5)
-                if vol > mv * 2 and abs(change) > mc * 2:
-                    d3 = "long" if change > 0 else "short"
-                    fb_votes[d3] += 1; fb_tags.append(f"量价{change:+.1f}%")
-                
-                best_dir = max(fb_votes, key=fb_votes.get)
-                best_cnt = fb_votes[best_dir]
-                non_fee = sum(1 for t in fb_tags if not t.startswith("费率"))
-                
-                # 主流币放宽：≥1非费率票即开；山寨：≥2票且非费率≥1
-                if is_stable(sym):
-                    ok = non_fee >= 1 and best_dir in ("long", "short")
-                else:
-                    ok = best_cnt >= 2 and non_fee >= 1 and best_dir in ("long", "short")
-                
-                if ok:
-                    side = best_dir
-                    signal_src = f"多方兜底 {'|'.join(fb_tags)} ✓{best_cnt}"
-                else:
-                    continue
-
-            # ── 多交易所方向确认（自进化v2）──
-            if MULTI_ENABLED:
-                try:
-                    feed_m = get_multi_feed()
-                    if feed_m:
-                        sig = feed_m.direction_signal(sym)
-                        # 交易所间价差过大 → 方向不确定 → 跳过
-                        if sig['divergence'] > 0.5:
-                            continue
-                        # 多交易所共识方向与开仓方向相反 → 跳过
-                        if sig['bias'] != 'neutral' and sig['bias'] != side:
-                            if ai_use:
-                                if ai_confidence < 70:
-                                    continue  # AI信心不足时相信多交易所
-                            elif sig.get('confidence', 0) > 40:
-                                continue  # 兜底信号时多交易所信心>40则跳过
-                except Exception as e:
-                    _log.warning("multi_exchange direction_signal failed for %s: %s", sym, e)
-
-            # ── 行情方向约束：趋势行情禁止逆势开仓 ──
-            _rc = self._regime_cache.get(sym, {}).get("cfg", {})
-            _allowed = _rc.get("allowed_dir")
-            if _allowed and _allowed != "both" and side != _allowed:
-                continue  # 趋势方向不符 → 不逆势
-
-            # 行情止损/止盈覆盖
-            _stop_override = _rc.get("stop_pct")
-            _tp_override = _rc.get("tp_pct")
-            _pyramid_override = _rc.get("pyramid")
+            # ── 信号决策（委托给 SignalEngine）──
+            result = self._signal_engine.decide(
+                self, sym, px, funding_rates.get(sym, 0),
+                change, vol, cfg, now, self._regime_cache, _regime)
+            if not result.side:
+                continue
+            side = result.side
+            signal_src = result.signal_src
+            ai_confidence = result.ai_confidence
+            ai_use = result.ai_use
+            _learner_feat = result.learner_feat
+            _stop_mult = result.stop_mult
+            _tp_mult = result.tp_mult
 
             # 策略入场价：根据行情类型+方向智能定位
             _rv = _regime.value if _regime else "unknown"
             entry_price = self._strategic_entry(sym, side, entry_price, _rv)
+
+            # ── 统一下单通道 → Redis → Go 执行器 ──
+            _live_oid = None
+            _is_live = self._live and self._live.active
+            mode = "live" if (_is_live and self._live_trading_enabled) else "paper"
+            
+            _ct_size = max(1, int(size))
+            cmd = json.dumps({
+                "symbol": sym, "side": side, "size": _ct_size,
+                "leverage": lev, "action": "open", "mode": mode,
+            })
+            try:
+                import redis as _redis
+                _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                _r.publish("shark:orders:new", cmd)
+                _live_oid = True
+            except Exception as e:
+                _log.error("Redis publish failed: %s", e)
+                if mode == "live":
+                    continue  # 实盘失败必须跳过
+            
 
             self.positions[sym] = {
                 "side": side, "entry": entry_price, "size": size,
@@ -1365,13 +1637,22 @@ class StrategyRunner:
                 "order_id": uuid.uuid4(),
                 "signal_src": signal_src,
                 "ai_confidence": ai_confidence if ai_use else 0,
+                "_learner_feat": _learner_feat,
             }
             
             # AI分析（异步，不阻塞开仓）
             if AI_ENABLED:
                 asyncio.create_task(self._fetch_ai_plan(sym, px, funding_rates.get(sym, 0),
                                         changes.get(sym, 0), vol))
-            self._cooldowns[sym] = now + COOLDOWN_SEC
+
+            # 实盘记录
+            if self._live and self._live.active and _live_oid:
+                self._live.positions[sym] = LivePosition(
+                    symbol=sym, side=side, size=int(size),
+                    entry_price=entry_price, leverage=lev, margin=margin,
+                    order_id=str(uuid.uuid4()), opened_at=now,
+                )
+            self._cooldowns[sym] = now + COOLDOWN_SEC + float(self._evo_cooldown_bonus or 0)
             self.trades += 1
             total_margin += margin
 
@@ -1380,13 +1661,20 @@ class StrategyRunner:
             msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}"
             if _regime:
                 msg += f" 行情={_regime.value}"
-            if _stop_override:
-                msg += f" SL={_stop_override}%"
-            if _tp_override:
-                msg += f" TP={_tp_override}%"
+            if _stop_mult:
+                msg += f" SL=ATR×{_stop_mult}"
+            if _tp_mult:
+                msg += f" TP=ATR×{_tp_mult}"
             
-            # 所有检查通过，扣费开仓（冻结保证金 + 手续费）
-            self.balance -= margin + fee
+            # 所有检查通过，扣费开仓
+            if self._live and self._live.active and self._live_trading_enabled and _live_oid:
+                # 实盘：余额从交易所同步
+                try:
+                    self.balance = self._live.get_balance()
+                except Exception:
+                    self.balance -= margin + fee
+            else:
+                self.balance -= margin + fee
             self.total_fees += fee
             if self._persistence and self._persistence.enabled_db():
                 oid = self.positions[sym]["order_id"]
@@ -1424,6 +1712,25 @@ class StrategyRunner:
         self._update_state(prices)
 
     def _close_position(self, sym, px, reason, pnl_pct, prices=None):
+        # ── 实盘平仓 → Redis 发布给 Go 执行器 ──
+        _live_close_ok = True
+        _live_close_px = px
+        if self._live and self._live.active and self._live_trading_enabled:
+            lp = self.positions.get(sym)
+            if lp:
+                cmd = json.dumps({
+                    "symbol": sym, "side": lp["side"], "action": "close",
+                    "size": int(lp.get("size", 1)),
+                })
+                try:
+                    import redis as _redis
+                    _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                    _r.publish("shark:orders:new", cmd)
+                except Exception as e:
+                    _log.error("Redis close publish failed: %s", e)
+                    _live_close_ok = False
+                    _log.error("🔥 实盘平仓失败 %s, 人工介入!", sym)
+
         pos = self.positions.pop(sym)
         oid = pos.get("order_id")
         bal_before = self.balance
@@ -1439,13 +1746,20 @@ class StrategyRunner:
         realized = gross - fee_open - fee_close  # 含全部手续费的净利
 
         self.total_fees += fee_close
+        # 余额更新：实盘从交易所同步，纸盘本地计算
+        if _live_close_ok and self._live and self._live.active and self._live_trading_enabled:
+            try:
+                self.balance = self._live.get_balance()
+            except Exception:
+                self.balance += pos["margin"] + gross - fee_close
+        else:
+            self.balance += pos["margin"] + gross - fee_close
         print(
             f"[DEBUG费用] 毛利={gross:.6f} 平仓费={fee_close:.6f} 净利={realized:.6f} "
             f"balance={self.balance:.2f} total_fees={self.total_fees:.4f}",
             flush=True,
         )
 
-        self.balance += pos["margin"] + gross - fee_close
         self.realized_pnl += realized
         self.gross_realized += gross  # 毛利累计（不含手续费），用于余额展示
         self.closed_trades += 1
@@ -1474,6 +1788,14 @@ class StrategyRunner:
             "signal_src": pos.get("signal_src", ""),
             "ai_confidence": pos.get("ai_confidence", 0),
         })
+        # 发布到 Redis 供 C++ 进化引擎消费
+        try:
+            import redis as _redis2
+            _rr = _redis2.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            _rr.lpush("shark:trade_history", json.dumps(self._trade_history[-1]))
+            _rr.ltrim("shark:trade_history", 0, 199)
+        except Exception:
+            pass
         if self._persistence and self._persistence.enabled_db() and oid:
             ou = oid if isinstance(oid, uuid.UUID) else uuid.UUID(str(oid))
             self._persistence.on_position_close(
@@ -1506,10 +1828,43 @@ class StrategyRunner:
         self._log.append(msg)
         print(msg, flush=True)
 
-        # ── 止损反思：多维分析亏损原因 ──
+        # ── 止损反思：多维分析亏损原因 → 立即调整下笔交易参数 ──
         if self._reflector and realized < 0:
-            self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
+            local_tags = self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
                                     self._regime_cache, None)
+            # 本地快速调整
+            adj = self._reflector.maybe_adjust()
+            if adj:
+                print(f"[反思调整] {adj}", flush=True)
+            # AI深度诊断（异步，每60秒最多一次，避免API轰炸）
+            now_ts = time.time()
+            if now_ts - self._reflector._last_ai_call > 60 and (
+                os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("QWEN_KEY") or os.environ.get("VOLC_KEY")
+            ):
+                self._reflector._last_ai_call = now_ts
+                asyncio.create_task(self._ai_reflect(sym, pos, realized, pnl_pct, reason, px, local_tags))
+
+        # ── 在线学习：Q-Learning + ES更新 ──
+        if self._learner:
+            feat = pos.get("_learner_feat")
+            if feat:
+                # 构建下一状态特征（平仓时）
+                try:
+                    diag_now = self._regime_cache.get(sym, {}).get("diag", {})
+                    ai_cache = self._ai_signal_cache.get(sym, {})
+                    funding = 0  # 当前tick的费率
+                    # 简化：用开仓时的特征变换作为下一状态
+                    next_feat = feat[:]  # 简化处理
+                    held = pos.get("closed_at", time.time()) - pos.get("opened_at", time.time())
+                    was_stop = "止损" in reason
+                    rc = self._regime_cache.get(sym, {})
+                    regime_val = rc.get("regime", "unknown")
+                    self._learner.on_trade_closed(
+                        feat, next_feat, realized, pnl_pct,
+                        was_stop, held, regime_val
+                    )
+                except Exception:
+                    pass
 
         # Alpha角色事件：平仓
         is_tp = "止盈" in reason
@@ -1546,8 +1901,8 @@ class StrategyRunner:
         _state["character_event"] = ev_close
         _schedule_loli_speech(ev_close)
 
-        # 平仓后冷却，避免立即重开（止损更长）
-        cooldown_sec = 120 if reason == "止损" else 30
+        # 平仓后冷却，避免立即重开（止损更长）；进化 cooldown_bonus 叠加
+        cooldown_sec = (120 if reason == "止损" else 30) + float(self._evo_cooldown_bonus or 0)
         self._cooldowns[sym] = time.time() + cooldown_sec
 
     def _recalc_equity(self, prices):
@@ -1605,6 +1960,27 @@ class StrategyRunner:
                 "ai_boost": self._reflector.ai_boost,
                 "stop_boost": self._reflector.stop_boost,
             }
+
+        # 实盘状态
+        if self._live:
+            _state["live"] = self._live.stats()
+            _state["live"]["trading_enabled"] = self._live_trading_enabled
+            try:
+                _state["live"]["balance"] = self._live.get_balance()
+            except Exception:
+                _state["live"]["balance"] = 0
+            # 实盘模式：余额走交易所，但初始资金不变
+            if self._live.active:
+                _state["balance"] = _state["live"]["balance"]
+                _state["equity"] = _state["live"]["balance"]
+                _state["free_cash"] = _state["live"]["balance"]
+                _state["unrealized_pnl"] = 0
+                _state["margin_locked"] = sum(
+                    p.get("margin", 0) for p in self._live.sync_positions().values()
+                ) if self._live else 0
+
+        # 待审批的进化修改：_state 是唯一真相源，tick从_state同步
+        self._pending_evo_changes = _state.get("evo_pending", [])
 
         if self._persistence:
             self._persistence.schedule_state_redis(
@@ -1747,6 +2123,13 @@ async def main():
 
     print(f"\U0001f988 Shark 2.0 启动成功 :{port}", flush=True)
     
+    # 启动状态一览
+    _shark_mode = os.environ.get("SHARK_MODE", "paper").lower()
+    _paper_state = "关闭" if not _state.get("paper_trading") else "开启"
+    _live_state = "关闭" if not _state.get("live_trading") else "开启"
+    print(f"📋 当前模式: {_shark_mode} | 模拟盘: {_paper_state} | 实盘: {_live_state}", flush=True)
+    print(f"💡 提示: 前端点击「开始交易」后才开仓", flush=True)
+    
     # 多交易所价格聚合
     multi_feed_task = None
     if MULTI_ENABLED:
@@ -1765,6 +2148,77 @@ async def main():
         multi_feed_task = asyncio.create_task(multi_loop())
         print("[多交易所] 价格聚合已启动 (Binance/Bybit/OKX/Gate)", flush=True)
     
+    async def hydrate_evo_pending_from_redis() -> None:
+        """进程重启后从 LPUSH 列表恢复待审批项（missed pub/sub）。LRANGE 0.. 为最新优先，反向合并使同 type 保留最新。"""
+        if not redis_client:
+            return
+        try:
+            items = await redis_client.lrange("shark:evo:list", 0, 49)
+        except Exception as e:
+            _log.warning("hydrate shark:evo:list: %s", e)
+            return
+        for raw in reversed(items or []):
+            try:
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="replace")
+                runner.merge_evo_suggestion(json.loads(raw))
+            except Exception as e:
+                _log.debug("hydrate evo item: %s", e)
+
+    # C++ 进化引擎订阅：监听 shark:evo:pending → 加入待审批队列
+    async def evo_subscriber():
+        if not redis_client:
+            return
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe("shark:evo:pending")
+        print("[进化订阅] 已订阅 shark:evo:pending", flush=True)
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                raw = msg["data"]
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="replace")
+                change = json.loads(raw)
+                runner.merge_evo_suggestion(change)
+                print(f"[进化订阅] 收到建议 #{change.get('id')}: {change.get('type')}", flush=True)
+            except Exception as e:
+                _log.debug("evo_subscriber parse: %s", e)
+
+    if redis_client:
+        await hydrate_evo_pending_from_redis()
+    evo_task = asyncio.create_task(evo_subscriber()) if redis_client else None
+
+    # Go RL Agent 动作订阅
+    async def rl_action_subscriber():
+        if not redis_client:
+            return
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe("shark:rl:action")
+        print("[RL订阅] 已订阅 shark:rl:action", flush=True)
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                raw = msg["data"]
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="replace")
+                action = json.loads(raw)
+                if not runner._paper_trading_enabled and not runner._live_trading_enabled:
+                    continue  # 交易未启用，跳过
+                sym = action.get("symbol", "")
+                side = action.get("side", "")
+                if side in ("long", "short"):
+                    # 实盘走 executor，模拟盘走 matcher
+                    mode = "live" if (runner._live and runner._live.active) else "paper"
+                    cmd = json.dumps({"symbol": sym, "side": side, "action": "open", "mode": mode, "source": "rl-agent"})
+                    await redis_client.publish("shark:orders:new", cmd)
+                    print(f"[RL动作] {sym} {side.upper()} ({mode})", flush=True)
+            except Exception as e:
+                _log.debug("rl_action_subscriber: %s", e)
+
+    rl_task = asyncio.create_task(rl_action_subscriber()) if redis_client else None
+
     await asyncio.gather(
         server.serve(),
         trading_loop(feed, runner),

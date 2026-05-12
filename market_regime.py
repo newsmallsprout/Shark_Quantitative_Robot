@@ -26,9 +26,9 @@ class MarketRegime(Enum):
 REGIME_CONFIG = {
     MarketRegime.STRONG_TREND_UP: {
         "allowed_dir": "long",
-        "margin_mult": 1.6,        # 顺势加码
-        "stop_pct": -10.0,         # 宽止损给趋势呼吸
-        "tp_pct": 15.0,
+        "margin_mult": 1.6,
+        "stop_atr_mult": 3.0,       # 止损 = ATR × 3（趋势给呼吸空间）
+        "tp_atr_mult": 5.0,         # 止盈 = ATR × 5（吃大波段）
         "pyramid": True,
         "pyramid_levels": 3,
         "cooldown_s": 5,
@@ -37,8 +37,8 @@ REGIME_CONFIG = {
     MarketRegime.STRONG_TREND_DOWN: {
         "allowed_dir": "short",
         "margin_mult": 1.6,
-        "stop_pct": -10.0,
-        "tp_pct": 15.0,
+        "stop_atr_mult": 3.0,
+        "tp_atr_mult": 5.0,
         "pyramid": True,
         "pyramid_levels": 3,
         "cooldown_s": 5,
@@ -46,9 +46,9 @@ REGIME_CONFIG = {
     },
     MarketRegime.WEAK_TREND_UP: {
         "allowed_dir": "long",
-        "margin_mult": 0.6,        # 轻仓试探
-        "stop_pct": -5.0,
-        "tp_pct": 6.0,
+        "margin_mult": 0.6,
+        "stop_atr_mult": 2.0,       # 弱趋势止损紧
+        "tp_atr_mult": 3.0,
         "pyramid": False,
         "cooldown_s": 10,
         "desc": "弱多趋势·轻仓试探",
@@ -56,26 +56,26 @@ REGIME_CONFIG = {
     MarketRegime.WEAK_TREND_DOWN: {
         "allowed_dir": "short",
         "margin_mult": 0.6,
-        "stop_pct": -5.0,
-        "tp_pct": 6.0,
+        "stop_atr_mult": 2.0,
+        "tp_atr_mult": 3.0,
         "pyramid": False,
         "cooldown_s": 10,
         "desc": "弱空趋势·轻仓试探",
     },
     MarketRegime.HIGH_VOL_RANGING: {
-        "allowed_dir": "both",     # 高抛低吸，双向
-        "margin_mult": 0.7,        # 震荡加仓
-        "stop_pct": -5.0,          # 宽区间止损
-        "tp_pct": 4.0,             # 快进快出
+        "allowed_dir": "both",
+        "margin_mult": 0.7,
+        "stop_atr_mult": 2.5,       # 高波止损宽
+        "tp_atr_mult": 3.5,         # 快进快出
         "pyramid": False,
         "cooldown_s": 6,
         "desc": "高波震荡·高抛低吸",
     },
     MarketRegime.LOW_VOL_RANGING: {
         "allowed_dir": "both",
-        "margin_mult": 0.5,        # 震荡加仓（原0.25太保守）
-        "stop_pct": -4.0,          # 微利不留长
-        "tp_pct": 3.0,
+        "margin_mult": 0.5,
+        "stop_atr_mult": 2.0,       # 低波止损紧
+        "tp_atr_mult": 3.0,
         "pyramid": False,
         "cooldown_s": 10,
         "desc": "低波震荡·网格小刀",
@@ -83,8 +83,8 @@ REGIME_CONFIG = {
     MarketRegime.BREAKOUT_UP: {
         "allowed_dir": "long",
         "margin_mult": 1.2,
-        "stop_pct": -6.0,
-        "tp_pct": 10.0,
+        "stop_atr_mult": 2.0,       # 突破假破快跑
+        "tp_atr_mult": 4.0,
         "pyramid": False,
         "cooldown_s": 6,
         "desc": "向上突破·追多",
@@ -92,21 +92,21 @@ REGIME_CONFIG = {
     MarketRegime.BREAKOUT_DOWN: {
         "allowed_dir": "short",
         "margin_mult": 1.2,
-        "stop_pct": -6.0,
-        "tp_pct": 10.0,
+        "stop_atr_mult": 2.0,
+        "tp_atr_mult": 4.0,
         "pyramid": False,
         "cooldown_s": 6,
         "desc": "向下突破·追空",
     },
     MarketRegime.CHOPPY: {
-        "allowed_dir": "both",      # 乱震也试，极小仓
-        "margin_mult": 0.15,        # 蚊子仓试探
-        "stop_pct": -2.0,
-        "tp_pct": 2.5,
+        "allowed_dir": "both",
+        "margin_mult": 0.15,
+        "stop_atr_mult": 1.5,       # 乱震止损极紧
+        "tp_atr_mult": 2.5,
         "desc": "乱震·蚊子仓试探",
     },
     MarketRegime.DEAD: {
-        "allowed_dir": None,       # 死水不开仓
+        "allowed_dir": None,
         "margin_mult": 0,
         "desc": "死水·休眠",
     },

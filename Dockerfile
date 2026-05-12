@@ -25,25 +25,26 @@ COPY ai_strategy.py .
 COPY dual_strategy.py .
 COPY ai_position.py .
 COPY oscillation.py .
-COPY ai/ ./ai/
-COPY engine/ ./engine/
 COPY api/ ./api/
-COPY strategies/ ./strategies/
 COPY multi_exchange.py .
 COPY kline_cache.py .
 COPY market_regime.py .
 COPY trade_reflector.py .
+COPY online_learner.py .
+COPY live_engine.py .
+COPY signal_engine.py .
 COPY battle_report.py .
-COPY evolve_v2.py .
-COPY evolve.py .
+COPY tests/ ./tests/
+COPY CONTEXT.md .
+COPY ARCHITECTURE.md .
 COPY dialogue_ammo.py .
 COPY character_voice.py .
-COPY domain/ ./domain/
 COPY observability/ ./observability/
 COPY persistence/ ./persistence/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 COPY scripts/ ./scripts/
+COPY static/ ./static/
 
 # Built frontend (from web-builder stage)
 COPY --from=web-builder /app/web/dist ./web/dist

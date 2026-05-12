@@ -16,16 +16,14 @@ HIGH_VOL_ALTS = {
 # 主流币策略（BTC/ETH）：日线趋势 + 金字塔
 # ═══════════════════════════════════════════════
 STABLE_CONFIG = {
-    "margin_pct": 0.04,         # 保证金 4% 余额（主流是大头）
+    "margin_pct": 0.20,         # 保证金 20% 余额（主流是大头）
     "max_positions": 2,        # 只做 BTC 和 ETH
     "min_volume": 500000,      # 最低成交量 50万（确保流动性）
     # Gate 24h 涨跌幅为百分数；0 表示不因波动过小拒单（避免 BTC/ETH 横盘不入池）
     "min_change": 0.0,
     "max_change": 15,          # 最大涨跌幅 15%
     
-    "stop_loss_base": -15.0,   # 宽止损 -15%
-    "stop_loss_max": -80.0,    # 最大 -80%
-    
+    # 止损/止盈全部由行情+ATR实时计算
     "pyramid_levels": 4,
     "pyramid_margin_pct": 0.5,
     
@@ -39,16 +37,13 @@ STABLE_CONFIG = {
 # 波动币策略（高波动山寨）：短线爆发
 # ═══════════════════════════════════════════════
 VOLATILE_CONFIG = {
-    "margin_pct": 0.002,       # 保证金 0.2% 余额（放宽山寨仓位）
+    "margin_pct": 0.02,         # 保证金 2% 余额（山寨起步）
     "max_positions": 4,        # 最多 4 个山寨仓位（放宽）
     "min_volume": 1000000,     # 最低成交量 100万（放宽，更多机会）
     "min_change": 1.5,         # 涨跌幅至少 1.5%（放宽，不卡太死）
     "max_change": 25,          # 最大涨跌幅 25%
     
-    # 止损：适度放宽（给山寨呼吸空间）
-    "stop_loss_base": -6.0,    # 硬止损 -6%
-    "stop_loss_max": -12.0,    # 最大 -12%
-    
+    # 止损/止盈全部由行情+ATR实时计算
     # 禁止补仓
     "pyramid_levels": 0,       # 波动币绝对不加仓
     

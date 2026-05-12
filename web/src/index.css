@@ -258,7 +258,142 @@ body::before {
   color: var(--accent-cyan);
   text-shadow: 0 0 10px rgba(0,240,255,0.5);
 }
-.topbar-right { display: flex; align-items: center; gap: 14px; }
+.topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.topbar-controls-trading {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.mode-switch {
+  display: inline-flex;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid rgba(176, 38, 255, 0.35);
+  background: rgba(0, 0, 0, 0.35);
+}
+.mode-switch button {
+  border: none;
+  cursor: pointer;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-display);
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: transparent;
+  transition: background 0.15s, color 0.15s;
+}
+.mode-switch button:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+.mode-switch button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.mode-switch button.mode-switch--on {
+  background: rgba(176, 38, 255, 0.22);
+  color: var(--accent-purple);
+  box-shadow: inset 0 0 12px rgba(176, 38, 255, 0.15);
+}
+.mode-switch button.mode-switch--on-live {
+  background: rgba(0, 255, 136, 0.14);
+  color: #00ff88;
+  box-shadow: inset 0 0 14px rgba(0, 255, 136, 0.12);
+}
+.btn-live-trade {
+  padding: 5px 16px;
+  border-radius: 9999px;
+  border: none;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+  transition: transform 0.1s, box-shadow 0.2s;
+}
+.btn-live-trade--start {
+  background: linear-gradient(180deg, #ff5566, #cc2233);
+  color: #fff;
+  box-shadow: 0 0 14px rgba(255, 51, 102, 0.35);
+}
+.btn-live-trade--start:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 0 20px rgba(255, 51, 102, 0.45);
+}
+.btn-live-trade--stop {
+  background: rgba(0, 255, 136, 0.12);
+  color: #00ff88;
+  border: 1px solid rgba(0, 255, 136, 0.45);
+}
+.btn-live-trade:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CONFIRM MODAL — 与顶栏「开始交易」同一套霓虹质感
+   ═══════════════════════════════════════════════════════════ */
+.shark-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(4, 8, 18, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.shark-confirm-panel {
+  width: 100%;
+  max-width: 400px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-accent);
+  border-radius: 10px;
+  box-shadow: var(--glow-cyan), 0 24px 48px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.shark-confirm-title {
+  padding: 14px 18px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  font-family: var(--font-display);
+  border-bottom: 1px solid var(--border-glass);
+}
+.shark-confirm-body {
+  padding: 16px 18px 18px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.shark-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 0 18px 16px;
+}
+.btn-modal-cancel {
+  padding: 5px 16px;
+  border-radius: 9999px;
+  border: 1px solid var(--border-accent);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: var(--font-display);
+  letter-spacing: 0.05em;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.btn-modal-cancel:hover {
+  color: var(--text-primary);
+  border-color: rgba(0, 240, 255, 0.45);
+  background: rgba(0, 240, 255, 0.06);
+}
 
 /* ═══════════════════════════════════════════════════════════
    EMPTY STATE

@@ -1,23 +1,24 @@
 """
-止损反思引擎 — 每单亏损后自动诊断原因，识别模式并调整战术
-嵌入 main.py StrategyRunner，平仓时自动触发
+止损反思引擎 v2 — AI驱动多维诊断
+每笔亏损后：本地快速分类 + AI深度分析 → 立即调整下笔策略
 """
 
 import time
+import json
 
 
 class LossReason:
-    SIGNAL_WEAK = "signal_weak"         # AI低置信/兜底信号
-    REGIME_FLIP = "regime_flip"          # 行情反转（趋势→震荡）
-    STOP_TOO_TIGHT = "stop_too_tight"    # 止损被正常波动穿透
-    BAD_ENTRY = "bad_entry"              # 入场在区间极值（追高/抄底）
-    WRONG_DIR = "wrong_dir"              # 方向错误（开仓后秒亏）
-    MICRO_LOSS = "micro_loss"            # 微利被手续费吃掉
-    NORMAL = "normal"                    # 正常亏损
+    SIGNAL_WEAK = "signal_weak"
+    REGIME_FLIP = "regime_flip"
+    STOP_TOO_TIGHT = "stop_too_tight"
+    BAD_ENTRY = "bad_entry"
+    WRONG_DIR = "wrong_dir"
+    MICRO_LOSS = "micro_loss"
+    NORMAL = "normal"
 
 
 class Reflector:
-    """止损反思器，累积模式后触发战术调整"""
+    """止损反思器：本地快速分类 + AI深度诊断 → 实时调整"""
 
     def __init__(self):
         self.counters = {r: 0 for r in [
@@ -31,13 +32,12 @@ class Reflector:
         self.ai_boost = 0           # AI阈值临时提高量
         self.stop_boost = 0         # 止损临时放宽量（百分点）
         self.signal_throttle = 0    # 兜底信号临时禁用计数器
+        self.ai_insights = []       # AI深度分析历史
+        self._last_ai_call = 0      # 节流AI调用
 
-    def analyze(self, sym, pos, realized, pnl_pct, reason, px,  # noqa: PLR0917
+    def analyze(self, sym, pos, realized, pnl_pct, reason, px,
                 regime_cache: dict, kline_cache) -> list:
-        """
-        分析单笔亏损，返回识别到的问题标签列表
-        仅在亏损时调用
-        """
+        """快速本地分类 + 触发AI深度分析"""
         if realized >= 0:
             self.total_wins += 1
             return []
@@ -61,37 +61,35 @@ class Reflector:
             self.counters[LossReason.SIGNAL_WEAK] += 1
             tags.append(LossReason.SIGNAL_WEAK)
 
-        # 2. 止损是否被正常波动穿透（实际亏损 > 入场波动 × 2.5）
+        # 2. 止损过紧
         vol_at_entry = abs(pos.get("vol_chg", 3))
         actual_loss = abs(pnl_pct)
         if actual_loss > vol_at_entry * 2.5:
             self.counters[LossReason.STOP_TOO_TIGHT] += 1
             tags.append(LossReason.STOP_TOO_TIGHT)
 
-        # 3. 入场位置（高位做多 / 低位做空）
+        # 3. 入场位置
         side = pos.get("side", "")
         if (side == "long" and pos_in_range > 75) or (side == "short" and pos_in_range < 25):
             self.counters[LossReason.BAD_ENTRY] += 1
             tags.append(LossReason.BAD_ENTRY)
 
-        # 4. 方向错误（持仓<60秒就亏）
+        # 4. 方向错误
         opened = pos.get("opened", 0)
         held = time.time() - opened if opened else 999
         if held < 60:
             self.counters[LossReason.WRONG_DIR] += 1
             tags.append(LossReason.WRONG_DIR)
 
-        # 5. 微利被手续费吃掉（亏损 < $0.02）
+        # 5. 微利
         if abs(realized) < 0.02:
             self.counters[LossReason.MICRO_LOSS] += 1
             tags.append(LossReason.MICRO_LOSS)
 
-        # 无匹配 → 正常亏损
         if not tags:
             self.counters[LossReason.NORMAL] += 1
             tags.append(LossReason.NORMAL)
 
-        # 日志
         tag_str = ", ".join(tags)
         print(
             f"[反思] {sym} {side} 亏{realized:.4f}({pnl_pct:.1f}%) "
@@ -99,51 +97,110 @@ class Reflector:
             f"区间位={pos_in_range:.0f} 持{held:.0f}s",
             flush=True,
         )
-
         return tags
 
+    def build_ai_prompt(self, sym, pos, realized, pnl_pct, reason, px,
+                        regime_cache: dict, local_tags: list) -> str:
+        """构建AI深度诊断的prompt"""
+        rc = regime_cache.get(sym, {})
+        diag = rc.get("diag", {})
+        regime = rc.get("regime", "unknown")
+
+        # 收集近期的调整状态
+        adjustments = []
+        if self.ai_boost:
+            adjustments.append(f"AI阈值已+{self.ai_boost}")
+        if self.stop_boost:
+            adjustments.append(f"止损已放宽{self.stop_boost}%")
+
+        return f"""你是量化交易策略分析师。分析这笔亏损的深层原因并给出具体的参数调整建议。
+
+【交易信息】
+币对: {sym}
+方向: {pos.get('side', '?')}
+入场价: {pos.get('entry', 0):.4f}
+平仓价: {px:.4f}
+亏损: {realized:.4f} USDT ({pnl_pct:.1f}%)
+持仓时长: {time.time() - pos.get('opened', time.time()):.0f}秒
+信号源: {pos.get('signal_src', 'unknown')}
+AI置信度: {pos.get('ai_confidence', 0)}
+原因标签: {', '.join(local_tags)}
+
+【市场环境】
+行情类型: {regime}
+RSI: {diag.get('rsi', '?')}
+价格区间位: {diag.get('pos', '?')}%
+成交量变化: {pos.get('vol_chg', '?')}%
+资金费率: {diag.get('funding', '?')}
+
+【当前调整状态】
+{chr(10).join(adjustments) if adjustments else '无历史调整'}
+
+请输出JSON格式（只输出JSON，不要其他内容）：
+{{
+  "root_cause": "一句话根因（中文）",
+  "dimensions": ["维度1分析", "维度2分析", ...],
+  "adjustments": {{
+    "ai_threshold": 数字,    // AI阈值调整（当前{self.ai_boost}，建议+5/-5/0）
+    "stop_boost": 数字,      // 止损放宽（当前{self.stop_boost}%，建议值）
+    "entry_filter": true/false, // 是否加强入场过滤
+    "cooldown_bonus": 数字,  // 冷却增加（秒）
+    "tp_boost": true/false   // 是否提高止盈门槛
+  }},
+  "confidence": 数字,        // 0-100 诊断置信度
+  "next_action": "下笔建议（中文）"
+}}"""
+
+    def apply_ai_adjustments(self, adjustments: dict) -> str:
+        """应用AI返回的调整建议"""
+        msgs = []
+        if "ai_threshold" in adjustments:
+            delta = adjustments["ai_threshold"]
+            if delta != 0:
+                self.ai_boost = max(0, self.ai_boost + delta)
+                msgs.append(f"AI阈值→{self.ai_boost}")
+        if "stop_boost" in adjustments:
+            self.stop_boost = float(adjustments["stop_boost"])
+            msgs.append(f"止损→+{self.stop_boost}%")
+        if adjustments.get("entry_filter"):
+            msgs.append("入场过滤开启")
+        if "cooldown_bonus" in adjustments:
+            msgs.append(f"冷却+{adjustments['cooldown_bonus']}s")
+        if adjustments.get("tp_boost"):
+            msgs.append("止盈门槛提高")
+        return ", ".join(msgs)
+
     def maybe_adjust(self) -> dict:
-        """累积足够样本后触发战术调整，返回调整指令"""
+        """累积足够样本后触发战术调整"""
         total = self.total_losses
         if total < 5:
-            return {}  # 样本不够（放宽至5笔）
+            return {}
 
         adjustments = {}
 
-        # 信号质量差（>50%亏损来自弱信号）→ 提高AI阈值
         weak_rate = self.counters[LossReason.SIGNAL_WEAK] / total
         if weak_rate > 0.5 and self.ai_boost < 10:
             self.ai_boost += 5
             adjustments["ai_boost"] = self.ai_boost
-            print(f"[进化] 信号质量差({weak_rate:.0%})，AI阈值临时+{self.ai_boost}", flush=True)
 
-        # 止损过紧（>40%亏损被波动穿透）→ 放宽止损
         tight_rate = self.counters[LossReason.STOP_TOO_TIGHT] / total
         if tight_rate > 0.4 and self.stop_boost < 4:
             self.stop_boost += 1.5
             adjustments["stop_boost"] = self.stop_boost
-            print(f"[进化] 止损过紧({tight_rate:.0%})，止损放宽+{self.stop_boost}%", flush=True)
 
-        # 入场差（>30%买在极值）→ 增加入场过滤
         entry_rate = self.counters[LossReason.BAD_ENTRY] / total
         if entry_rate > 0.3:
             adjustments["entry_filter"] = True
-            print(f"[进化] 入场位差({entry_rate:.0%})，增加RSI入场过滤", flush=True)
 
-        # 方向错误（>40%秒亏）→ 暂停兜底信号
         wrong_rate = self.counters[LossReason.WRONG_DIR] / total
         if wrong_rate > 0.4:
             self.signal_throttle = min(self.signal_throttle + 5, 20)
             adjustments["signal_throttle"] = self.signal_throttle
-            print(f"[进化] 方向错误({wrong_rate:.0%})，兜底冷却+{self.signal_throttle}s", flush=True)
 
-        # 微利亏损（>25%被手续费吃掉）→ 提高止盈门槛
         micro_rate = self.counters[LossReason.MICRO_LOSS] / total
         if micro_rate > 0.25:
             adjustments["tp_boost"] = True
-            print(f"[进化] 微利亏损({micro_rate:.0%})，提高止盈净利门槛", flush=True)
 
-        # 重置计数器（保留调整状态）
         if adjustments:
             self.counters = {r: 0 for r in self.counters}
             self.total_losses = 0
@@ -153,7 +210,6 @@ class Reflector:
         return adjustments
 
     def summary(self) -> str:
-        """返回当前反思统计"""
         total = self.total_losses
         if total == 0:
             return "无亏损记录"
