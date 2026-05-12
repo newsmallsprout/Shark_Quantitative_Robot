@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// MacroBuilder — BTC/ETH 宏观环境分析
+// MacroBuilder — 各币对 USDT 永续日 K 宏观（ATR / regime / 波动）
 type MacroBuilder struct {
 	cache  map[string]*MacroContext
 	client *http.Client
@@ -36,6 +36,9 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("candlesticks http %d", resp.StatusCode)
+	}
 
 	var raw []struct {
 		C string `json:"c"`
@@ -107,6 +110,12 @@ func (m *MacroBuilder) Get(symbol string) *MacroContext {
 		return c
 	}
 	return &MacroContext{Symbol: symbol, Regime: RegimeUnknown, ATR14: 0}
+}
+
+// Cached 是否已有该交易对的成功 Fetch 结果（失败不会写入 cache）。
+func (m *MacroBuilder) Cached(symbol string) bool {
+	_, ok := m.cache[symbol]
+	return ok
 }
 
 // ── 计算工具 ──

@@ -57,9 +57,6 @@ func (p *Planner) Bootstrap(ctx context.Context) error {
 
 	p.fetchPrices(ctx)
 
-	_ = p.macro.Fetch(ctx, "BTC/USDT")
-	_ = p.macro.Fetch(ctx, "ETH/USDT")
-
 	digest := p.news.Fetch(ctx)
 
 	bootstrapOrder := priorityOrder(p.symbols)
@@ -89,6 +86,10 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 
 	if !IsLargeCap(symbol) {
 		return nil
+	}
+
+	if err := p.macro.Fetch(ctx, symbol); err != nil {
+		log.Printf("[Planning] 永续宏观(%s): %v — ATR/regime 本币回退", symbol, err)
 	}
 
 	depth, err := p.book.Fetch(ctx, symbol)
@@ -152,8 +153,6 @@ func (p *Planner) PlanAll(ctx context.Context) {
 	log.Printf("[Planning] 开始全量计划更新 (%d个币对)...", len(p.symbols))
 
 	p.fetchPrices(ctx)
-	_ = p.macro.Fetch(ctx, "BTC/USDT")
-	_ = p.macro.Fetch(ctx, "ETH/USDT")
 
 	digest := p.news.Fetch(ctx)
 
@@ -372,31 +371,19 @@ func (p *Planner) fetchFunding(ctx context.Context, symbol string) float64 {
 }
 
 func (p *Planner) getMacro(symbol string) *MacroContext {
-	macro := p.macro.Get(symbol)
-	if macro != nil {
-		return macro
-	}
-	// 山寨币用BTC宏观推断
-	if btcMacro := p.macro.Get("BTC/USDT"); btcMacro != nil {
-		px := p.prices[symbol]
-		if px <= 0 {
-			px = 80000
-		}
-		return &MacroContext{
-			Symbol:   symbol,
-			Regime:   btcMacro.Regime,
-			ATR14:    px * 0.02,
-			VolPct:   btcMacro.VolPct,
-			TrendStr: btcMacro.TrendStr,
-		}
+	if p.macro.Cached(symbol) {
+		return p.macro.Get(symbol)
 	}
 	px := p.prices[symbol]
 	if px <= 0 {
 		px = 80000
 	}
 	return &MacroContext{
-		Symbol: symbol, Regime: RegimeRange,
-		ATR14: px * 0.02, VolPct: 50,
+		Symbol:   symbol,
+		Regime:   RegimeRange,
+		ATR14:    px * 0.02,
+		VolPct:   50,
+		TrendStr: 0,
 	}
 }
 
