@@ -3,7 +3,7 @@
 # ═══════════════════════════════════════════════
 # 币种分类
 # ═══════════════════════════════════════════════
-STABLE_COINS = {"BTC/USDT", "ETH/USDT"}  # 主流币：日线波段
+STABLE_COINS = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}  # 主流币：日线波段
 
 # 高波动山寨精选（只做这些，小刀赚微利）
 HIGH_VOL_ALTS = {
@@ -17,7 +17,7 @@ HIGH_VOL_ALTS = {
 # ═══════════════════════════════════════════════
 STABLE_CONFIG = {
     "margin_pct": 0.20,         # 保证金 20% 余额（主流是大头）
-    "max_positions": 2,        # 只做 BTC 和 ETH
+    "max_positions": 3,        # BTC + ETH + SOL
     "min_volume": 500000,      # 最低成交量 50万（确保流动性）
     # Gate 24h 涨跌幅为百分数；0 表示不因波动过小拒单（避免 BTC/ETH 横盘不入池）
     "min_change": 0.0,

@@ -66,6 +66,21 @@ func (kb *KnowledgeBase) IngestAlert(alert TVAlert) {
 	kb.Sentiment[alert.Symbol] = current*0.9 + sentimentDelta*0.1 // EMA
 }
 
+// GetTVInsights returns a human-readable summary of TV community insights for a symbol
+func (kb *KnowledgeBase) GetTVInsights(symbol string) string {
+	kb.mu.RLock()
+	defer kb.mu.RUnlock()
+	sentiment := kb.Sentiment[symbol]
+	bias := "中性"
+	if sentiment > 0.2 {
+		bias = "看多"
+	} else if sentiment < -0.2 {
+		bias = "看空"
+	}
+	return fmt.Sprintf("社区情绪: %s(%.2f) 信号数: %d 模式数: %d",
+		bias, sentiment, len(kb.Signals), len(kb.Patterns))
+}
+
 // GetSentiment returns the current sentiment for a symbol
 func (kb *KnowledgeBase) GetSentiment(symbol string) float64 {
 	kb.mu.RLock()

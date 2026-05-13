@@ -31,6 +31,9 @@ type Planner struct {
 	evo       *EvoState
 	lastPlan  int64
 	symbols   []string
+
+	// TV insights (set from main.go)
+	tvFn func(symbol string) string
 }
 
 func NewPlanner(rdb *redis.Client, symbols []string) *Planner {
@@ -48,6 +51,9 @@ func NewPlanner(rdb *redis.Client, symbols []string) *Planner {
 		symbols: symbols,
 	}
 }
+
+// SetTVFn sets the TradingView insights provider (closure from main.go)
+func (p *Planner) SetTVFn(fn func(string) string) { p.tvFn = fn }
 
 func (p *Planner) State() PlanningState { return p.state }
 
@@ -112,7 +118,10 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 
 	funding := p.fetchFunding(ctx, symbol)
 
-	plan := p.buildPlan(symbol, depth, macro, digest, funding)
+	plan := p.buildPlan(ctx, symbol, depth, macro, digest, funding)
+	if plan == nil {
+		return nil // 无价格数据，跳过
+	}
 	plan.GeneratedAt = time.Now().Unix()
 	plan.ValidUntil = plan.GeneratedAt + 1800
 	plan.EvoGen = p.evo.Generation
@@ -124,7 +133,10 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 
 	data, _ := json.Marshal(plan)
 	key := fmt.Sprintf("shark:plan:%s", symbol)
-	p.rdb.Set(ctx, key, data, 35*time.Minute)
+	if err := p.rdb.Set(ctx, key, data, 35*time.Minute).Err(); err != nil {
+		log.Printf("[Planning] Redis写入失败(%s): %v", symbol, err)
+		return nil
+	}
 	p.rdb.Publish(ctx, "shark:plan:updated", string(data))
 
 	if digest.RiskLevel >= 2 {
@@ -166,9 +178,9 @@ func (p *Planner) PlanAll(ctx context.Context) {
 		}
 	}
 
-	// 自进化：每3个周期评估一次
+	// 自进化：每6个周期评估一次（3币对×6=18计划）
 	p.evo.PlansGenerated += successCount
-	if p.evo.PlansGenerated%105 == 0 {
+	if p.evo.PlansGenerated >= 18 && p.evo.PlansGenerated%18 == 0 {
 		p.evolve(ctx)
 	}
 
@@ -387,27 +399,23 @@ func (p *Planner) getMacro(symbol string) *MacroContext {
 	}
 }
 
-// buildPlan — 纯数学构建 RangePlan（自进化 multiplier 驱动）
-func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroContext,
-	news *NewsDigest, funding float64) *RangePlan {
+// buildPlan — AI 主导（DeepSeek→数学审计兜底）
+// v3: AI 优先，失败降级到纯数学
+func (p *Planner) buildPlan(ctx context.Context, symbol string, depth *DepthProfile,
+	macro *MacroContext, news *NewsDigest, funding float64) *RangePlan {
 
 	px := p.prices[symbol]
 	if px <= 0 {
-		px = 80000
+		return nil
 	}
 
 	pxPlan := px
 	if depth != nil && depth.SupportPrice > 0 && depth.ResistancePrice > depth.SupportPrice {
 		midBook := (depth.SupportPrice + depth.ResistancePrice) / 2
 		if midBook > 0 {
-			if pxPlan <= 0 {
-				pxPlan = midBook
-			} else {
-				dv := math.Abs(midBook-pxPlan) / pxPlan
-				if dv <= 0.05 {
-					// 订单簿重心与 ticker 接近时，用中间价减少区间锚在「错价」上
-					pxPlan = (pxPlan + midBook) / 2
-				}
+			dv := math.Abs(midBook-pxPlan) / pxPlan
+			if dv <= 0.05 {
+				pxPlan = (pxPlan + midBook) / 2
 			}
 		}
 	}
@@ -415,20 +423,159 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 		pxPlan = px
 	}
 
-	e := p.evo
 	atr := macro.ATR14
 	if atr <= 0 {
 		atr = pxPlan * 0.02
 	}
 
+	// 尝试 AI 生成
+	if aiPlan, err := p.tryAIBuild(ctx, symbol, pxPlan, atr, depth, macro, news, funding); err == nil && aiPlan != nil {
+		if err := p.audit(aiPlan); err != nil {
+			log.Printf("[AI] %s 审计失败(%v)，降级到数学", symbol, err)
+		} else {
+			log.Printf("[AI] ✅ %s 计划由 %s 生成 conf=%.0f", symbol, aiPlan.AiModel, aiPlan.AiConfidence)
+			return aiPlan
+		}
+	}
+
+	// ── 数学 fallback ──
+	return p.mathBuild(symbol, pxPlan, atr, depth, macro, news, funding)
+}
+
+// tryAIBuild 尝试用 AI 生成计划，失败返回 error
+func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64,
+	depth *DepthProfile, macro *MacroContext, news *NewsDigest, funding float64) (*RangePlan, error) {
+
+	// 构建 AI 分析上下文
+	pc := &PlanContext{
+		Symbol:       symbol,
+		Regime:       string(macro.Regime),
+		Price:        px,
+		ATR14:        atr,
+		FundingRate:  funding,
+		SupportStr:   depth.SupportStrength,
+		ResistanceStr: depth.ResistanceStrength,
+		NewsRisk:    news.RiskLevel,
+		NewsFlags:   news.Flags,
+	}
+	if pc.SupportStr <= 0 {
+		pc.SupportStr = 0.5
+	}
+	if pc.ResistanceStr <= 0 {
+		pc.ResistanceStr = 0.5
+	}
+	// 估算区间供 AI 参考
+	pc.RangeLow = px - atr*1.5
+	pc.RangeHigh = px + atr*1.5
+
+	// TV insights
+	if p.tvFn != nil {
+		pc.TVInsights = p.tvFn(symbol)
+	}
+
+	// 调用 AI
+	ai, err := p.aiGeneratePlan(ctx, symbol, pc)
+	if err != nil {
+		return nil, err
+	}
+
+	// AI → RangePlan
+	plan := &RangePlan{
+		Symbol:       symbol,
+		Regime:       string(macro.Regime),
+		LeverageCap:  5,
+		ATR14:        atr,
+		AiModel:      "deepseek",
+		AiRationale:  ai.Rationale,
+		AiConfidence: ai.Confidence,
+		PositionSizePct: ai.PositionSizePct,
+		Leverage:        ai.Leverage,
+		PyramidPrices:   ai.PyramidPrices,
+		CutLossPct:      ai.CutLossPct,
+		SupportStrength: depth.SupportStrength,
+		ResistanceStrength: depth.ResistanceStrength,
+		NewsRiskLevel:  news.RiskLevel,
+		RiskFlags:      news.Flags,
+		MacroRegime:    macro.Regime,
+		FundingRate:    funding,
+	}
+
+	// 填入 AI 产出的区间值
+	aiRangeLow := ai.LongEntryLow
+	aiRangeHigh := ai.LongEntryHigh
+	hasLong := ai.LongEntryLow > 0 && ai.LongEntryHigh > ai.LongEntryLow
+	hasShort := ai.ShortEntryLow > 0 && ai.ShortEntryHigh > ai.ShortEntryLow
+
+	if hasLong && hasShort {
+		plan.Bias = "both"
+		plan.LongEntryLow = ai.LongEntryLow
+		plan.LongEntryHigh = ai.LongEntryHigh
+		plan.LongStopLoss = ai.LongSL
+		plan.LongTakeProfit = ai.LongTP
+		plan.ShortEntryLow = ai.ShortEntryLow
+		plan.ShortEntryHigh = ai.ShortEntryHigh
+		plan.ShortStopLoss = ai.ShortSL
+		plan.ShortTakeProfit = ai.ShortTP
+		plan.RangeLow = math.Min(ai.LongEntryLow*0.995, ai.LongSL)
+		plan.RangeHigh = math.Max(ai.ShortEntryHigh*1.005, ai.ShortSL)
+	} else if hasLong {
+		plan.Bias = "long"
+		plan.EntryZoneLow = ai.LongEntryLow
+		plan.EntryZoneHigh = ai.LongEntryHigh
+		plan.StopLoss = ai.LongSL
+		plan.TakeProfit = ai.LongTP
+		plan.LongEntryLow = ai.LongEntryLow
+		plan.LongEntryHigh = ai.LongEntryHigh
+		plan.LongStopLoss = ai.LongSL
+		plan.LongTakeProfit = ai.LongTP
+		aiRangeLow = ai.LongEntryLow
+		aiRangeHigh = ai.LongTP[len(ai.LongTP)-1]
+	} else if hasShort {
+		plan.Bias = "short"
+		plan.EntryZoneLow = ai.ShortEntryLow
+		plan.EntryZoneHigh = ai.ShortEntryHigh
+		plan.StopLoss = ai.ShortSL
+		plan.TakeProfit = ai.ShortTP
+		plan.ShortEntryLow = ai.ShortEntryLow
+		plan.ShortEntryHigh = ai.ShortEntryHigh
+		plan.ShortStopLoss = ai.ShortSL
+		plan.ShortTakeProfit = ai.ShortTP
+		aiRangeLow = ai.ShortTP[len(ai.ShortTP)-1]
+		aiRangeHigh = ai.ShortEntryHigh
+	} else {
+		return nil, fmt.Errorf("AI未产出有效入场")
+	}
+
+	if aiRangeHigh <= 0 || aiRangeLow <= 0 || aiRangeHigh <= aiRangeLow {
+		plan.RangeLow = px * 0.99
+		plan.RangeHigh = px * 1.01
+	} else {
+		plan.RangeLow = math.Min(aiRangeLow, px)
+		plan.RangeHigh = math.Max(aiRangeHigh, px)
+	}
+	if plan.RangeHigh-plan.RangeLow < px*0.002 {
+		plan.RangeLow = px * 0.99
+		plan.RangeHigh = px * 1.01
+	}
+
+	// 基于 AI 的区间调用 clampPlan
+	clampPlan(plan, px)
+	return plan, nil
+}
+
+// mathBuild 纯数学构建（原 buildPlan 逻辑，AI 失败时的 fallback）
+func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
+	depth *DepthProfile, macro *MacroContext, news *NewsDigest, funding float64) *RangePlan {
+
+	e := p.evo
 	plan := &RangePlan{
 		Symbol:      symbol,
 		Regime:      string(macro.Regime),
 		LeverageCap: 5,
 		ATR14:       atr,
+		AiModel:     "math",
 	}
 
-	// 区间：ATR 带，并至少覆盖订单簿支撑/压力
 	plan.RangeLow = pxPlan - atr*e.AtRMult
 	plan.RangeHigh = pxPlan + atr*e.AtRMult
 	if depth != nil && depth.SupportPrice > 0 && depth.ResistancePrice > depth.SupportPrice {
@@ -436,29 +583,44 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 		plan.RangeHigh = math.Max(plan.RangeHigh, depth.ResistancePrice)
 	}
 
-	// 方向 + 入场带
 	switch {
-	case macro.Regime == RegimeTrendUp && depth.SupportStrength > 0.5:
+	case macro.Regime == RegimeTrendUp:
 		plan.Bias = "long"
-		plan.EntryZoneLow = depth.SupportPrice
+		plan.EntryZoneLow = pxPlan - atr*e.AtRMult*0.3
 		plan.EntryZoneHigh = pxPlan - atr*e.EntryMargin
-		plan.StopLoss = depth.SupportPrice - atr*e.StopOffset
-	case macro.Regime == RegimeTrendDown && depth.ResistanceStrength > 0.5:
+		plan.StopLoss = plan.EntryZoneLow - atr*e.StopOffset
+		plan.TakeProfit = []float64{pxPlan + atr*e.TpMult, pxPlan + atr*e.TpMult*2}
+		plan.LongEntryLow = plan.EntryZoneLow
+		plan.LongEntryHigh = plan.EntryZoneHigh
+		plan.LongStopLoss = plan.StopLoss
+		plan.LongTakeProfit = plan.TakeProfit
+
+	case macro.Regime == RegimeTrendDown:
 		plan.Bias = "short"
 		plan.EntryZoneLow = pxPlan + atr*e.EntryMargin
-		plan.EntryZoneHigh = depth.ResistancePrice
-		plan.StopLoss = depth.ResistancePrice + atr*e.StopOffset
-	default:
-		plan.Bias = "long"
-		plan.EntryZoneLow = depth.SupportPrice
-		plan.EntryZoneHigh = pxPlan - atr*e.EntryMargin
-		plan.StopLoss = depth.SupportPrice - atr*e.StopOffset
-	}
-
-	if plan.Bias == "short" {
+		plan.EntryZoneHigh = pxPlan + atr*e.AtRMult*0.3
+		plan.StopLoss = plan.EntryZoneHigh + atr*e.StopOffset
 		plan.TakeProfit = []float64{pxPlan - atr*e.TpMult, pxPlan - atr*e.TpMult*2}
-	} else {
-		plan.TakeProfit = []float64{pxPlan + atr*e.TpMult, pxPlan + atr*e.TpMult*2}
+		plan.ShortEntryLow = plan.EntryZoneLow
+		plan.ShortEntryHigh = plan.EntryZoneHigh
+		plan.ShortStopLoss = plan.StopLoss
+		plan.ShortTakeProfit = plan.TakeProfit
+
+	default:
+		plan.Bias = "both"
+		midRange := (plan.RangeLow + plan.RangeHigh) / 2
+		plan.LongEntryLow = plan.RangeLow
+		plan.LongEntryHigh = plan.RangeLow + atr*e.EntryMargin
+		plan.LongStopLoss = plan.RangeLow - atr*e.StopOffset
+		plan.LongTakeProfit = []float64{midRange, plan.RangeHigh}
+		plan.ShortEntryLow = plan.RangeHigh - atr*e.EntryMargin
+		plan.ShortEntryHigh = plan.RangeHigh
+		plan.ShortStopLoss = plan.RangeHigh + atr*e.StopOffset
+		plan.ShortTakeProfit = []float64{midRange, plan.RangeLow}
+		plan.EntryZoneLow = plan.LongEntryLow
+		plan.EntryZoneHigh = plan.ShortEntryHigh
+		plan.StopLoss = plan.LongStopLoss
+		plan.TakeProfit = plan.LongTakeProfit
 	}
 
 	plan.SupportStrength = depth.SupportStrength
@@ -473,6 +635,38 @@ func (p *Planner) buildPlan(symbol string, depth *DepthProfile, macro *MacroCont
 }
 
 func clampPlan(plan *RangePlan, px float64) {
+	// both 方向：同时修正 long 和 short 的入场带
+	if plan.Bias == "both" {
+		minZone := px * 0.005 // 最低入场带宽 = 0.5%
+		if plan.LongEntryLow > px || plan.LongEntryLow <= 0 {
+			plan.LongEntryLow = px * 0.97
+		}
+		if plan.LongEntryHigh-plan.LongEntryLow < minZone {
+			plan.LongEntryHigh = plan.LongEntryLow + minZone
+			if plan.LongEntryHigh > px {
+				plan.LongEntryHigh = px * 0.995
+			}
+		}
+		if plan.ShortEntryLow < px || plan.ShortEntryLow <= 0 {
+			plan.ShortEntryLow = px * 1.005
+		}
+		if plan.ShortEntryHigh-plan.ShortEntryLow < minZone {
+			plan.ShortEntryHigh = plan.ShortEntryLow + minZone
+			if plan.ShortEntryHigh < px {
+				plan.ShortEntryHigh = px * 1.03
+			}
+		}
+		if plan.LongStopLoss >= plan.LongEntryLow || plan.LongStopLoss <= 0 {
+			plan.LongStopLoss = plan.LongEntryLow * 0.97
+		}
+		if plan.ShortStopLoss <= plan.ShortEntryHigh || plan.ShortStopLoss <= 0 {
+			plan.ShortStopLoss = plan.ShortEntryHigh * 1.03
+		}
+		plan.EntryZoneLow = plan.LongEntryLow
+		plan.EntryZoneHigh = plan.ShortEntryHigh
+		plan.StopLoss = plan.LongStopLoss
+		return
+	}
 	// 支撑不应高于现价
 	if plan.Bias == "long" && plan.EntryZoneLow > px {
 		plan.EntryZoneLow = px * 0.97

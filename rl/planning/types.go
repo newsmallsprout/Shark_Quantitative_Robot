@@ -26,19 +26,11 @@ const (
 	RegimeUnknown   Regime = "unknown"
 )
 
-// MarketCapFiltered 市值 > $1B 的 Gate.io 合约币对
-var LargeCapSymbols = []string{
-	"BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-	"DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "MATIC/USDT",
-	"UNI/USDT", "LINK/USDT", "SHIB/USDT", "LTC/USDT", "ATOM/USDT",
-	"FIL/USDT", "APT/USDT", "ARB/USDT", "OP/USDT", "NEAR/USDT",
-	"INJ/USDT", "SUI/USDT", "TIA/USDT", "SEI/USDT", "WIF/USDT",
-	"PEPE/USDT", "FET/USDT", "RENDER/USDT", "TAO/USDT", "ENA/USDT",
-	"STRK/USDT", "JUP/USDT", "W/USDT", "ONDO/USDT", "BONK/USDT",
-}
+// FocusSymbols 专注币对
+var FocusSymbols = []string{"BTC/USDT", "ETH/USDT", "SOL/USDT"}
 
 func IsLargeCap(symbol string) bool {
-	for _, s := range LargeCapSymbols {
+	for _, s := range FocusSymbols {
 		if s == symbol {
 			return true
 		}
@@ -85,6 +77,26 @@ type RangePlan struct {
 
 	// 进化标记
 	EvoGen int `json:"evo_gen"` // 当前进化代数
+
+	// AI 驱动字段
+	AiRationale     string    `json:"ai_rationale"`       // AI分析摘要
+	PositionSizePct float64   `json:"position_size_pct"`  // 仓位%余额
+	Leverage        int       `json:"leverage"`            // 建议杠杆
+	PyramidPrices   []float64 `json:"pyramid_prices"`      // 补仓点位
+	CutLossPct      float64   `json:"cut_loss_pct"`        // 割肉线%
+	AiModel         string    `json:"ai_model"`            // "deepseek"|"qwen"|"math"
+	AiConfidence    float64   `json:"ai_confidence"`       // 0-100
+
+	// 震荡双方向（regime=range_bound 时同时填充）
+	LongEntryLow   float64   `json:"long_entry_low"`
+	LongEntryHigh  float64   `json:"long_entry_high"`
+	LongStopLoss   float64   `json:"long_stop_loss"`
+	LongTakeProfit []float64 `json:"long_take_profit"`
+
+	ShortEntryLow  float64   `json:"short_entry_low"`
+	ShortEntryHigh float64   `json:"short_entry_high"`
+	ShortStopLoss  float64   `json:"short_stop_loss"`
+	ShortTakeProfit []float64 `json:"short_take_profit"`
 }
 
 // MacroContext 大盘环境快照
@@ -149,10 +161,10 @@ type EvoState struct {
 
 func DefaultEvo() *EvoState {
 	return &EvoState{
-		AtRMult:     2.0,
-		StopOffset:  0.5,
-		TpMult:      1.5,
-		EntryMargin: 0.3,
+		AtRMult:     1.5,   // 超短线：更窄区间
+		StopOffset:  0.6,   // 更紧止损
+		TpMult:      1.5,   // 更快止盈
+		EntryMargin: 0.10,  // 更窄入场带
 	}
 }
 

@@ -103,12 +103,14 @@ func getBalance() float64 {
 // ═══════════════════════════════════════════════
 
 type TradeCmd struct {
-	Symbol   string `json:"symbol"`
-	Side     string `json:"side"`
-	Size     int    `json:"size"`
-	Leverage int    `json:"leverage"`
-	Action   string `json:"action"` // "open" or "close"
-	Mode     string `json:"mode"`   // "paper" or "live"
+	Symbol     string  `json:"symbol"`
+	Side       string  `json:"side"`
+	Size       int     `json:"size"`
+	Leverage   int     `json:"leverage"`
+	Action     string  `json:"action"` // "open" or "close"
+	Mode       string  `json:"mode"`   // "paper" or "live"
+	StopLoss   float64 `json:"stop_loss,omitempty"`
+	TakeProfit float64 `json:"take_profit,omitempty"`
 }
 
 func executePaper(cmd TradeCmd) {
@@ -149,6 +151,65 @@ func executeOpen(cmd TradeCmd) {
 		return
 	}
 	log.Printf("✅ 开仓 %s %s size=%d status=%v", cmd.Symbol, cmd.Side, cmd.Size, r["status"])
+
+	// ── 挂止盈止损条件单 ──
+	if cmd.StopLoss > 0 {
+		slSize := size
+		if slSize < 0 {
+			slSize = -slSize
+		}
+		// 止损：stop-market
+		slRule := 2 // long: price<=trigger, short: price>=trigger
+		if cmd.Side == "short" {
+			slRule = 1
+		}
+		slR, slErr := gateAPI("POST", "/price_orders", map[string]interface{}{
+			"contract": contract,
+			"size":     slSize,
+			"price":    "0",
+			"trigger": map[string]interface{}{
+				"price":      strconv.FormatFloat(cmd.StopLoss, 'f', 1, 64),
+				"rule":       slRule,
+				"expiration": 3600,
+			},
+			"reduce_only": true,
+			"text":        fmt.Sprintf("t-shark-sl-%d", time.Now().UnixNano()),
+		})
+		if slErr != nil {
+			log.Printf("⚠ 止损单挂失败 %s: %v", cmd.Symbol, slErr)
+		} else {
+			log.Printf("🛑 止损 %s @%.1f status=%v", cmd.Symbol, cmd.StopLoss, slR["status"])
+		}
+	}
+	if cmd.TakeProfit > 0 {
+		tpSize := size
+		if tpSize < 0 {
+			tpSize = -tpSize
+		}
+		// 止盈：limit
+		tpRule := 1 // long: price>=trigger, short: price<=trigger
+		if cmd.Side == "short" {
+			tpRule = 2
+		}
+		tpR, tpErr := gateAPI("POST", "/price_orders", map[string]interface{}{
+			"contract": contract,
+			"size":     tpSize,
+			"price":    "0",
+			"trigger": map[string]interface{}{
+				"price":      strconv.FormatFloat(cmd.TakeProfit, 'f', 1, 64),
+				"rule":       tpRule,
+				"expiration": 3600,
+			},
+			"reduce_only": true,
+			"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
+		})
+		if tpErr != nil {
+			log.Printf("⚠ 止盈单挂失败 %s: %v", cmd.Symbol, tpErr)
+		} else {
+			log.Printf("🎯 止盈 %s @%.1f status=%v", cmd.Symbol, cmd.TakeProfit, tpR["status"])
+		}
+	}
+
 	rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "open_ok", 0)
 }
 

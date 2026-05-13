@@ -171,43 +171,40 @@ RSI: {diag.get('rsi', '?')}
         return ", ".join(msgs)
 
     def maybe_adjust(self) -> dict:
-        """累积足够样本后触发战术调整"""
+        """累积足够样本后返回统计摘要（不再实时改参，Go SlowLoop 统一驱动）"""
         total = self.total_losses
         if total < 5:
             return {}
 
-        adjustments = {}
+        summary = {}
 
         weak_rate = self.counters[LossReason.SIGNAL_WEAK] / total
-        if weak_rate > 0.5 and self.ai_boost < 10:
-            self.ai_boost += 5
-            adjustments["ai_boost"] = self.ai_boost
+        if weak_rate > 0.5:
+            summary["ai_boost_hint"] = f"信号弱{weak_rate:.0%}"
 
         tight_rate = self.counters[LossReason.STOP_TOO_TIGHT] / total
-        if tight_rate > 0.4 and self.stop_boost < 4:
-            self.stop_boost += 1.5
-            adjustments["stop_boost"] = self.stop_boost
+        if tight_rate > 0.4:
+            summary["stop_hint"] = f"止损紧{tight_rate:.0%}"
 
         entry_rate = self.counters[LossReason.BAD_ENTRY] / total
         if entry_rate > 0.3:
-            adjustments["entry_filter"] = True
+            summary["entry_hint"] = f"入场差{entry_rate:.0%}"
 
         wrong_rate = self.counters[LossReason.WRONG_DIR] / total
         if wrong_rate > 0.4:
-            self.signal_throttle = min(self.signal_throttle + 5, 20)
-            adjustments["signal_throttle"] = self.signal_throttle
+            summary["dir_hint"] = f"方向错{wrong_rate:.0%}"
 
         micro_rate = self.counters[LossReason.MICRO_LOSS] / total
         if micro_rate > 0.25:
-            adjustments["tp_boost"] = True
+            summary["micro_hint"] = f"微亏多{micro_rate:.0%}"
 
-        if adjustments:
+        if summary:
             self.counters = {r: 0 for r in self.counters}
             self.total_losses = 0
             self.total_wins = 0
             self.last_adjust_tick = time.time()
 
-        return adjustments
+        return summary
 
     def summary(self) -> str:
         total = self.total_losses

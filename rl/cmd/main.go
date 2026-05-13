@@ -68,10 +68,14 @@ func main() {
 	plannerCtx, plannerCancel := context.WithCancel(context.Background())
 	defer plannerCancel()
 	go func() {
-		sched := planning.NewScheduler(rdb, planning.LargeCapSymbols)
+		sched := planning.NewScheduler(rdb, planning.FocusSymbols)
+		// 注入 TradingView insights（每次生成计划时从 KB 读取）
+		sched.Planner().SetTVFn(func(symbol string) string {
+			return kb.GetTVInsights(symbol)
+		})
 		sched.Start(plannerCtx)
 	}()
-	log.Printf("[Planning] SlowLoop 已启动（每30分钟生成RangePlan，覆盖%d个大市值币对）", len(planning.LargeCapSymbols))
+	log.Printf("[Planning] SlowLoop 已启动（每30分钟生成RangePlan，专注%d个币对）", len(planning.FocusSymbols))
 
 	// ── TradingView 知识学习 ──
 	tv := rl.NewTVScraper()

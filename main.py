@@ -88,7 +88,6 @@ try:
     from trade_reflector import Reflector, LossReason
     from online_learner import OnlineLearner, FeatureExtractor, compute_reward
     from live_engine import LiveEngine, create_live_engine
-    from signal_engine import SignalEngine
     KLINE_ENABLED = True
 except ImportError:
     KLINE_ENABLED = False
@@ -573,6 +572,11 @@ async def plans_dashboard():
 
     return {"plans": plans, "fuse": fuse_info, "_plan_count": len(plans)}
 
+@app.get("/plans")
+async def plans_full_page():
+    """全屏计划看板（自适应布局）"""
+    return HTMLResponse(_PLANS_FULL_PAGE)
+
 @app.websocket("/ws")
 async def ws(
     websocket: WebSocket,
@@ -633,12 +637,12 @@ _PLAN_PANEL_SCRIPT = """
 <script>
 (function(){var p;function panel(){
 if(p)return p;p=document.createElement('div');p.id='plan-panel'
-p.style.cssText='position:fixed;bottom:12px;right:12px;z-index:99999;background:rgba(10,10,30,0.92);border:1px solid rgba(0,255,200,0.3);border-radius:10px;padding:10px 14px;font:11px/1.5 monospace;color:#0f8;min-width:220px;max-height:280px;overflow-y:auto;backdrop-filter:blur(8px);'
+p.style.cssText='position:fixed;bottom:12px;right:12px;z-index:99999;background:rgba(10,10,30,0.92);border:1px solid rgba(0,255,200,0.3);border-radius:10px;padding:10px 14px;font:11px/1.5 monospace;color:#0f8;min-width:240px;max-height:300px;overflow-y:auto;backdrop-filter:blur(8px);'
 document.body.appendChild(p);return p}
-function f(n){var x=Number(n);if(!Number.isFinite(x))return '--';var ax=Math.abs(x);if(ax===0)return '0';if(ax>=1000)return x.toFixed(1);if(ax>=1)return x.toFixed(4);if(ax>=0.01)return x.toFixed(6);return x.toFixed(8)}
+function f(n){var x=Number(n);if(!Number.isFinite(x)||x<=0)return'--';var ax=Math.abs(x);if(ax>=1000)return x.toFixed(1);if(ax>=1)return x.toFixed(4);if(ax>=0.01)return x.toFixed(6);return x.toFixed(8)}
 function ft(n){if(!n)return'';var m=Math.floor(n/60),s=Math.floor(n%60);return m+':'+s.toString().padStart(2,'0')}
-function badge(b){return b==='long'?'<b style=color:#0f0>LONG</b>':b==='short'?'<b style=color:#f44>SHORT</b>':'<span style=color:#888>--</span>'}
-function rsk(lv){return lv>=2?'<span style=color:red>⚠ </span>':lv>=1?'<span style=color:#fa0>⚡</span>':''}
+function bdg(b){return b==='long'?'<b style=color:#0f0>LONG</b>':b==='short'?'<b style=color:#f44>SHORT</b>':'<span style=color:#888>--</span>'}
+function rsk(lv){return lv>=2?'<span style=color:red>⚠</span>':lv>=1?'<span style=color:#fa0>⚡</span>':''}
 function render(){
 var pd=panel()
 fetch('/api/plans').then(function(r){return r.json()}).then(function(d){
@@ -646,21 +650,118 @@ var plans=d.plans||{},fuse=d.fuse,ks=Object.keys(plans).sort()
 var h=[]
 if(ks.length===0){h.push('<div style=color:#888>等待 SlowLoop 生成计划...</div>')}
 else{
-var n=Math.min(ks.length,8)
+var n=Math.min(ks.length,6)
 h.push('<table style=width:100%;border-collapse:collapse>')
-for(var i=0;i<n;i++){var sym=ks[i],p=plans[sym]
-h.push('<tr><td>'+sym.replace('/USDT','')+'</td><td>'+badge(p.bias)+'</td><td>'+f(p.entry_zone_low)+'~'+f(p.entry_zone_high)+'</td><td>'+rsk(p.news_risk_level)+'</td></tr>')
-h.push('<tr><td colspan=4 style=font-size:9px;color:#555>区间 '+f(p.range_low)+'~'+f(p.range_high)+' SL'+f(p.stop_loss)+' '+p.macro_regime+'</td></tr>')}
-if(ks.length>n)h.push('<tr><td colspan=4 style=font-size:9px;color:#555>... 还有'+(ks.length-n)+'个计划</td></tr>')
-h.push('</table>')}
+for(var i=0;i<n;i++){var sym=ks[i],p=plans[sym],b=p.bias||''
+h.push('<tr><td colspan=4 style=font-weight:bold;color:#0ff>'+sym.replace('/USDT','')+' '+rsk(p.news_risk_level)+'</td></tr>')
+if(b==='both'){
+h.push('<tr><td>'+bdg('long')+'</td><td>'+f(p.long_entry_low)+'~'+f(p.long_entry_high)+'</td><td>SL '+f(p.long_stop_loss)+'</td><td>'+p.macro_regime+'</td></tr>')
+h.push('<tr><td>'+bdg('short')+'</td><td>'+f(p.short_entry_low)+'~'+f(p.short_entry_high)+'</td><td>SL '+f(p.short_stop_loss)+'</td><td></td></tr>')
+}else{
+h.push('<tr><td>'+bdg(b)+'</td><td>'+f(p.entry_zone_low)+'~'+f(p.entry_zone_high)+'</td><td>SL '+f(p.stop_loss)+'</td><td>'+p.macro_regime+'</td></tr>')}
+// AI 信息行
+if(p.ai_rationale||p.ai_model){
+var ai_tag=(p.ai_model||'').toUpperCase()
+var ai_conf=p.ai_confidence?Math.round(p.ai_confidence)+'%':''
+var sz=p.position_size_pct?'仓位'+Math.round(p.position_size_pct*100)+'%':''
+var lv=p.leverage?'杠杆'+p.leverage+'x':''
+h.push('<tr style=font-size:9px;color:#4a8><td colspan=4><span style=color:#0f8>🤖 '+ai_tag+' '+ai_conf+'</span> '+(p.ai_rationale||'').substring(0,25)+' '+sz+' '+lv+'</td></tr>')}
+}}
+h.push('</table>')
+if(ks.length>n)h.push('<div style=font-size:9px;color:#555>... 还有'+(ks.length-n)+'个计划</div>')}
 if(fuse&&fuse.triggered)h.push('<div style=color:red;font-weight:bold;margin-top:4px>⛔ 熔断中 '+ft(fuse.remaining)+' '+fuse.reason+'</div>')
 else h.push('<div style=font-size:9px;color:#555;margin-top:4px>'+ks.length+'个计划 · 无熔断</div>')
-pd.innerHTML='<div style=font-weight:bold;color:#0ff;margin-bottom:4px>📊 RangePlan</div>'+h.join('')
+pd.innerHTML='<div style=font-weight:bold;color:#0ff;margin-bottom:4px>📊 <a href=/plans style=color:#0ff;text-decoration:underline>RangePlan 全屏看板→</a></div>'+h.join('')
 }).catch(function(e){panel().innerHTML='<div style=color:#f44>📊 Plan API 错误</div>'})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',function(){render();setInterval(render,5000)})
 else{render();setInterval(render,5000)}
 })()
 </script>"""
+
+_PLANS_FULL_PAGE = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>🦈 Shark RangePlan 看板</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#e0e0e0;font:14px/1.5 system-ui,sans-serif;padding:16px}
+h1{font-size:20px;color:#00d4ff;margin-bottom:4px}
+.sub{font-size:12px;color:#64748b;margin-bottom:16px}
+.fuse{background:#3b0000;border:1px solid #f44;color:#f44;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-weight:bold}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.card{background:#111827;border:1px solid #1e293b;border-radius:10px;padding:14px}
+.card h2{font-size:14px;color:#0ff;margin-bottom:4px}
+.card .meta{font-size:11px;color:#64748b;margin-bottom:8px}
+.row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:3px 0;border-bottom:1px solid #1a1a2e}
+.row .lbl{color:#64748b;white-space:nowrap}
+.row .val{text-align:right;font-weight:600}
+.val.long{color:#0f8}.val.short{color:#f44}.val.both{color:#fa0}
+.val.good{color:#0f8}.val.warn{color:#fa0}.val.bad{color:#f44}
+.ai{font-size:11px;color:#4a8;margin-top:6px;padding-top:6px;border-top:1px solid #1e293b;line-height:1.4}
+.ai b{color:#0f8}
+.empty{text-align:center;padding:60px 20px;color:#64748b;font-size:15px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
+.dot.live{background:#0f8;animation:pulse 2s infinite}
+.dot.paused{background:#f44}
+.countdown{font-size:11px;color:#555;text-align:right}
+@media(max-width:400px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>🦈 Shark RangePlan 看板 <span id=refresh></span></h1>
+<div class=sub id=sub></div>
+<div id=fuse></div>
+<div class=grid id=grid><div class=empty>加载中...</div></div>
+<script>
+function f(n){var x=Number(n);if(!Number.isFinite(x)||x<=0)return'--';var ax=Math.abs(x);if(ax>=1000)return x.toFixed(1);if(ax>=1)return x.toFixed(4);if(ax>=0.01)return x.toFixed(6);return x.toFixed(8)}
+function ft(n){if(!n)return'';var m=Math.floor(n/60),s=Math.floor(n%60);return m+':'+s.toString().padStart(2,'0')}
+function bdg(b){return b==='long'?'<span class="val long">LONG</span>':b==='short'?'<span class="val short">SHORT</span>':'<span class="val both">BOTH</span>'}
+function rsk(lv){return lv>=2?'<span class="val bad">⚠ 熔断级</span>':lv>=1?'<span class="val warn">⚡ 警告</span>':''}
+function am(m){return m==='deepseek'?'🤖 DeepSeek':m==='qwen'?'💡 Qwen':m==='math'?'📐 数学':'--'}
+
+function render(){
+fetch('/api/plans').then(r=>r.json()).then(d=>{
+var plans=d.plans||{},fuse=d.fuse,ks=Object.keys(plans).sort()
+var g=document.getElementById('grid'),fs=document.getElementById('fuse')
+var sub=document.getElementById('sub')
+sub.textContent=ks.length+'个计划 · '+(fuse&&fuse.triggered?'⛔ 熔断':'无熔断')+' · 每30分钟更新'
+
+if(fuse&&fuse.triggered)fs.innerHTML='<div class=fuse>⛔ 熔断保护中 '+ft(fuse.remaining)+' — '+fuse.reason+'</div>'
+else fs.innerHTML=''
+
+if(ks.length===0){g.innerHTML='<div class=empty>等待 SlowLoop 生成计划...</div>';return}
+var h=''
+for(var i=0;i<ks.length;i++){
+var sym=ks[i],p=plans[sym],bias=p.bias||''
+h+='<div class=card>'
+h+='<h2>'+sym.replace('/USDT','')+' <span style=font-size:11px>'+bdg(bias)+'</span> '+rsk(p.news_risk_level||0)+'</h2>'
+h+='<div class=meta>'+am(p.ai_model)+' 置信'+(p.ai_confidence?Math.round(p.ai_confidence)+'%':'--')+' · '+ (p.macro_regime||'')+' · ATR '+f(p.atr14)+'</div>'
+h+='<div class=row><span class=lbl>区间</span><span class=val>'+f(p.range_low)+' ~ '+f(p.range_high)+'</span></div>'
+if(bias==='both'){
+h+='<div class=row><span class=lbl>做多入场</span><span class="val long">'+f(p.long_entry_low)+' ~ '+f(p.long_entry_high)+'</span></div>'
+h+='<div class=row><span class=lbl>做多SL/TP</span><span class=val>SL '+f(p.long_stop_loss)+' / TP '+(p.long_take_profit||[]).map(f).join(',')+'</span></div>'
+h+='<div class=row><span class=lbl>做空入场</span><span class="val short">'+f(p.short_entry_low)+' ~ '+f(p.short_entry_high)+'</span></div>'
+h+='<div class=row><span class=lbl>做空SL/TP</span><span class=val>SL '+f(p.short_stop_loss)+' / TP '+(p.short_take_profit||[]).map(f).join(',')+'</span></div>'
+}else{
+h+='<div class=row><span class=lbl>入场带</span><span class=val>'+f(p.entry_zone_low)+' ~ '+f(p.entry_zone_high)+'</span></div>'
+h+='<div class=row><span class=lbl>SL/TP</span><span class=val>SL '+f(p.stop_loss)+' / TP '+(p.take_profit||[]).map(f).join(',')+'</span></div>'
+}
+if(p.position_size_pct||p.leverage){
+h+='<div class=row><span class=lbl>仓位/杠杆</span><span class=val>'+(p.position_size_pct?Math.round(p.position_size_pct*100)+'%':'--')+' / '+(p.leverage?p.leverage+'x':'--')+'</span></div>'}
+if(p.pyramid_prices&&p.pyramid_prices.length)h+='<div class=row><span class=lbl>补仓点</span><span class=val>'+p.pyramid_prices.map(f).join(' , ')+'</span></div>'
+if(p.cut_loss_pct)h+='<div class=row><span class=lbl>割肉线</span><span class="val bad">'+Math.round(p.cut_loss_pct*100)+'%</span></div>'
+h+='<div class=row><span class=lbl>费率</span><span class=val>'+(p.funding_rate?p.funding_rate.toFixed(4)+'%':'--')+'</span></div>'
+if(p.ai_rationale)h+='<div class=ai><b>AI分析:</b> '+p.ai_rationale+'</div>'
+h+='</div>'
+}
+g.innerHTML=h
+}).catch(function(e){document.getElementById('grid').innerHTML='<div class=empty style=color:#f44>API 错误: '+e.message+'</div>'})}
+render();setInterval(render,10000)
+</script>
+</body>
+</html>"""
 
 def _inject_plan_panel(html: str) -> str:
     """注入计划看板浮动面板（右下角）"""
@@ -822,7 +923,6 @@ class StrategyRunner:
         self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
         self._reflector = Reflector() if KLINE_ENABLED else None  # 止损反思器
         self._learner = OnlineLearner() if KLINE_ENABLED else None  # 在线学习器
-        self._signal_engine = SignalEngine()  # 信号决策引擎
         self._live = create_live_engine()  # 实盘引擎（paper模式返回None）
         self._live_trading_enabled = False  # 默认不开实盘，需前端手动开启
         self._paper_trading_enabled = False # 默认不开模拟盘，需前端手动开启
@@ -1296,9 +1396,34 @@ class StrategyRunner:
             
             # 止盈 = ATR% × 行情倍率（不低于地板 3%）
             dyn_tp = max(atr_pct * _tp_mult, 3.0)
+
+            # ── 计划精确 SL/TP 优先 ──
+            _psl = pos.get("plan_sl")
+            _ptp = pos.get("plan_tp")
+            if _psl and isinstance(_psl, (int, float)) and _psl > 0:
+                if pos["side"] == "long":
+                    plan_sl_pct = -(pos["entry"] - _psl) / pos["entry"] * 100
+                else:
+                    plan_sl_pct = -(_psl - pos["entry"]) / pos["entry"] * 100
+                if -25 <= plan_sl_pct <= -0.5:
+                    dyn_sl = plan_sl_pct
+            if _ptp:
+                if isinstance(_ptp, list) and len(_ptp) > 0:
+                    _tp_first = _ptp[0]
+                elif isinstance(_ptp, (int, float)):
+                    _tp_first = _ptp
+                else:
+                    _tp_first = None
+                if _tp_first and _tp_first > 0:
+                    if pos["side"] == "long":
+                        plan_tp_pct = (_tp_first - pos["entry"]) / pos["entry"] * 100
+                    else:
+                        plan_tp_pct = (pos["entry"] - _tp_first) / pos["entry"] * 100
+                    if 0.5 <= plan_tp_pct <= 50:
+                        dyn_tp = plan_tp_pct
             
             # 移动止盈：ATR × 3 触发或最低 4%
-            trail_trigger = max(atr_pct * 3.0, 4.0)
+            trail_trigger = max(atr_pct * 1.5, 2.0)  # 超短线：更低阈值
             trail_ratio = 0.3
 
             # 更新最高盈利
@@ -1505,6 +1630,15 @@ class StrategyRunner:
                         self.trades += 1
                         self._persist_margin_delta(prices, sym, pos, -add_margin, "margin_add", "funding_pyramid")
 
+            # 保本止损：盈利 ≥ 3%（杠杆后） → 止损移至开仓价，防止盈利变亏损
+            if pnl_pct >= 3.0 and not pos.get("_breakeven_set"):
+                pos["_breakeven_set"] = True
+                # 把计划止损价提升到 entry（相当于 dyn_sl = -0.01%，留手续费空间）
+                if pos["side"] == "long":
+                    pos["plan_sl"] = pos["entry"] * 1.0005
+                else:
+                    pos["plan_sl"] = pos["entry"] * 0.9995
+
             # 移动止盈：从最高点回撤，覆盖手续费
             trail_bar = trail_trigger if not is_st else min(trail_trigger, 5.0)
             if best_pnl > trail_bar:
@@ -1594,7 +1728,7 @@ class StrategyRunner:
         scored = scored_stable + scored_alt
 
         # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
-        # 仅 ai 模式预取 LLM；plan 模式由 SignalEngine 读 RangePlan，避免每 tick 打爆 DeepSeek
+        # 方向判定已内联（读 RangePlan 区间中点判定），无需外部引擎
         if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
             prefetch_tasks = []
             for psym, _, _, _ in scored[:35]:
@@ -1626,19 +1760,9 @@ class StrategyRunner:
             px = prices[sym]
             change = changes.get(sym, 0)
 
-            # 取合约最大杠杆
-            spec = self._contract_specs.get(sym)
-            if spec is None and is_stable(sym):
-                print(
-                    f"[DEBUG-BTC] {sym} 无合约规格，使用默认杠杆/面值",
-                    flush=True,
-                )
-            max_lev = spec.leverage_max if spec else 50
-
-            # 杠杆：合约最大 * 波动衰减（平滑连续）
-            # chg_abs=1% → full leverage, chg_abs=50% → 30% of max
-            lev_factor = max(0.25, 1.0 / (1 + chg_abs / 25))
-            lev = max(1, int(max_lev * lev_factor))
+            # 杠杆：完全由 AI 计划决定，无固定值
+            lev = 0
+            spec = self._contract_specs.get(sym)  # 合约规格（quanto/手续费）
 
             # 保证金：余额动态比例 × 波动衰减（低波大仓，高波小仓）
             cfg = get_config(sym)
@@ -1663,6 +1787,17 @@ class StrategyRunner:
                         }
                 except Exception:
                     pass
+
+            # ── 读 AI 计划，提取杠杆（完全由 AI 决定） ──
+            plan_cache = None
+            if self._plan_gate:
+                plan_cache = self._plan_gate.get_plan(sym)
+                if plan_cache:
+                    plan_lev = plan_cache.get("leverage", 0)
+                    if plan_lev and 1 <= plan_lev <= 125:
+                        lev = int(plan_lev)
+            if lev <= 0:
+                continue  # AI 未产出有效杠杆，不交易
             
             base_pct = cfg.get("margin_pct", 0.01)
             # 行情调整保证金倍率
@@ -1716,19 +1851,42 @@ class StrategyRunner:
                 if same_type >= max_pos:
                     continue
 
-            # ── 信号决策（委托给 SignalEngine）──
-            result = self._signal_engine.decide(
-                self, sym, px, funding_rates.get(sym, 0),
-                change, vol, cfg, now, self._regime_cache, _regime)
-            if not result.side:
+            # ── 纯数学方向判定（从 RangePlan 区间中点） ──
+            side = ""
+            signal_src = ""
+            ai_confidence = 0
+            ai_use = False
+            _learner_feat = []
+            _stop_mult = 2.0
+            _tp_mult = 3.0
+            _plan_sl = None   # 计划精确止损价
+            _plan_tp = None   # 计划精确止盈价
+
+            # 使用缓存计划（已在杠杆阶段读取）
+            if plan_cache:
+                bias = plan_cache.get("bias", "")
+                if bias == "both":
+                    mid = (plan_cache.get("range_low", 0) + plan_cache.get("range_high", 0)) / 2
+                    if px < mid:
+                        side = "long"
+                        signal_src = f"计划震荡 价{px:.0f}<中{mid:.0f}→多"
+                        _plan_sl = plan_cache.get("long_stop_loss")
+                        _plan_tp = plan_cache.get("long_take_profit")
+                    else:
+                        side = "short"
+                        signal_src = f"计划震荡 价{px:.0f}>中{mid:.0f}→空"
+                        _plan_sl = plan_cache.get("short_stop_loss")
+                        _plan_tp = plan_cache.get("short_take_profit")
+                elif bias in ("long", "short"):
+                    side = bias
+                    signal_src = f"计划趋势 {bias}"
+                    _plan_sl = plan_cache.get("stop_loss")
+                    _plan_tp = plan_cache.get("take_profit")
+                ai_confidence = int(plan_cache.get("ai_confidence", 0))
+                if ai_confidence > 0:
+                    ai_use = True
+            if not side:
                 continue
-            side = result.side
-            signal_src = result.signal_src
-            ai_confidence = result.ai_confidence
-            ai_use = result.ai_use
-            _learner_feat = result.learner_feat
-            _stop_mult = result.stop_mult
-            _tp_mult = result.tp_mult
 
             # 策略入场价：根据行情类型+方向智能定位
             _rv = _regime.value if _regime else "unknown"
@@ -1746,9 +1904,18 @@ class StrategyRunner:
             mode = "live" if (_is_live and self._live_trading_enabled) else "paper"
             
             _ct_size = max(1, int(size))
+            # 构建订单 JSON（含止盈止损价，Go 执行器直接挂条件单）
+            _tp_first = None
+            if _plan_tp:
+                if isinstance(_plan_tp, list) and len(_plan_tp) > 0:
+                    _tp_first = _plan_tp[0]
+                elif isinstance(_plan_tp, (int, float)):
+                    _tp_first = _plan_tp
             cmd = json.dumps({
                 "symbol": sym, "side": side, "size": _ct_size,
                 "leverage": lev, "action": "open", "mode": mode,
+                "stop_loss": _plan_sl,
+                "take_profit": _tp_first,
             })
             try:
                 import redis as _redis
@@ -1771,6 +1938,8 @@ class StrategyRunner:
                 "signal_src": signal_src,
                 "ai_confidence": ai_confidence if ai_use else 0,
                 "_learner_feat": _learner_feat,
+                "plan_sl": _plan_sl,  # AI计划精确止损价
+                "plan_tp": _plan_tp,  # AI计划精确止盈价
             }
             
             # AI分析（异步，不阻塞开仓）
@@ -1791,11 +1960,9 @@ class StrategyRunner:
 
             fee_str = f" 手续费={fee:.4f}" if fee > 0.0001 else ""
             stype = "主流" if is_stable(sym) else "山寨"
-            msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}"
-            if _regime:
-                msg += f" 行情={_regime.value}"
-            if _stop_mult:
-                msg += f" SL=ATR×{_stop_mult}"
+            msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}{' 行情='+_regime.value if _regime else ''}"
+            if _plan_sl:
+                msg += f" SL=计划{_plan_sl:.1f}"
             if _tp_mult:
                 msg += f" TP=ATR×{_tp_mult}"
             
@@ -1965,17 +2132,11 @@ class StrategyRunner:
         if self._reflector and realized < 0:
             local_tags = self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
                                     self._regime_cache, None)
-            # 本地快速调整
+            # 本地快速调整（只统计，不实时改参数 — Go SlowLoop 统一进化）
             adj = self._reflector.maybe_adjust()
             if adj:
-                print(f"[反思调整] {adj}", flush=True)
-            # AI深度诊断（异步，每60秒最多一次，避免API轰炸）
-            now_ts = time.time()
-            if now_ts - self._reflector._last_ai_call > 60 and (
-                os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("QWEN_KEY") or os.environ.get("VOLC_KEY")
-            ):
-                self._reflector._last_ai_call = now_ts
-                asyncio.create_task(self._ai_reflect(sym, pos, realized, pnl_pct, reason, px, local_tags))
+                print(f"[反思统计] {adj}", flush=True)
+            # AI深度诊断已移除 — 调整统一由Go侧SlowLoop计划轮次驱动
 
         # ── 在线学习：Q-Learning + ES更新 ──
         if self._learner:
@@ -2172,7 +2333,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             _tick += 1
             symbols = await fetch_top_symbols(n=30)
             # 强制加入 BTC/ETH，山寨只保留高波动精选
-            MUST_HAVE = ["BTC/USDT", "ETH/USDT"]
+            MUST_HAVE = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
             for m in MUST_HAVE:
                 if m not in symbols:
                     symbols.insert(0, m)
