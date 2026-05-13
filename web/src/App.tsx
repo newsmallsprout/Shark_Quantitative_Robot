@@ -35,10 +35,10 @@ type ConfirmPayload = {
   confirmLabel?: string
   /** danger = 红渐变（同「开始交易」）；safe = 绿描边（同「停止交易」） */
   confirmStyle?: 'danger' | 'safe'
-  onConfirm: () => void | Promise<void>
+  onConfirm: () => boolean | void | Promise<boolean | void>
 }
 
-function ConfirmModal({
+export function ConfirmModal({
   open,
   title,
   message,
@@ -91,7 +91,8 @@ function ConfirmModal({
             onClick={async () => {
               try {
                 const r = onConfirm()
-                if (r instanceof Promise) await r
+                const result = r instanceof Promise ? await r : r
+                if (result === false) return
                 onCancel()
               } catch {
                 // 出错保持弹窗不关闭
@@ -199,13 +200,21 @@ async function postSharkMode(mode: 'paper' | 'live'): Promise<{ error?: string }
   return {}
 }
 
-function applyDashboardPayload(
+export function normalizeDashboardPayload(
   data: Record<string, unknown>,
-  setStatus: (s: Partial<Status>) => void,
-) {
-  if (!data || typeof data !== 'object') return
-  const prev = useStore.getState().status
-  setStatus({
+  prev: Status,
+): Partial<Status> {
+  const paperTrading = data.paper_trading
+  const liveTrading = data.live_trading
+  const livePayload =
+    data.live !== undefined && data.live !== null && typeof data.live === 'object'
+      ? (data.live as LiveStatus)
+      : undefined
+  const paperPayload =
+    data.paper !== undefined && data.paper !== null && typeof data.paper === 'object'
+      ? (data.paper as Status['paper'])
+      : undefined
+  return {
     equity: num(data.equity, prev.equity),
     balance: num(data.balance, prev.balance),
     free_cash: num(data.free_cash, prev.free_cash),
@@ -224,21 +233,36 @@ function applyDashboardPayload(
     trade_history: Array.isArray(data.trade_history) ? data.trade_history : prev.trade_history,
     margin_locked: num(data.margin_locked, prev.margin_locked),
     character_event: (data.character_event as Status['character_event']) || undefined,
-    live:
-      data.live !== undefined && data.live !== null && typeof data.live === 'object'
-        ? (data.live as LiveStatus)
-        : undefined,
-    paper:
-      data.paper !== undefined && data.paper !== null && typeof data.paper === 'object'
-        ? (data.paper as Status['paper'])
-        : prev.paper ?? { active: true, trading_enabled: false },
+    live: livePayload
+      ? {
+          ...livePayload,
+          trading_enabled:
+            typeof liveTrading === 'boolean' ? liveTrading : livePayload.trading_enabled,
+        }
+      : undefined,
+    paper: paperPayload ?? {
+      active: true,
+      trading_enabled:
+        typeof paperTrading === 'boolean'
+          ? paperTrading
+          : prev.paper?.trading_enabled === true,
+    },
     shark_mode: (() => {
       const m = data.shark_mode
       if (m === 'live' || m === 'paper') return m
       return prev.shark_mode ?? 'paper'
     })(),
     evo_pending: Array.isArray(data.evo_pending) ? data.evo_pending : prev.evo_pending ?? [],
-  })
+  }
+}
+
+function applyDashboardPayload(
+  data: Record<string, unknown>,
+  setStatus: (s: Partial<Status>) => void,
+) {
+  if (!data || typeof data !== 'object') return
+  const prev = useStore.getState().status
+  setStatus(normalizeDashboardPayload(data, prev))
 }
 
 /** 超过此时长未收到快照/WL 推送则视为断连（与轮询 2.5s 对齐） */
@@ -401,7 +425,7 @@ export default function App() {
           const j = isPaperMode ? await postPaperToggle() : await postLiveToggle()
           if (j.error) {
             window.alert(`操作失败：${j.error}`)
-            return  // 保持弹窗不关闭
+            return false  // 保持弹窗不关闭
           }
           if (typeof j.trading_enabled === 'boolean') {
             // 即时更新本地状态，不等轮询
@@ -415,6 +439,7 @@ export default function App() {
         } catch (e) {
           console.warn('[shark] trade toggle failed', e)
           window.alert('请求失败，请检查网络')
+          return false
         }
       },
     })

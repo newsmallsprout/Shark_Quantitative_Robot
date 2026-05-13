@@ -142,7 +142,6 @@ Shark_Quantitative_Robot/
 ├── main.py                 # 主入口（FastAPI + 策略循环）
 ├── ai_strategy.py          # 多模型AI分析
 ├── dual_strategy.py        # 双轨资金配置
-├── oscillation.py          # 震荡检测
 ├── live_engine.py           # Gate.io实盘引擎
 ├── market_regime.py        # 行情检测器（10种类型）
 ├── trade_reflector.py      # 止损反思引擎（AI驱动）
@@ -151,8 +150,6 @@ Shark_Quantitative_Robot/
 ├── multi_exchange.py       # 多所价格聚合
 ├── dialogue_ammo.py        # 角色台词库
 ├── character_voice.py      # LLM角色配音
-├── battle_report.py         # 战报生成（cron）
-├── backtest.py             # 3日回测工具
 │
 ├── executor/               # Go实盘执行器
 ├── matcher/                # Go模拟撮合器

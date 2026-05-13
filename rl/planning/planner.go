@@ -642,32 +642,32 @@ func applyRegimePlaybook(plan *RangePlan, macro *MacroContext, px, atr float64) 
 	plan.LeverageCap = 125
 	switch macro.Regime {
 	case RegimeTrendUp, RegimeTrendDown:
-		plan.PositionSizePct = 0.005
-		plan.Leverage = 75
+		plan.PositionSizePct = 0.018
+		plan.Leverage = 90
 		plan.CutLossPct = 0.035
 	case RegimeBreakoutUp, RegimeBreakoutDown:
-		plan.PositionSizePct = 0.004
-		plan.Leverage = 70
+		plan.PositionSizePct = 0.015
+		plan.Leverage = 85
 		plan.CutLossPct = 0.03
 	case RegimeSlowGrindUp, RegimeSlowGrindDown:
-		plan.PositionSizePct = 0.003
-		plan.Leverage = 65
+		plan.PositionSizePct = 0.012
+		plan.Leverage = 80
 		plan.CutLossPct = 0.025
 	case RegimeBleedDown:
-		plan.PositionSizePct = 0.003
-		plan.Leverage = 65
+		plan.PositionSizePct = 0.012
+		plan.Leverage = 80
 		plan.CutLossPct = 0.025
 	case RegimeChoppy:
-		plan.PositionSizePct = 0.0015
-		plan.Leverage = 35
+		plan.PositionSizePct = 0.004
+		plan.Leverage = 45
 		plan.CutLossPct = 0.02
 	case RegimeDead:
 		plan.PositionSizePct = 0.001
 		plan.Leverage = 1
 		plan.CutLossPct = 0.01
 	default:
-		plan.PositionSizePct = 0.003
-		plan.Leverage = 60
+		plan.PositionSizePct = 0.01
+		plan.Leverage = 75
 		plan.CutLossPct = 0.025
 	}
 	applyQuickProfitWideStop(plan, px, atr)

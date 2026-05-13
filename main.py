@@ -57,13 +57,6 @@ except ImportError:
 # 开仓方向：plan = 仅 Redis RangePlan（默认，与 SlowLoop 一致）；ai = DeepSeek 预取缓存
 SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
 
-# 导入震荡检测器
-try:
-    from oscillation import OscillationDetector
-    OSC_ENABLED = True
-except ImportError:
-    OSC_ENABLED = False
-
 # 导入双轨策略
 try:
     from dual_strategy import get_config, is_stable, get_capital_limit, is_high_vol_alt
@@ -299,7 +292,16 @@ def _sanitize_ws_value(v):
 
 
 def _state_for_websocket() -> dict:
-    return _sanitize_ws_value(dict(_state))
+    payload = dict(_state)
+    payload["paper"] = {
+        "active": True,
+        "trading_enabled": bool(payload.get("paper_trading", False)),
+    }
+    live_data = dict(payload.get("live") or {})
+    live_data["active"] = bool(live_data.get("active", False))
+    live_data["trading_enabled"] = bool(payload.get("live_trading", live_data.get("trading_enabled", False)))
+    payload["live"] = live_data
+    return _sanitize_ws_value(payload)
 
 
 def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float]) -> List[dict]:
@@ -910,8 +912,6 @@ class StrategyRunner:
         self._log: List[str] = []
         self._trade_history: List[dict] = []
         self._contract_specs: Dict[str, ContractSpec] = {}
-        self._oscillator = OscillationDetector() if OSC_ENABLED else None
-        self._osc_avg_count: Dict[str, int] = {}  # 每币对补仓次数
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
         self._open_timestamps: list = []  # 开仓时间戳
         self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
@@ -1236,6 +1236,15 @@ class StrategyRunner:
             margin = min(margin, self.balance * cap_pct)
         return max(0.0, margin)
 
+    def _warmup_allows_open(self, *, has_kline: bool, has_detector: bool) -> bool:
+        """RangePlan-first trading should not wait on Python kline helpers."""
+        self._warmup_ticks += 1
+        if self._warmup_done:
+            return True
+        self._warmup_done = True
+        print(f"🔥 计划优先：跳过K线预热，立即允许开仓 (tick={self._warmup_ticks})", flush=True)
+        return True
+
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
         q = self._quanto_for(sym)
@@ -1354,12 +1363,6 @@ class StrategyRunner:
                     if sym not in real:
                         _log.warning("⚠ 对账异常: %s paper有持仓但交易所无", sym)
 
-        # 喂震荡检测器
-        if self._oscillator:
-            for sym, px in prices.items():
-                if px > 0:
-                    self._oscillator.feed(sym, px)
-
         # 检查持仓：动态止损 / 移动止盈 / 浮盈加仓
         for sym in list(self.positions):
             pos = self.positions[sym]
@@ -1443,27 +1446,6 @@ class StrategyRunner:
                 pos["best_price"] = px
 
             best_pnl = pos.get("best_pnl", pnl_pct)
-
-            # ── 浮亏补仓（震荡模式均价拉低） ──
-            if self._oscillator and pnl_pct < -3.0:
-                pside = pos["side"]
-                should_add, add_ratio, reason = self._oscillator.should_avg_down(
-                    sym, px, pos["entry"], pside, pnl_pct)
-                if should_add:
-                    avg_count = self._osc_avg_count.get(sym, 0)
-                    if avg_count < 2:  # 最多补 2 次
-                        add_m = pos["margin"] * add_ratio
-                        if add_m >= 0.3 and self.balance > add_m + pos["margin"]:
-                            q_av = self._quanto_for(sym)
-                            add_s = (add_m * pos["leverage"]) / max(q_av * px, 1e-9)
-                            pos["margin"] += add_m
-                            self.balance -= add_m
-                            pos["size"] += add_s
-                            pos["entry"] = (pos["entry"] * (pos["size"] - add_s) + px * add_s) / pos["size"]
-                            self._osc_avg_count[sym] = avg_count + 1
-                            self.trades += 1
-                            print(f"[补仓] {sym} {reason} 均价→{pos['entry']:.4f} 余{self._osc_avg_count[sym]}/2")
-                            self._persist_margin_delta(prices, sym, pos, -add_m, "margin_add", f"osc_avg:{reason}")
 
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
@@ -1699,14 +1681,9 @@ class StrategyRunner:
         # ── 启动预热：等K线+行情就绪后再开仓（持仓管理不受影响）──
         _can_open = True
         if not self._warmup_done:
-            self._warmup_ticks += 1
             kc = get_kline_cache() if KLINE_ENABLED else None
             detector = get_detector() if KLINE_ENABLED else None
-            if self._warmup_ticks >= 5 and kc and detector:
-                self._warmup_done = True
-                print(f"🔥 预热完成 (tick={self._warmup_ticks})，开始交易", flush=True)
-            else:
-                _can_open = False  # 跳过开仓，但持仓管理继续
+            _can_open = self._warmup_allows_open(has_kline=bool(kc), has_detector=bool(detector))
         scored = []
         for sym in prices:
             if now < self._fuse_block_until.get(sym, 0):
@@ -2033,8 +2010,6 @@ class StrategyRunner:
         pos = self.positions.pop(sym)
         oid = pos.get("order_id")
         bal_before = self.balance
-        self._osc_avg_count.pop(sym, None)  # 清补仓计数
-
         spec = self._contract_specs.get(sym)
         q = self._quanto_for(sym)
         gross = self._gross_pnl_usd(sym, pos, px)

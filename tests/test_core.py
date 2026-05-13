@@ -111,7 +111,6 @@ def test_pnl():
     runner.wins = 0
     runner.total_slippage = 0.0
     runner._initial_capital = 200.0
-    runner._osc_avg_count = type('FakeDict', (), {'pop': lambda self, k, v=None: None})()
 
     # 开多 BTC: 10张 @ 80000, 杠杆100x, 保证金=$20
     pos = make_pos("BTC/USDT", "long", 80000, size=10, leverage=100,

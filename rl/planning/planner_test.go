@@ -75,8 +75,8 @@ func TestApplyRegimePlaybookSetsRiskForMathPlans(t *testing.T) {
 
 	applyRegimePlaybook(plan, macro, 100, 2)
 
-	if plan.PositionSizePct <= 0 || plan.PositionSizePct > 0.01 {
-		t.Fatalf("expected defensive bleed position size, got %.4f", plan.PositionSizePct)
+	if plan.PositionSizePct < 0.008 || plan.PositionSizePct > 0.018 {
+		t.Fatalf("expected useful bleed position size, got %.4f", plan.PositionSizePct)
 	}
 	if plan.Leverage < 60 || plan.Leverage > 95 {
 		t.Fatalf("expected high-leverage bleed plan, got %d", plan.Leverage)
@@ -101,11 +101,11 @@ func TestPlaybookUsesMicroPositionHighLeverageWideStopQuickProfit(t *testing.T) 
 	entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
 	firstTPDistance := plan.TakeProfit[0] - entry
 	stopDistance := entry - plan.StopLoss
-	if plan.PositionSizePct <= 0 || plan.PositionSizePct > 0.006 {
-		t.Fatalf("expected micro position <=0.6%%, got %.4f", plan.PositionSizePct)
+	if plan.PositionSizePct < 0.01 || plan.PositionSizePct > 0.02 {
+		t.Fatalf("expected meaningful micro position in [1%%,2%%], got %.4f", plan.PositionSizePct)
 	}
-	if plan.Leverage < 65 {
-		t.Fatalf("expected high leverage >=65x, got %d", plan.Leverage)
+	if plan.Leverage < 80 {
+		t.Fatalf("expected high leverage >=80x, got %d", plan.Leverage)
 	}
 	if firstTPDistance <= 0 || firstTPDistance > 2*0.9 {
 		t.Fatalf("expected quick first TP within 0.9 ATR, got %.4f", firstTPDistance)

@@ -55,8 +55,8 @@ class PlanGateTest(unittest.TestCase):
 
         allowed, reason = gate.can_open("BTC/USDT", "long", 103.0)
 
-        self.assertFalse(allowed)
-        self.assertIn("入场", reason)
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "OK")
 
     def test_rejects_both_direction_entry_outside_matching_entry_zone(self):
         plan = make_plan(

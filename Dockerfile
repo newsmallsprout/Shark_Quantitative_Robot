@@ -23,7 +23,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY ai_strategy.py .
 COPY dual_strategy.py .
-COPY oscillation.py .
 COPY api/ ./api/
 COPY multi_exchange.py .
 COPY kline_cache.py .
@@ -32,10 +31,7 @@ COPY trade_reflector.py .
 COPY online_learner.py .
 COPY live_engine.py .
 COPY execution/ ./execution/
-COPY battle_report.py .
 COPY tests/ ./tests/
-COPY CONTEXT.md .
-COPY ARCHITECTURE.md .
 COPY dialogue_ammo.py .
 COPY character_voice.py .
 COPY observability/ ./observability/

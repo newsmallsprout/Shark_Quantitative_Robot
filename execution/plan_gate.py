@@ -142,11 +142,6 @@ class PlanGate:
             range_high = plan.get("range_high", 0)
             if range_low > 0 and range_high > 0 and (px < range_low or px > range_high):
                 return False, f"价格({px:.0f})不在区间[{range_low:.0f},{range_high:.0f}]"
-            entry_low = plan.get("entry_zone_low", 0)
-            entry_high = plan.get("entry_zone_high", 0)
-            in_zone = entry_low > 0 and entry_high > 0 and px >= entry_low and px <= entry_high
-            if not in_zone:
-                return False, f"价格({px:.0f})不在入场带[{entry_low:.0f},{entry_high:.0f}]"
         else:
             return False, f"计划方向无效({bias})"
 
