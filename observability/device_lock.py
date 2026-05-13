@@ -4,9 +4,9 @@
 说明：HTTP 协议无法获取浏览器端网卡 MAC，因此以来源 IP 白名单为主；
 可选 SHARK_ALLOWED_MAC：部分 API 请求须带 Header（同源 bootstrap 注入）。
 
-Docker / 本机访问时，对端 IP 常为 172.17.0.1、::ffff:127.0.0.1 等，故默认在开启锁时
-仍允许 loopback + 私网（RFC1918）与链路本地地址；生产仅信任显式 IP 时请设
-SHARK_DEVICE_LOCK_ALLOW_PRIVATE=0 并配置 SHARK_ALLOWED_IPS。
+Docker / 本机访问时，对端 IP 可能为 172.17.0.1、::ffff:127.0.0.1 等；设备锁开启后
+默认只信任 SHARK_ALLOWED_IPS / SHARK_ALLOWED_CIDRS 中显式配置的来源。
+确需局域网共享时再显式设置 SHARK_DEVICE_LOCK_ALLOW_PRIVATE=1。
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def init_device_lock(repo_root: Path) -> None:
     _TRUST_XFF = _truthy(os.environ.get("SHARK_TRUST_X_FORWARDED_FOR", ""))
     raw_ap = os.environ.get("SHARK_DEVICE_LOCK_ALLOW_PRIVATE")
     if raw_ap is None or str(raw_ap).strip() == "":
-        _ALLOW_PRIVATE = True
+        _ALLOW_PRIVATE = False
     else:
         _ALLOW_PRIVATE = not _falsy(str(raw_ap))
 
@@ -115,24 +115,77 @@ def init_device_lock(repo_root: Path) -> None:
 
 
 def _client_ip(request: Request) -> str:
-    if _TRUST_XFF:
+    loopback_host = _request_loopback_host(request)
+    if loopback_host:
+        return loopback_host
+
+    client = request.client
+    peer = ""
+    if client and client.host:
+        peer = client.host
+    else:
+        scope = request.scope.get("client")
+        if scope and len(scope) >= 1 and scope[0]:
+            peer = str(scope[0])
+
+    if _host_is_loopback(peer):
+        return peer
+    if _TRUST_XFF and _proxy_peer_trusted(peer):
         xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
         if xff:
             return xff.split(",")[0].strip()
-    client = request.client
-    if client and client.host:
-        return client.host
-    # scope 兜底（极少数中间件下 client 为空）
-    scope = request.scope.get("client")
-    if scope and len(scope) >= 1 and scope[0]:
-        return str(scope[0])
-    return ""
+    return peer
 
 
 def _normalize_host_ip(host: str) -> str:
     if host.startswith("::ffff:"):
         return host[7:]
     return host
+
+
+def _host_is_loopback(host: str) -> bool:
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(_normalize_host_ip(host)).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_header_loopback(host_header: str) -> Optional[str]:
+    if not host_header:
+        return None
+    host = host_header.strip()
+    if host.startswith("["):
+        end = host.find("]")
+        candidate = host[1:end] if end > 0 else host
+    else:
+        candidate = host.rsplit(":", 1)[0] if ":" in host else host
+    if candidate.lower() == "localhost":
+        return "127.0.0.1"
+    return candidate if _host_is_loopback(candidate) else None
+
+
+def _request_loopback_host(request: Request) -> Optional[str]:
+    return _host_header_loopback(request.headers.get("host") or request.headers.get("Host") or "")
+
+
+def _proxy_peer_trusted(host: str) -> bool:
+    """只信任显式白名单代理写入的 XFF，避免直连客户端伪造 X-Forwarded-For。"""
+    if not host:
+        return False
+    if host in _ALLOWED_IPS:
+        return True
+    h = _normalize_host_ip(host)
+    if h != host and h in _ALLOWED_IPS:
+        return True
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    if str(addr) in _ALLOWED_IPS:
+        return True
+    return any(addr in net for net in _ALLOWED_CIDRS)
 
 
 def _ip_allowed(host: str) -> bool:
@@ -229,8 +282,15 @@ def websocket_connection_allowed(
     if not _LOCK_ENABLED:
         return True, ""
     host = client_host or ""
-    if _TRUST_XFF:
-        hdr = {k.lower(): v for k, v in headers}
+    hdr = {k.lower(): v for k, v in headers}
+    hh = hdr.get(b"host")
+    if hh:
+        loopback_host = _host_header_loopback(hh.decode("latin-1", errors="replace"))
+        if loopback_host:
+            return True, ""
+    if _host_is_loopback(host):
+        return True, ""
+    if _TRUST_XFF and _proxy_peer_trusted(host):
         xff = hdr.get(b"x-forwarded-for")
         if xff:
             host = xff.decode("latin-1", errors="replace").split(",")[0].strip()
