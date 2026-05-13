@@ -90,15 +90,37 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 	lowSlice := lows[n-win:]
 	highSlice := highs[n-win:]
 
+	rangeLow := minFloat(lowSlice...) * 0.99
+	rangeHigh := maxFloat(highSlice...) * 1.01
+	lastClose := closes[len(closes)-1]
+
+	// ── 突破检测：价格接近20日区间边界时，用4h短期趋势确认 ──
+	breakoutDir := ""
+	nearHigh := rangeHigh > 0 && (lastClose-rangeHigh)/rangeHigh > -0.015 // 价格距上沿<1.5%
+	nearLow := rangeLow > 0 && (rangeLow-lastClose)/rangeLow > -0.015    // 价格距下沿<1.5%
+
+	if (nearHigh || nearLow) && regime == RegimeRange {
+		// 拉4h K线确认短期趋势
+		h4Trend := m.fetchShortTermTrend(ctx, symbol)
+		if nearHigh && h4Trend > 0.005 {
+			regime = RegimeTrendUp
+			breakoutDir = "up"
+		} else if nearLow && h4Trend < -0.005 {
+			regime = RegimeTrendDown
+			breakoutDir = "down"
+		}
+	}
+
 	macro := &MacroContext{
-		Symbol:    symbol,
-		Regime:    regime,
-		RangeLow:  minFloat(lowSlice...) * 0.99,
-		RangeHigh: maxFloat(highSlice...) * 1.01,
-		ATR14:     atr,
-		VolPct:    volPct,
-		TrendStr:  trend,
-		Timestamp: time.Now().Unix(),
+		Symbol:      symbol,
+		Regime:      regime,
+		RangeLow:    rangeLow,
+		RangeHigh:   rangeHigh,
+		ATR14:       atr,
+		VolPct:      volPct,
+		TrendStr:    trend,
+		BreakoutDir: breakoutDir,
+		Timestamp:   time.Now().Unix(),
 	}
 
 	m.cache[symbol] = macro
@@ -110,6 +132,42 @@ func (m *MacroBuilder) Get(symbol string) *MacroContext {
 		return c
 	}
 	return &MacroContext{Symbol: symbol, Regime: RegimeUnknown, ATR14: 0}
+}
+
+// fetchShortTermTrend 拉4h K线，计算近6根(24h)的线性回归斜率
+// 用于突破确认：日线判断为震荡但价格在区间边界时，用4h趋势确认方向
+func (m *MacroBuilder) fetchShortTermTrend(ctx context.Context, symbol string) float64 {
+	contract := stringsReplace(symbol, "/", "_")
+	url := fmt.Sprintf(
+		"https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=%s&interval=4h&limit=12",
+		contract)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+
+	var raw []struct {
+		C string `json:"c"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return 0
+	}
+	if len(raw) < 6 {
+		return 0
+	}
+
+	closes := make([]float64, len(raw))
+	for i, r := range raw {
+		closes[i] = parseFloat(r.C)
+	}
+	// 用最近6根4h K线（=24h）判断短期方向
+	return calcTrend(closes, 6)
 }
 
 // Cached 是否已有该交易对的成功 Fetch 结果（失败不会写入 cache）。

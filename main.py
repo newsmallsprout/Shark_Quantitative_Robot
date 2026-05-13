@@ -2251,8 +2251,11 @@ class StrategyRunner:
 
         # 实盘状态
         if self._live:
+            # 保留 toggle API 写入的 trading_enabled（竞态修复：_state 是唯一真相源）
+            _prev_trading = _state.get("live", {}).get("trading_enabled")
             _state["live"] = self._live.stats()
-            _state["live"]["trading_enabled"] = self._live_trading_enabled
+            if _prev_trading is not None:
+                _state["live"]["trading_enabled"] = _prev_trading
             try:
                 _state["live"]["balance"] = self._live.get_balance()
             except Exception:

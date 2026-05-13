@@ -101,14 +101,15 @@ type RangePlan struct {
 
 // MacroContext 大盘环境快照
 type MacroContext struct {
-	Symbol    string
-	Regime    Regime
-	RangeLow  float64
-	RangeHigh float64
-	ATR14     float64
-	VolPct    float64 // 波动率分位(0-100)
-	TrendStr  float64 // 趋势强度(-1到1)
-	Timestamp int64
+	Symbol      string
+	Regime      Regime
+	RangeLow    float64
+	RangeHigh   float64
+	ATR14       float64
+	VolPct      float64 // 波动率分位(0-100)
+	TrendStr    float64 // 趋势强度(-1到1)
+	BreakoutDir string  // "up"/"down"/"" — 当前是否在突破区间边界
+	Timestamp   int64
 }
 
 // DepthProfile 订单簿深度分析

@@ -457,6 +457,7 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 		ResistanceStr: depth.ResistanceStrength,
 		NewsRisk:      news.RiskLevel,
 		NewsFlags:     news.Flags,
+		BreakoutDir:   macro.BreakoutDir,
 	}
 	if pc.SupportStr <= 0 {
 		pc.SupportStr = 0.5
