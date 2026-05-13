@@ -1,11 +1,13 @@
 package rl
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -14,24 +16,24 @@ import (
 
 // TVAlert represents a TradingView Pine Script alert payload
 type TVAlert struct {
-	Symbol    string             `json:"symbol"`
-	Timeframe string             `json:"timeframe"`
-	Price     float64            `json:"price"`
-	Signal    string             `json:"signal"`    // "long", "short", "neutral"
-	Strength  float64            `json:"strength"`  // 0-100
+	Symbol     string             `json:"symbol"`
+	Timeframe  string             `json:"timeframe"`
+	Price      float64            `json:"price"`
+	Signal     string             `json:"signal"`     // "long", "short", "neutral"
+	Strength   float64            `json:"strength"`   // 0-100
 	Indicators map[string]float64 `json:"indicators"` // e.g. {"rsi": 35, "macd": 0.5}
-	Message   string             `json:"message"`
-	Timestamp int64              `json:"timestamp"`
+	Message    string             `json:"message"`
+	Timestamp  int64              `json:"timestamp"`
 }
 
 // KnowledgeBase stores learned patterns and market insights
 type KnowledgeBase struct {
 	mu          sync.RWMutex
-	Signals     []TVAlert           `json:"signals"`
-	Patterns    []TradePattern      `json:"patterns"`
-	Sentiment   map[string]float64  `json:"sentiment"`   // symbol → sentiment score (-1 to 1)
-	SignalCount int                 `json:"signal_count"`
-	LastUpdate  int64               `json:"last_update"`
+	Signals     []TVAlert          `json:"signals"`
+	Patterns    []TradePattern     `json:"patterns"`
+	Sentiment   map[string]float64 `json:"sentiment"` // symbol → sentiment score (-1 to 1)
+	SignalCount int                `json:"signal_count"`
+	LastUpdate  int64              `json:"last_update"`
 }
 
 func NewKnowledgeBase() *KnowledgeBase {
@@ -172,8 +174,33 @@ func NewWebhookServer(kb *KnowledgeBase, ga *GAPopulation, agent *DQNAgent) *Web
 	}
 }
 
+func requireHTTPToken(w http.ResponseWriter, r *http.Request) bool {
+	expected := os.Getenv("RL_API_TOKEN")
+	if expected == "" {
+		expected = os.Getenv("SHARK_API_TOKEN")
+	}
+	if expected == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	got := auth[len(prefix):]
+	if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 // POST /tv/alert — TradingView webhook endpoint
 func (s *WebhookServer) HandleTVAlert(w http.ResponseWriter, r *http.Request) {
+	if !requireHTTPToken(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -227,6 +254,9 @@ func (s *WebhookServer) HandleTVAlert(w http.ResponseWriter, r *http.Request) {
 
 // GET /rl/status — current RL engine status
 func (s *WebhookServer) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireHTTPToken(w, r) {
+		return
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -245,6 +275,9 @@ func (s *WebhookServer) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 // GET /rl/patterns — learned trading patterns
 func (s *WebhookServer) HandlePatterns(w http.ResponseWriter, r *http.Request) {
+	if !requireHTTPToken(w, r) {
+		return
+	}
 	s.kb.mu.RLock()
 	patterns := make([]TradePattern, len(s.kb.Patterns))
 	copy(patterns, s.kb.Patterns)

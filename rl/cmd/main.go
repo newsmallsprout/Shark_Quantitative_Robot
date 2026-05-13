@@ -23,8 +23,11 @@ func main() {
 	log.Println("🧬 Shark RL Evolution Engine (Go) starting...")
 
 	redisURL := getEnv("SHARK_REDIS_URL", "redis://redis:6379/0")
-	_ = redisURL
-	rdb := redis.NewClient(&redis.Options{Addr: "redis:6379", DB: 0})
+	redisOpt, err := redisOptionsFromURL(redisURL)
+	if err != nil {
+		log.Fatalf("[Redis] invalid SHARK_REDIS_URL: %v", err)
+	}
+	rdb := redis.NewClient(redisOpt)
 	defer rdb.Close()
 
 	ctx := context.Background()
@@ -91,6 +94,13 @@ func main() {
 	defer cancel()
 	httpServer.Shutdown(ctx2)
 	log.Println("[Shutdown] done")
+}
+
+func redisOptionsFromURL(rawURL string) (*redis.Options, error) {
+	if rawURL == "" {
+		rawURL = "redis://redis:6379/0"
+	}
+	return redis.ParseURL(rawURL)
 }
 
 func trainingLoop(kb *rl.KnowledgeBase, ga *rl.GAPopulation, agent *rl.DQNAgent,
@@ -242,7 +252,8 @@ func publishActions(rdb *redis.Client, agent *rl.DQNAgent, kb *rl.KnowledgeBase,
 		chg := (px - prices[len(prices)-1]) / prices[len(prices)-1] // proxy price change
 		rsi := computeRSI(prices, len(prices)-1, 14)
 		vol := computeVol(prices, len(prices)-1, 20)
-		trend := computeTrend; _ = trend(prices, len(prices)-1, 20)
+		trend := computeTrend
+		_ = trend(prices, len(prices)-1, 20)
 		sentiment := kb.GetSentiment(sym)
 
 		state := []float64{chg, rsi, vol, 0, 0, sentiment} // position=flat, upnl=0
@@ -315,14 +326,14 @@ func publishEvoSuggestion(rdb *redis.Client, ga *rl.GAPopulation) {
 		"type":        "ga_best_params",
 		"description": desc,
 		"params": map[string]interface{}{
-			"margin_pct":        gene.MarginPct,
-			"max_positions":     gene.MaxPositions,
-			"rsi_threshold":     gene.RSIThreshold,
-			"stop_atr_mult":     gene.StopATRMult,
-			"take_atr_mult":     gene.TakeATRMult,
+			"margin_pct":         gene.MarginPct,
+			"max_positions":      gene.MaxPositions,
+			"rsi_threshold":      gene.RSIThreshold,
+			"stop_atr_mult":      gene.StopATRMult,
+			"take_atr_mult":      gene.TakeATRMult,
 			"max_drawdown_limit": gene.MaxDrawdownLimit,
-			"cooldown_sec":      gene.CoolDownSec,
-			"pyramid_levels":    gene.PyramidLevels,
+			"cooldown_sec":       gene.CoolDownSec,
+			"pyramid_levels":     gene.PyramidLevels,
 		},
 	}
 	data, _ := json.Marshal(msg)

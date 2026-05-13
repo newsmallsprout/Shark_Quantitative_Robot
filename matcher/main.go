@@ -18,16 +18,17 @@ var (
 	ctx      = context.Background()
 )
 
-func init() {
+func connectRedis() *redis.Client {
 	if redisURL == "" {
 		redisURL = "redis://redis:6379/0"
 	}
 	opt, _ := redis.ParseURL(redisURL)
-	rdb = redis.NewClient(opt)
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	client := redis.NewClient(opt)
+	if err := client.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Redis: %v", err)
 	}
 	log.Println("✅ Redis connected")
+	return client
 }
 
 type TradeCmd struct {
@@ -37,8 +38,26 @@ type TradeCmd struct {
 	Mode   string `json:"mode"`
 }
 
+func validateTradeCmd(cmd TradeCmd) error {
+	if cmd.Mode != "paper" {
+		return fmt.Errorf("unsupported mode %q", cmd.Mode)
+	}
+	if cmd.Action != "open" && cmd.Action != "close" {
+		return fmt.Errorf("unsupported action %q", cmd.Action)
+	}
+	if cmd.Side != "long" && cmd.Side != "short" {
+		return fmt.Errorf("unsupported side %q", cmd.Side)
+	}
+	if cmd.Symbol == "" {
+		return fmt.Errorf("symbol required")
+	}
+	return nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	rdb = connectRedis()
+	defer rdb.Close()
 
 	pubsub := rdb.Subscribe(ctx, "shark:orders:new")
 	defer pubsub.Close()
@@ -53,6 +72,10 @@ func main() {
 		}
 		if cmd.Mode != "paper" {
 			continue // 只处理纸盘
+		}
+		if err := validateTradeCmd(cmd); err != nil {
+			log.Printf("reject paper command: %v", err)
+			continue
 		}
 
 		// 读 Redis 价格

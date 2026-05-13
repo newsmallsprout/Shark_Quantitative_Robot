@@ -32,7 +32,6 @@ COPY market_regime.py .
 COPY trade_reflector.py .
 COPY online_learner.py .
 COPY live_engine.py .
-COPY signal_engine.py .
 COPY execution/ ./execution/
 COPY battle_report.py .
 COPY tests/ ./tests/

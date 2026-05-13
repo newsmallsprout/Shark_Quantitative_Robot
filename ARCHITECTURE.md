@@ -58,18 +58,14 @@ def _close_position(self, sym, px, reason, pnl_pct, prices=None):
     self.positions.pop(sym)  # 最后才删除
 ```
 
-### 3. 信号判定 — 内联在 tick() 中
+### 3. RangePlan 方向判定 — 内联在 tick() 中
 
-**问题**：AI 委员会和多方兜底的 100+ 行逻辑直接在 tick 循环内。
+**问题**：RangePlan 的方向判定和订单构建曾直接在 tick 循环内，难以单测。
 
-**深化方案**：提取 `SignalEngine` 类
+**深化方案**：保留 RangePlan 为唯一信号来源，把可复用边界逻辑提取到 `execution/` 下的独立 helper。
 
 ```python
-class SignalEngine:
-    def decide(self, sym, ai_cache, diag, funding, change, vol, is_stable) -> Signal:
-        if ai := self._try_ai(sym, ai_cache):
-            return ai
-        return self._try_fallback(sym, diag, funding, change, vol, is_stable)
+from execution.order_command import build_order_command
 ```
 
 ## 保持深度的模块（不变）
@@ -87,7 +83,7 @@ class SignalEngine:
 
 1. **P0**: 拆 `tick()` → 测试能跑起来
 2. **P1**: 拆 `_close_position()` → 实盘/纸盘分离
-3. **P2**: 提取 SignalEngine → 方向判定可独立测试
+3. **P2**: 继续收敛 RangePlan 方向判定 → 方向与订单边界可独立测试
 4. **P3**: `get_mark_prices()` 中的 HTML 渲染移到 web 层
 
 ## 不做的事

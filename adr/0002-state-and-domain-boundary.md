@@ -12,17 +12,17 @@
 
 ## 决策
 
-1. 新增包 **`domain/trading`**：定义 **`Side`、`OrderStatus`、`TradeOrder`** 及 **`OrderStatus` 合法跃迁表**（见 `transitions.py`）。
-2. **`_state` 定位**：在迁移完成前，仍为**进程内缓存 DTO**；不作为复式记账或审计的唯一来源。长期目标是由应用服务从领域聚合根**投影**出 `_state` 或独立 Read Model。
-3. **`engine.paper_engine`**：保持现有行为；新逻辑优先引用 `domain.trading` 类型，再通过适配器写入引擎或 `_state`（绞杀者模式，按需 PR）。
-4. **幂等**：`TradeOrder.idempotency_key` 字段预留；真正幂等门闩（Redis/DB）属基础设施，不在本 ADR 范围。
+1. **目标边界**：后续若继续领域层迁移，再新增 `domain/trading` 包定义 `Side`、`OrderStatus`、`TradeOrder` 及合法状态跃迁。
+2. **当前落地状态**：本仓库当前尚未包含 `domain/` 包；短期内以 `execution/order_command.py` 和 Go 边界校验先收敛 Redis 订单契约。
+3. **`_state` 定位**：在迁移完成前，仍为**进程内缓存 DTO**；不作为复式记账或审计的唯一来源。长期目标是由应用服务从领域聚合根**投影**出 `_state` 或独立 Read Model。
+4. **幂等**：订单命令已预留边界校验和 token；真正幂等门闩（Redis/DB）属基础设施，后续按实盘需要补齐。
 
 ## 后果
 
 - **正面**：订单状态可单测；非法跃迁可在服务层显式失败。
-- **负面**：短期内双轨类型并存，需约定「新代码走 domain」直至旧路径删除。
+- **负面**：领域包尚未落地，短期内 Python 与 Go 仍需分别维护边界校验。
 
 ## 参考
 
-- `domain/trading/order.py`
+- `execution/order_command.py`
 - `main.py` `_state` 与 `StrategyRunner._trade_history`

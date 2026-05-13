@@ -52,7 +52,7 @@ Shark 2.0 是一个**多语言微服务**量化交易平台，Python策略大脑
 
 ### 数据流
 
-1. **Python** 运行主循环：获取行情 → AI委员会分析 → SignalEngine决策 → 发布到 `shark:orders:new`
+1. **Python** 运行主循环：获取行情 → 读取 RangePlan → PlanGate 决策与风控 → 发布到 `shark:orders:new`
 2. **Go executor** 订阅 `shark:orders:new`（仅实盘）→ Gate.io 下单
 3. **Go matcher** 订阅 `shark:orders:new`（模拟盘）→ 用Redis价格快照撮合
 4. **Go evolver** 读取Redis交易历史 → DQN训练 + GA进化 + TradingView学习 → 发布 `shark:rl:action` + `shark:evo:pending`
@@ -140,7 +140,6 @@ open http://localhost:80
 ```
 Shark_Quantitative_Robot/
 ├── main.py                 # 主入口（FastAPI + 策略循环）
-├── signal_engine.py        # 信号决策（AI委员会 + 兜底）
 ├── ai_strategy.py          # 多模型AI分析
 ├── ai_position.py          # AI仓位管理
 ├── dual_strategy.py        # 双轨资金配置

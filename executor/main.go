@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -111,22 +112,36 @@ type TradeCmd struct {
 	Mode       string  `json:"mode"`   // "paper" or "live"
 	StopLoss   float64 `json:"stop_loss,omitempty"`
 	TakeProfit float64 `json:"take_profit,omitempty"`
+	Token      string  `json:"token,omitempty"`
 }
 
-func executePaper(cmd TradeCmd) {
-	// Read current price from Redis
-	priceStr, err := rdb.Get(ctx, "shark:price:"+cmd.Symbol).Result()
-	if err != nil {
-		log.Printf("paper: no price for %s, skip", cmd.Symbol)
-		return
+func validateTradeCmd(cmd TradeCmd) error {
+	if cmd.Mode != "live" {
+		return fmt.Errorf("unsupported mode %q", cmd.Mode)
 	}
-	price, _ := strconv.ParseFloat(priceStr, 64)
-	oid := fmt.Sprintf("paper-%d", time.Now().UnixNano())
-
-	msg := fmt.Sprintf("{\"symbol\":\"%s\",\"side\":\"%s\",\"action\":\"%s\",\"price\":%.4f,\"order_id\":\"%s\"}",
-		cmd.Symbol, cmd.Side, cmd.Action, price, oid)
-	rdb.Publish(ctx, "shark:orders:status", msg)
-	log.Printf("📝 纸盘 %s %s %s @%.4f", cmd.Symbol, cmd.Side, cmd.Action, price)
+	if cmd.Action != "open" && cmd.Action != "close" {
+		return fmt.Errorf("unsupported action %q", cmd.Action)
+	}
+	if cmd.Side != "long" && cmd.Side != "short" {
+		return fmt.Errorf("unsupported side %q", cmd.Side)
+	}
+	if !strings.Contains(cmd.Symbol, "/") {
+		return fmt.Errorf("invalid symbol %q", cmd.Symbol)
+	}
+	if cmd.Size <= 0 {
+		return fmt.Errorf("size must be positive")
+	}
+	if cmd.Leverage < 1 || cmd.Leverage > 125 {
+		return fmt.Errorf("leverage out of range")
+	}
+	expectedToken := os.Getenv("SHARK_ORDER_TOKEN")
+	if expectedToken == "" {
+		expectedToken = os.Getenv("SHARK_API_TOKEN")
+	}
+	if expectedToken != "" && subtle.ConstantTimeCompare([]byte(cmd.Token), []byte(expectedToken)) != 1 {
+		return fmt.Errorf("invalid order token")
+	}
+	return nil
 }
 
 func executeOpen(cmd TradeCmd) {
@@ -283,6 +298,10 @@ func main() {
 			log.Printf("📩 收到指令: %s %s %s [%s]", cmd.Symbol, cmd.Side, cmd.Action, cmd.Mode)
 			if cmd.Mode == "paper" {
 				continue // paper 由 matcher 处理
+			}
+			if err := validateTradeCmd(cmd); err != nil {
+				log.Printf("reject command: %v", err)
+				continue
 			}
 			switch cmd.Action {
 			case "open":

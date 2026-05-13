@@ -22,15 +22,15 @@ type Planner struct {
 	prices map[string]float64
 
 	// 子模块
-	macro  *MacroBuilder
-	book   *BookIngestor
-	news   *NewsIngestor
-	http   *http.Client
+	macro *MacroBuilder
+	book  *BookIngestor
+	news  *NewsIngestor
+	http  *http.Client
 
 	// 自进化
-	evo       *EvoState
-	lastPlan  int64
-	symbols   []string
+	evo      *EvoState
+	lastPlan int64
+	symbols  []string
 
 	// TV insights (set from main.go)
 	tvFn func(symbol string) string
@@ -448,15 +448,15 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 
 	// 构建 AI 分析上下文
 	pc := &PlanContext{
-		Symbol:       symbol,
-		Regime:       string(macro.Regime),
-		Price:        px,
-		ATR14:        atr,
-		FundingRate:  funding,
-		SupportStr:   depth.SupportStrength,
+		Symbol:        symbol,
+		Regime:        string(macro.Regime),
+		Price:         px,
+		ATR14:         atr,
+		FundingRate:   funding,
+		SupportStr:    depth.SupportStrength,
 		ResistanceStr: depth.ResistanceStrength,
-		NewsRisk:    news.RiskLevel,
-		NewsFlags:   news.Flags,
+		NewsRisk:      news.RiskLevel,
+		NewsFlags:     news.Flags,
 	}
 	if pc.SupportStr <= 0 {
 		pc.SupportStr = 0.5
@@ -481,23 +481,23 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 
 	// AI → RangePlan
 	plan := &RangePlan{
-		Symbol:       symbol,
-		Regime:       string(macro.Regime),
-		LeverageCap:  5,
-		ATR14:        atr,
-		AiModel:      "deepseek",
-		AiRationale:  ai.Rationale,
-		AiConfidence: ai.Confidence,
-		PositionSizePct: ai.PositionSizePct,
-		Leverage:        ai.Leverage,
-		PyramidPrices:   ai.PyramidPrices,
-		CutLossPct:      ai.CutLossPct,
-		SupportStrength: depth.SupportStrength,
+		Symbol:             symbol,
+		Regime:             string(macro.Regime),
+		LeverageCap:        125,
+		ATR14:              atr,
+		AiModel:            "deepseek",
+		AiRationale:        ai.Rationale,
+		AiConfidence:       ai.Confidence,
+		PositionSizePct:    ai.PositionSizePct,
+		Leverage:           ai.Leverage,
+		PyramidPrices:      ai.PyramidPrices,
+		CutLossPct:         ai.CutLossPct,
+		SupportStrength:    depth.SupportStrength,
 		ResistanceStrength: depth.ResistanceStrength,
-		NewsRiskLevel:  news.RiskLevel,
-		RiskFlags:      news.Flags,
-		MacroRegime:    macro.Regime,
-		FundingRate:    funding,
+		NewsRiskLevel:      news.RiskLevel,
+		RiskFlags:          news.Flags,
+		MacroRegime:        macro.Regime,
+		FundingRate:        funding,
 	}
 
 	// 填入 AI 产出的区间值
@@ -571,7 +571,7 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 	plan := &RangePlan{
 		Symbol:      symbol,
 		Regime:      string(macro.Regime),
-		LeverageCap: 5,
+		LeverageCap: 125,
 		ATR14:       atr,
 		AiModel:     "math",
 	}
@@ -635,6 +635,7 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 }
 
 func clampPlan(plan *RangePlan, px float64) {
+	clampPlanRisk(plan)
 	// both 方向：同时修正 long 和 short 的入场带
 	if plan.Bias == "both" {
 		minZone := px * 0.005 // 最低入场带宽 = 0.5%
@@ -713,6 +714,34 @@ func clampPlan(plan *RangePlan, px float64) {
 		if plan.StopLoss <= plan.EntryZoneHigh || plan.StopLoss > px*1.15 || plan.StopLoss <= 0 {
 			plan.StopLoss = plan.EntryZoneHigh * 1.03
 		}
+	}
+}
+
+func clampPlanRisk(plan *RangePlan) {
+	const (
+		defaultLeverageCap = 125
+		minLeverage        = 1
+		maxLeverage        = 125
+		minPositionPct     = 0.001
+		maxPositionPct     = 0.05
+	)
+	if plan.LeverageCap <= 0 || plan.LeverageCap > maxLeverage {
+		plan.LeverageCap = defaultLeverageCap
+	}
+	if plan.Leverage <= 0 {
+		plan.Leverage = minLeverage
+	}
+	if plan.Leverage > plan.LeverageCap {
+		plan.Leverage = plan.LeverageCap
+	}
+	if plan.Leverage > maxLeverage {
+		plan.Leverage = maxLeverage
+	}
+	if plan.PositionSizePct <= 0 {
+		plan.PositionSizePct = minPositionPct
+	}
+	if plan.PositionSizePct > maxPositionPct {
+		plan.PositionSizePct = maxPositionPct
 	}
 }
 

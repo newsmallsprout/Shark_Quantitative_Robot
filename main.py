@@ -21,6 +21,7 @@ from persistence.bridge import PersistenceBridge, create_redis
 from persistence.repository import AccountRepository
 from persistence.session import create_engine_and_sessionmaker
 from persistence.redis_rate_limit import fixed_window_allow
+from execution.order_command import build_order_command, build_rl_order_command
 
 _storage_bridge: Optional[PersistenceBridge] = None
 
@@ -452,7 +453,7 @@ async def evo_reject(change_id: int, _: None = Depends(require_api_token)):
 
 @app.get("/api/evo/metrics")
 async def evo_metrics(_: None = Depends(require_api_token)):
-    """进化层奖励分解：优先读 C++ evolver 写入的 shark:evo:metrics；无 Redis 时用当前看板 trade_history 本地计算。"""
+    """进化层奖励分解：优先读 Go evolver 写入的 shark:evo:metrics；无 Redis 时用当前看板 trade_history 本地计算。"""
     global _storage_bridge
     if _storage_bridge and _storage_bridge.redis:
         try:
@@ -1103,7 +1104,7 @@ class StrategyRunner:
         return float(sp.quanto_multiplier) if sp else 1.0
 
     def merge_evo_suggestion(self, change: dict) -> None:
-        """合并 C++ evolution 建议：同 type 仅保留一条，保留 id/params 与 Redis 一致便于 approve。
+        """合并 Go evolution 建议：同 type 仅保留一条，保留 id/params 与 Redis 一致便于 approve。
         审批/拒绝后的冷却期内（5min）同类型建议直接丢弃。"""
         ctype = str(change.get("type") or "unknown")
         
@@ -1904,19 +1905,10 @@ class StrategyRunner:
             mode = "live" if (_is_live and self._live_trading_enabled) else "paper"
             
             _ct_size = max(1, int(size))
-            # 构建订单 JSON（含止盈止损价，Go 执行器直接挂条件单）
-            _tp_first = None
-            if _plan_tp:
-                if isinstance(_plan_tp, list) and len(_plan_tp) > 0:
-                    _tp_first = _plan_tp[0]
-                elif isinstance(_plan_tp, (int, float)):
-                    _tp_first = _plan_tp
-            cmd = json.dumps({
-                "symbol": sym, "side": side, "size": _ct_size,
-                "leverage": lev, "action": "open", "mode": mode,
-                "stop_loss": _plan_sl,
-                "take_profit": _tp_first,
-            })
+            cmd = build_order_command(
+                symbol=sym, side=side, size=_ct_size, leverage=lev,
+                action="open", mode=mode, stop_loss=_plan_sl, take_profit=_plan_tp,
+            )
             try:
                 import redis as _redis
                 _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
@@ -2018,10 +2010,14 @@ class StrategyRunner:
         if self._live and self._live.active and self._live_trading_enabled:
             lp = self.positions.get(sym)
             if lp:
-                cmd = json.dumps({
-                    "symbol": sym, "side": lp["side"], "action": "close",
-                    "size": int(lp.get("size", 1)),
-                })
+                cmd = build_order_command(
+                    symbol=sym,
+                    side=lp["side"],
+                    action="close",
+                    mode="live",
+                    size=max(1, int(lp.get("size", 1))),
+                    leverage=max(1, int(lp.get("leverage", 1))),
+                )
                 try:
                     import redis as _redis
                     _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
@@ -2088,7 +2084,7 @@ class StrategyRunner:
             "signal_src": pos.get("signal_src", ""),
             "ai_confidence": pos.get("ai_confidence", 0),
         })
-        # 发布到 Redis 供 C++ 进化引擎消费
+        # 发布到 Redis 供 Go 进化引擎消费
         try:
             import redis as _redis2
             _rr = _redis2.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
@@ -2449,7 +2445,7 @@ async def main():
             except Exception as e:
                 _log.debug("hydrate evo item: %s", e)
 
-    # C++ 进化引擎订阅：监听 shark:evo:pending → 加入待审批队列
+    # Go 进化引擎订阅：监听 shark:evo:pending → 加入待审批队列
     async def evo_subscriber():
         if not redis_client:
             return
@@ -2493,9 +2489,11 @@ async def main():
                 sym = action.get("symbol", "")
                 side = action.get("side", "")
                 if side in ("long", "short"):
-                    # 实盘走 executor，模拟盘走 matcher
+                    if os.environ.get("SHARK_ENABLE_RL_ORDERS", "").strip().lower() not in ("1", "true", "yes", "on"):
+                        continue
+                    # 实盘走 executor，模拟盘走 matcher；RL 命令也必须包含 size/leverage 等完整字段
                     mode = "live" if (runner._live and runner._live.active) else "paper"
-                    cmd = json.dumps({"symbol": sym, "side": side, "action": "open", "mode": mode, "source": "rl-agent"})
+                    cmd = build_rl_order_command(action, mode=mode)
                     await redis_client.publish("shark:orders:new", cmd)
             except Exception as e:
                 _log.debug("rl_action_subscriber: %s", e)

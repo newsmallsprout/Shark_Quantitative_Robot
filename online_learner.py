@@ -1,4 +1,4 @@
-"""在线学习器 — Stub（C++ 进化引擎负责主循环）。
+"""在线学习器 — Stub（Go 进化引擎负责主循环）。
 多维奖励与回撤分解见 evolution.reward_signal.compute_reward_breakdown。
 """
 

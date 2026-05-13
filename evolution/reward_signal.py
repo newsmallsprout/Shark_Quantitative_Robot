@@ -106,7 +106,7 @@ def compute_reward_breakdown(
     syms.discard("")
     unique_symbols = len(syms)
 
-    # —— 加权奖励（与 C++ 一致）——
+    # —— 加权奖励（与 Go evolver 一致）——
     profit_term = math.tanh(total_pnl / 50.0) * 2.0
     sharpe_term = max(-1.5, min(1.5, sharpe_like * 0.35))
     dd_penalty = -0.12 * max(0.0, max_dd_pct - dd_limit_pct)

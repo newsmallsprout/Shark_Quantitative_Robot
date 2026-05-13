@@ -116,23 +116,31 @@ class PlanGate:
             return False, f"风险={plan.get('news_risk_level')}"
 
         bias = plan.get("bias", "")
+        if side not in ("long", "short"):
+            return False, f"方向无效({side})"
 
-        # 双方向：在区间内即可开仓，入场带为最优参考而非硬门禁
+        range_low = plan.get("range_low", 0)
+        range_high = plan.get("range_high", 0)
+        if range_low > 0 and range_high > range_low and (px < range_low or px > range_high):
+            return False, f"价格({px:.0f})不在区间[{range_low:.0f},{range_high:.0f}]"
+
         if bias == "both":
-            range_low = plan.get("range_low", 0)
-            range_high = plan.get("range_high", 0)
-            if px < range_low or px > range_high:
-                return False, f"价格({px:.0f})不在区间[{range_low:.0f},{range_high:.0f}]"
             if side == "long":
                 entry_low = plan.get("long_entry_low", 0)
                 entry_high = plan.get("long_entry_high", 0)
             else:
                 entry_low = plan.get("short_entry_low", 0)
                 entry_high = plan.get("short_entry_high", 0)
-            # 入场带仅做 soft check——在区间内但不在最优入场带时仍放行
-            in_zone = entry_low > 0 and entry_high > 0 and px >= entry_low and px <= entry_high
-            if not in_zone:
-                pass  # 区间内都放行
+        elif bias in ("long", "short"):
+            if side != bias:
+                return False, f"方向不匹配(plan={bias}, side={side})"
+            entry_low = plan.get("entry_zone_low", 0)
+            entry_high = plan.get("entry_zone_high", 0)
+        else:
+            return False, f"方向计划无效({bias})"
+
+        if entry_low > 0 and entry_high > entry_low and (px < entry_low or px > entry_high):
+            return False, f"价格({px:.0f})不在入场带[{entry_low:.0f},{entry_high:.0f}]"
 
         # Beta过滤：BTC下行趋势 → 山寨禁多
         if symbol not in ("BTC/USDT", "ETH/USDT"):
