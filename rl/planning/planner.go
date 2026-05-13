@@ -125,6 +125,15 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 	plan.GeneratedAt = time.Now().Unix()
 	plan.ValidUntil = plan.GeneratedAt + 1800
 	plan.EvoGen = p.evo.Generation
+	if digest.RiskLevel >= 2 {
+		plan.State = string(StatePaused)
+		p.state = StatePaused
+		log.Printf("[Planning] ⚠️ 新闻风险爆表 → PAUSED (flags=%v)", digest.Flags)
+	} else if fs, ok := p.fuse[symbol]; ok && fs != nil && fs.Triggered {
+		plan.State = string(StatePaused)
+	} else {
+		plan.State = string(StateLive)
+	}
 
 	if err := p.audit(plan); err != nil {
 		log.Printf("[Planning] 审计失败(%s): %v — 沿用旧计划", symbol, err)
@@ -138,16 +147,6 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 		return nil
 	}
 	p.rdb.Publish(ctx, "shark:plan:updated", string(data))
-
-	if digest.RiskLevel >= 2 {
-		plan.State = string(StatePaused)
-		p.state = StatePaused
-		log.Printf("[Planning] ⚠️ 新闻风险爆表 → PAUSED (flags=%v)", digest.Flags)
-	} else if fs, ok := p.fuse[symbol]; ok && fs != nil && fs.Triggered {
-		plan.State = string(StatePaused)
-	} else {
-		plan.State = string(StateLive)
-	}
 
 	p.plans[symbol] = plan
 	p.lastPlan = time.Now().Unix()
@@ -585,7 +584,7 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 	}
 
 	switch {
-	case macro.Regime == RegimeTrendUp:
+	case macro.Regime == RegimeTrendUp || macro.Regime == RegimeBreakoutUp || macro.Regime == RegimeSlowGrindUp:
 		plan.Bias = "long"
 		plan.EntryZoneLow = pxPlan - atr*e.AtRMult*0.3
 		plan.EntryZoneHigh = pxPlan - atr*e.EntryMargin
@@ -596,7 +595,7 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 		plan.LongStopLoss = plan.StopLoss
 		plan.LongTakeProfit = plan.TakeProfit
 
-	case macro.Regime == RegimeTrendDown:
+	case macro.Regime == RegimeTrendDown || macro.Regime == RegimeBreakoutDown || macro.Regime == RegimeSlowGrindDown || macro.Regime == RegimeBleedDown:
 		plan.Bias = "short"
 		plan.EntryZoneLow = pxPlan + atr*e.EntryMargin
 		plan.EntryZoneHigh = pxPlan + atr*e.AtRMult*0.3
@@ -631,8 +630,92 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 	plan.MacroRegime = macro.Regime
 	plan.FundingRate = funding
 
+	applyRegimePlaybook(plan, macro, pxPlan, atr)
 	clampPlan(plan, pxPlan)
 	return plan
+}
+
+func applyRegimePlaybook(plan *RangePlan, macro *MacroContext, px, atr float64) {
+	if plan == nil || macro == nil {
+		return
+	}
+	plan.LeverageCap = 125
+	switch macro.Regime {
+	case RegimeTrendUp, RegimeTrendDown:
+		plan.PositionSizePct = 0.005
+		plan.Leverage = 75
+		plan.CutLossPct = 0.035
+	case RegimeBreakoutUp, RegimeBreakoutDown:
+		plan.PositionSizePct = 0.004
+		plan.Leverage = 70
+		plan.CutLossPct = 0.03
+	case RegimeSlowGrindUp, RegimeSlowGrindDown:
+		plan.PositionSizePct = 0.003
+		plan.Leverage = 65
+		plan.CutLossPct = 0.025
+	case RegimeBleedDown:
+		plan.PositionSizePct = 0.003
+		plan.Leverage = 65
+		plan.CutLossPct = 0.025
+	case RegimeChoppy:
+		plan.PositionSizePct = 0.0015
+		plan.Leverage = 35
+		plan.CutLossPct = 0.02
+	case RegimeDead:
+		plan.PositionSizePct = 0.001
+		plan.Leverage = 1
+		plan.CutLossPct = 0.01
+	default:
+		plan.PositionSizePct = 0.003
+		plan.Leverage = 60
+		plan.CutLossPct = 0.025
+	}
+	applyQuickProfitWideStop(plan, px, atr)
+}
+
+func applyQuickProfitWideStop(plan *RangePlan, px, atr float64) {
+	if plan == nil || px <= 0 || atr <= 0 {
+		return
+	}
+	firstTP := atr * 0.75
+	secondTP := atr * 1.25
+	stopDistance := atr * 1.8
+	if plan.Bias == "long" {
+		entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
+		if entry <= 0 {
+			entry = px
+		}
+		plan.StopLoss = entry - stopDistance
+		plan.TakeProfit = []float64{entry + firstTP, entry + secondTP}
+		plan.LongStopLoss = plan.StopLoss
+		plan.LongTakeProfit = plan.TakeProfit
+		return
+	}
+	if plan.Bias == "short" {
+		entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
+		if entry <= 0 {
+			entry = px
+		}
+		plan.StopLoss = entry + stopDistance
+		plan.TakeProfit = []float64{entry - firstTP, entry - secondTP}
+		plan.ShortStopLoss = plan.StopLoss
+		plan.ShortTakeProfit = plan.TakeProfit
+		return
+	}
+	if plan.Bias == "both" {
+		longEntry := (plan.LongEntryLow + plan.LongEntryHigh) / 2
+		if longEntry <= 0 {
+			longEntry = px * 0.995
+		}
+		shortEntry := (plan.ShortEntryLow + plan.ShortEntryHigh) / 2
+		if shortEntry <= 0 {
+			shortEntry = px * 1.005
+		}
+		plan.LongStopLoss = longEntry - stopDistance
+		plan.LongTakeProfit = []float64{longEntry + firstTP, longEntry + secondTP}
+		plan.ShortStopLoss = shortEntry + stopDistance
+		plan.ShortTakeProfit = []float64{shortEntry - firstTP, shortEntry - secondTP}
+	}
 }
 
 func clampPlan(plan *RangePlan, px float64) {
@@ -747,6 +830,27 @@ func clampPlanRisk(plan *RangePlan) {
 }
 
 func (p *Planner) audit(plan *RangePlan) error {
+	if plan.Bias == "both" {
+		longEntry := (plan.LongEntryLow + plan.LongEntryHigh) / 2
+		if plan.LongStopLoss >= longEntry {
+			return fmt.Errorf("both long: sl(%.2f) >= entry(%.2f)", plan.LongStopLoss, longEntry)
+		}
+		for _, tp := range plan.LongTakeProfit {
+			if tp <= longEntry {
+				return fmt.Errorf("both long: tp(%.2f) <= entry(%.2f)", tp, longEntry)
+			}
+		}
+		shortEntry := (plan.ShortEntryLow + plan.ShortEntryHigh) / 2
+		if plan.ShortStopLoss <= shortEntry {
+			return fmt.Errorf("both short: sl(%.2f) <= entry(%.2f)", plan.ShortStopLoss, shortEntry)
+		}
+		for _, tp := range plan.ShortTakeProfit {
+			if tp >= shortEntry {
+				return fmt.Errorf("both short: tp(%.2f) >= entry(%.2f)", tp, shortEntry)
+			}
+		}
+		return nil
+	}
 	entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
 	if plan.Bias == "long" {
 		if plan.StopLoss >= entry {

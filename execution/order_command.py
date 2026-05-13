@@ -63,6 +63,8 @@ def build_order_command(
     first_tp = _first_take_profit(take_profit)
     if first_tp:
         cmd["take_profit"] = first_tp
+    if isinstance(take_profit, list) and take_profit:
+        cmd["take_profit_levels"] = [float(tp) for tp in take_profit if tp]
     token = _order_token()
     if token:
         cmd["token"] = token

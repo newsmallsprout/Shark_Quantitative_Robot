@@ -23,7 +23,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY ai_strategy.py .
 COPY dual_strategy.py .
-COPY ai_position.py .
 COPY oscillation.py .
 COPY api/ ./api/
 COPY multi_exchange.py .

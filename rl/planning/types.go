@@ -20,10 +20,17 @@ const (
 type Regime string
 
 const (
-	RegimeTrendUp   Regime = "trend_up"
-	RegimeTrendDown Regime = "trend_down"
-	RegimeRange     Regime = "range_bound"
-	RegimeUnknown   Regime = "unknown"
+	RegimeTrendUp       Regime = "trend_up"
+	RegimeTrendDown     Regime = "trend_down"
+	RegimeRange         Regime = "range_bound"
+	RegimeBreakoutUp    Regime = "breakout_up"
+	RegimeBreakoutDown  Regime = "breakout_down"
+	RegimeSlowGrindUp   Regime = "slow_grind_up"
+	RegimeSlowGrindDown Regime = "slow_grind_down"
+	RegimeBleedDown     Regime = "bleed_down"
+	RegimeChoppy        Regime = "choppy"
+	RegimeDead          Regime = "dead"
+	RegimeUnknown       Regime = "unknown"
 )
 
 // FocusSymbols 专注币对
@@ -42,12 +49,12 @@ func IsLargeCap(symbol string) bool {
 
 // RangePlan — SlowLoop 产出的交易计划（Redis JSON）
 type RangePlan struct {
-	Symbol      string  `json:"symbol"`
-	GeneratedAt int64   `json:"generated_at"`
-	ValidUntil  int64   `json:"valid_until"` // 30分钟后过期
-	State       string  `json:"state"`       // PlanningState
-	Regime      string  `json:"regime"`
-	Bias        string  `json:"bias"` // "long" | "short" | "neutral"
+	Symbol      string `json:"symbol"`
+	GeneratedAt int64  `json:"generated_at"`
+	ValidUntil  int64  `json:"valid_until"` // 30分钟后过期
+	State       string `json:"state"`       // PlanningState
+	Regime      string `json:"regime"`
+	Bias        string `json:"bias"` // "long" | "short" | "neutral"
 
 	// 价格区间
 	RangeLow  float64 `json:"range_low"`
@@ -79,13 +86,13 @@ type RangePlan struct {
 	EvoGen int `json:"evo_gen"` // 当前进化代数
 
 	// AI 驱动字段
-	AiRationale     string    `json:"ai_rationale"`       // AI分析摘要
-	PositionSizePct float64   `json:"position_size_pct"`  // 仓位%余额
-	Leverage        int       `json:"leverage"`            // 建议杠杆
-	PyramidPrices   []float64 `json:"pyramid_prices"`      // 补仓点位
-	CutLossPct      float64   `json:"cut_loss_pct"`        // 割肉线%
-	AiModel         string    `json:"ai_model"`            // "deepseek"|"qwen"|"math"
-	AiConfidence    float64   `json:"ai_confidence"`       // 0-100
+	AiRationale     string    `json:"ai_rationale"`      // AI分析摘要
+	PositionSizePct float64   `json:"position_size_pct"` // 仓位%余额
+	Leverage        int       `json:"leverage"`          // 建议杠杆
+	PyramidPrices   []float64 `json:"pyramid_prices"`    // 补仓点位
+	CutLossPct      float64   `json:"cut_loss_pct"`      // 割肉线%
+	AiModel         string    `json:"ai_model"`          // "deepseek"|"qwen"|"math"
+	AiConfidence    float64   `json:"ai_confidence"`     // 0-100
 
 	// 震荡双方向（regime=range_bound 时同时填充）
 	LongEntryLow   float64   `json:"long_entry_low"`
@@ -93,9 +100,9 @@ type RangePlan struct {
 	LongStopLoss   float64   `json:"long_stop_loss"`
 	LongTakeProfit []float64 `json:"long_take_profit"`
 
-	ShortEntryLow  float64   `json:"short_entry_low"`
-	ShortEntryHigh float64   `json:"short_entry_high"`
-	ShortStopLoss  float64   `json:"short_stop_loss"`
+	ShortEntryLow   float64   `json:"short_entry_low"`
+	ShortEntryHigh  float64   `json:"short_entry_high"`
+	ShortStopLoss   float64   `json:"short_stop_loss"`
 	ShortTakeProfit []float64 `json:"short_take_profit"`
 }
 
@@ -145,11 +152,11 @@ type FuseState struct {
 
 // EvoState 自进化状态：跟踪计划质量，反馈调优 multiplier
 type EvoState struct {
-	Generation   int     // 进化代数
-	AtRMult      float64 // ATR倍率 → 控制区间宽度
-	StopOffset   float64 // 止损偏移 (ATR倍数)
-	TpMult       float64 // 止盈倍率
-	EntryMargin  float64 // 入场带边距 (ATR倍数)
+	Generation  int     // 进化代数
+	AtRMult     float64 // ATR倍率 → 控制区间宽度
+	StopOffset  float64 // 止损偏移 (ATR倍数)
+	TpMult      float64 // 止盈倍率
+	EntryMargin float64 // 入场带边距 (ATR倍数)
 
 	// 质量追踪
 	PlansGenerated int     // 累计生成计划数
@@ -162,10 +169,10 @@ type EvoState struct {
 
 func DefaultEvo() *EvoState {
 	return &EvoState{
-		AtRMult:     1.5,   // 超短线：更窄区间
-		StopOffset:  0.6,   // 更紧止损
-		TpMult:      1.5,   // 更快止盈
-		EntryMargin: 0.10,  // 更窄入场带
+		AtRMult:     1.5,  // 超短线：更窄区间
+		StopOffset:  0.6,  // 更紧止损
+		TpMult:      1.5,  // 更快止盈
+		EntryMargin: 0.10, // 更窄入场带
 	}
 }
 

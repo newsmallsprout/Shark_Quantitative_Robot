@@ -49,3 +49,21 @@ func TestValidateTradeCmdAcceptsWellFormedLiveOpen(t *testing.T) {
 		t.Fatalf("expected valid command, got %v", err)
 	}
 }
+
+func TestSplitReduceSizesPreservesTotalAcrossTargets(t *testing.T) {
+	sizes := splitReduceSizes(5, 3)
+
+	if len(sizes) != 3 {
+		t.Fatalf("expected 3 target sizes, got %v", sizes)
+	}
+	total := 0
+	for _, size := range sizes {
+		if size <= 0 {
+			t.Fatalf("expected positive split sizes, got %v", sizes)
+		}
+		total += size
+	}
+	if total != 5 {
+		t.Fatalf("expected total size 5, got %d from %v", total, sizes)
+	}
+}

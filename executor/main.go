@@ -104,15 +104,17 @@ func getBalance() float64 {
 // ═══════════════════════════════════════════════
 
 type TradeCmd struct {
-	Symbol     string  `json:"symbol"`
-	Side       string  `json:"side"`
-	Size       int     `json:"size"`
-	Leverage   int     `json:"leverage"`
-	Action     string  `json:"action"` // "open" or "close"
-	Mode       string  `json:"mode"`   // "paper" or "live"
-	StopLoss   float64 `json:"stop_loss,omitempty"`
-	TakeProfit float64 `json:"take_profit,omitempty"`
-	Token      string  `json:"token,omitempty"`
+	Symbol           string    `json:"symbol"`
+	Side             string    `json:"side"`
+	Size             int       `json:"size"`
+	Leverage         int       `json:"leverage"`
+	Action           string    `json:"action"` // "open" or "close"
+	Mode             string    `json:"mode"`   // "paper" or "live"
+	StopLoss         float64   `json:"stop_loss,omitempty"`
+	TakeProfit       float64   `json:"take_profit,omitempty"`
+	TakeProfitLevels []float64 `json:"take_profit_levels,omitempty"`
+	Source           string    `json:"source,omitempty"`
+	Token            string    `json:"token,omitempty"`
 }
 
 func validateTradeCmd(cmd TradeCmd) error {
@@ -196,36 +198,65 @@ func executeOpen(cmd TradeCmd) {
 			log.Printf("🛑 止损 %s @%.1f status=%v", cmd.Symbol, cmd.StopLoss, slR["status"])
 		}
 	}
-	if cmd.TakeProfit > 0 {
+	tpLevels := cmd.TakeProfitLevels
+	if len(tpLevels) == 0 && cmd.TakeProfit > 0 {
+		tpLevels = []float64{cmd.TakeProfit}
+	}
+	if len(tpLevels) > 0 {
 		tpSize := size
 		if tpSize < 0 {
 			tpSize = -tpSize
 		}
+		splits := splitReduceSizes(tpSize, len(tpLevels))
 		// 止盈：limit
 		tpRule := 1 // long: price>=trigger, short: price<=trigger
 		if cmd.Side == "short" {
 			tpRule = 2
 		}
-		tpR, tpErr := gateAPI("POST", "/price_orders", map[string]interface{}{
-			"contract": contract,
-			"size":     tpSize,
-			"price":    "0",
-			"trigger": map[string]interface{}{
-				"price":      strconv.FormatFloat(cmd.TakeProfit, 'f', 1, 64),
-				"rule":       tpRule,
-				"expiration": 3600,
-			},
-			"reduce_only": true,
-			"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
-		})
-		if tpErr != nil {
-			log.Printf("⚠ 止盈单挂失败 %s: %v", cmd.Symbol, tpErr)
-		} else {
-			log.Printf("🎯 止盈 %s @%.1f status=%v", cmd.Symbol, cmd.TakeProfit, tpR["status"])
+		for i, target := range tpLevels {
+			if target <= 0 || i >= len(splits) {
+				continue
+			}
+			tpR, tpErr := gateAPI("POST", "/price_orders", map[string]interface{}{
+				"contract": contract,
+				"size":     splits[i],
+				"price":    "0",
+				"trigger": map[string]interface{}{
+					"price":      strconv.FormatFloat(target, 'f', 1, 64),
+					"rule":       tpRule,
+					"expiration": 3600,
+				},
+				"reduce_only": true,
+				"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
+			})
+			if tpErr != nil {
+				log.Printf("⚠ 止盈单挂失败 %s: %v", cmd.Symbol, tpErr)
+			} else {
+				log.Printf("🎯 止盈 %s @%.1f size=%d status=%v", cmd.Symbol, target, splits[i], tpR["status"])
+			}
 		}
 	}
 
 	rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "open_ok", 0)
+}
+
+func splitReduceSizes(total, targets int) []int {
+	if total <= 0 || targets <= 0 {
+		return nil
+	}
+	if targets > total {
+		targets = total
+	}
+	sizes := make([]int, targets)
+	base := total / targets
+	rem := total % targets
+	for i := range sizes {
+		sizes[i] = base
+		if i < rem {
+			sizes[i]++
+		}
+	}
+	return sizes
 }
 
 func executeClose(cmd TradeCmd) {

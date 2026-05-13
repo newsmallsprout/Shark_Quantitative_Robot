@@ -37,9 +37,9 @@
 由 `_strategic_entry()` 方法计算。
 
 **持仓管理（Position Manager）**
-`AIPositionManager` 状态机，每 tick 检查持仓并返回单一动作：
-- 硬止损 → 动态机械止损 → AI止损/止盈 → 移动止盈 → 固定止盈 → 震荡补仓 → 超时
-优先级链从高到低，返回第一个匹配的动作。
+持仓管理已收敛到 `StrategyRunner.tick()` 内的 RangePlan/动态止盈止损流程：
+- 计划止损 → 保本保护 → 移动止盈 → 快速止盈 → 动态止损 → 震荡补仓
+旧 `AIPositionManager` 已移除，避免形成第二套仓位状态机。
 
 **金字塔加仓（Pyramid）**
 主流币（BTC/ETH）在强趋势下允许分4层加仓。山寨禁止加仓。
@@ -94,13 +94,13 @@ Gate.io API → MarketDataFeed.refresh()
     ↓
 tick() 主循环:
   1. 预取AI信号 (asyncio.gather, 最多4币对并行)
-  2. 检查持仓 (AIPositionManager → 止损/止盈/加仓)
+  2. 检查持仓 (RangePlan/动态止损止盈/震荡补仓)
   3. 评分排序 (volume × funding_extreme)
   4. 逐币对处理:
      a. 行情检测 (RegimeDetector)
-     b. 保证金计算 (balance × base_pct × vol_factor × regime_mult × evo_mult)
-     c. 方向判定 (AI委员会 → 多方兜底)
-     d. 策略入场价 (_strategic_entry)
+     b. 保证金计算 (RangePlan.position_size_pct，配置只能向下限额)
+     c. 方向判定 (RangePlan.bias + PlanGate)
+     d. 计划入场带门禁 (不再由 Python 改写计划入场)
      e. 实盘下单 (LiveEngine, 仅 SHARK_MODE=live)
      f. 创建持仓
   5. 更新状态 (_update_state → WebSocket推送 + REST API)
@@ -120,7 +120,6 @@ tick() 主循环:
 |---|---|---|
 | `main.py` | 核心调度：tick循环、持仓管理、开仓逻辑、API服务 | 1857 |
 | `ai_strategy.py` | 三模型委员会：DeepSeek+Qwen+豆包，信号缓存 | 409 |
-| `ai_position.py` | 持仓状态机 AIPositionManager | 157 |
 | `dual_strategy.py` | 双轨策略配置：主流/山寨参数 | 169 |
 | `market_regime.py` | 行情检测器：每币对独立判定10种行情 | 258 |
 | `kline_cache.py` | K线缓存+技术指标：RSI/ATR/ADX/EMA | 184 |

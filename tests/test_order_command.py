@@ -38,6 +38,8 @@ class OrderCommandTest(unittest.TestCase):
         self.assertEqual(cmd["leverage"], 50)
         self.assertEqual(cmd["stop_loss"], 95.0)
         self.assertEqual(cmd["take_profit"], 104.0)
+        self.assertEqual(cmd["take_profit_levels"], [104.0, 108.0])
+        self.assertEqual(cmd["source"], "strategy")
         self.assertEqual(cmd["token"], "secret-token")
 
     def test_build_order_command_rejects_incomplete_live_open(self):

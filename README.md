@@ -141,7 +141,6 @@ open http://localhost:80
 Shark_Quantitative_Robot/
 ├── main.py                 # 主入口（FastAPI + 策略循环）
 ├── ai_strategy.py          # 多模型AI分析
-├── ai_position.py          # AI仓位管理
 ├── dual_strategy.py        # 双轨资金配置
 ├── oscillation.py          # 震荡检测
 ├── live_engine.py           # Gate.io实盘引擎

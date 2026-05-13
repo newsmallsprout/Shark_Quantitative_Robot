@@ -57,13 +57,6 @@ except ImportError:
 # 开仓方向：plan = 仅 Redis RangePlan（默认，与 SlowLoop 一致）；ai = DeepSeek 预取缓存
 SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
 
-# 导入AI仓位管理
-try:
-    from ai_position import AIPositionManager
-    AI_POSITION_ENABLED = True
-except ImportError:
-    AI_POSITION_ENABLED = False
-
 # 导入震荡检测器
 try:
     from oscillation import OscillationDetector
@@ -1226,6 +1219,23 @@ class StrategyRunner:
         except Exception:
             return px
 
+    def _margin_from_plan(self, plan: dict, cfg: dict, regime_cfg: dict, change_abs: float) -> float:
+        """Use RangePlan sizing as intent; local config may only cap risk lower."""
+        try:
+            pct = float((plan or {}).get("position_size_pct") or 0)
+        except Exception:
+            pct = 0.0
+        if pct <= 0:
+            return 0.0
+        margin = self.balance * pct
+        try:
+            cap_pct = float((cfg or {}).get("max_plan_margin_pct") or 0)
+        except Exception:
+            cap_pct = 0.0
+        if cap_pct > 0:
+            margin = min(margin, self.balance * cap_pct)
+        return max(0.0, margin)
+
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
         """合约张数 × 面值 × 价差 → USDT 毛利（与 Gate 线性 USDT 本位一致）。"""
         q = self._quanto_for(sym)
@@ -1800,15 +1810,9 @@ class StrategyRunner:
             if lev <= 0:
                 continue  # AI 未产出有效杠杆，不交易
             
-            base_pct = cfg.get("margin_pct", 0.01)
-            # 行情调整保证金倍率
-            if _regime_cfg.get("margin_mult"):
-                base_pct *= _regime_cfg["margin_mult"]
-            # 主流币额外加成：趋势中放大，震荡中也保持体量
-            if is_stable(sym):
-                base_pct *= 1.3
-            vol_factor = max(0.4, 1.5 / (1 + chg_abs / 12))
-            margin = self.balance * base_pct * vol_factor * self._evo_margin_mult
+            margin = self._margin_from_plan(plan_cache, cfg, _regime_cfg, chg_abs)
+            if margin <= 0:
+                continue
 
             # 检查最小下单量（考虑 quanto_multiplier）
             quanto = spec.quanto_multiplier if spec else 1.0
@@ -1889,9 +1893,8 @@ class StrategyRunner:
             if not side:
                 continue
 
-            # 策略入场价：根据行情类型+方向智能定位
-            _rv = _regime.value if _regime else "unknown"
-            entry_price = self._strategic_entry(sym, side, entry_price, _rv)
+            # 实际下单为市价；计划层 entry zone 只用于门禁，不由 Python 改写。
+            entry_price = px
 
             # ── FastLoop 计划门禁：无计划/走廊外/熔断/方向不匹配 → 禁止开仓 ──
             if self._plan_gate:

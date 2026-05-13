@@ -71,17 +71,6 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 	// 波动率分位
 	volPct := calcVolPercentile(closes, 20)
 
-	// Regime判定
-	var regime Regime
-	switch {
-	case trend > 0.01 && volPct < 70:
-		regime = RegimeTrendUp
-	case trend < -0.01 && volPct < 70:
-		regime = RegimeTrendDown
-	default:
-		regime = RegimeRange
-	}
-
 	n := len(lows)
 	win := 20
 	if n < win {
@@ -95,21 +84,14 @@ func (m *MacroBuilder) Fetch(ctx context.Context, symbol string) error {
 	lastClose := closes[len(closes)-1]
 
 	// ── 突破检测：价格接近20日区间边界时，用4h短期趋势确认 ──
-	breakoutDir := ""
 	nearHigh := rangeHigh > 0 && (lastClose-rangeHigh)/rangeHigh > -0.015 // 价格距上沿<1.5%
-	nearLow := rangeLow > 0 && (rangeLow-lastClose)/rangeLow > -0.015    // 价格距下沿<1.5%
+	nearLow := rangeLow > 0 && (rangeLow-lastClose)/rangeLow > -0.015     // 价格距下沿<1.5%
 
-	if (nearHigh || nearLow) && regime == RegimeRange {
-		// 拉4h K线确认短期趋势
-		h4Trend := m.fetchShortTermTrend(ctx, symbol)
-		if nearHigh && h4Trend > 0.005 {
-			regime = RegimeTrendUp
-			breakoutDir = "up"
-		} else if nearLow && h4Trend < -0.005 {
-			regime = RegimeTrendDown
-			breakoutDir = "down"
-		}
+	h4Trend := 0.0
+	if nearHigh || nearLow {
+		h4Trend = m.fetchShortTermTrend(ctx, symbol)
 	}
+	regime, breakoutDir := classifyRegime(trend, volPct, lastClose, rangeLow, rangeHigh, h4Trend)
 
 	macro := &MacroContext{
 		Symbol:      symbol,
@@ -209,6 +191,36 @@ func calcTrend(closes []float64, period int) float64 {
 	p := float64(period)
 	slope := (p*sumXY - sumX*sumY) / (p*sumX2 - sumX*sumX)
 	return slope / closes[n-1]
+}
+
+func classifyRegime(trend, volPct, lastClose, rangeLow, rangeHigh, h4Trend float64) (Regime, string) {
+	if lastClose <= 0 || rangeLow <= 0 || rangeHigh <= rangeLow {
+		return RegimeUnknown, ""
+	}
+	nearHigh := (rangeHigh-lastClose)/rangeHigh <= 0.015
+	nearLow := (lastClose-rangeLow)/rangeLow <= 0.015
+	switch {
+	case volPct < 8 && math.Abs(trend) < 0.001:
+		return RegimeDead, ""
+	case volPct > 80 && math.Abs(trend) < 0.003:
+		return RegimeChoppy, ""
+	case nearHigh && h4Trend > 0.005:
+		return RegimeBreakoutUp, "up"
+	case nearLow && h4Trend < -0.005:
+		return RegimeBreakoutDown, "down"
+	case trend > 0.01 && volPct < 70:
+		return RegimeTrendUp, ""
+	case trend < -0.01 && volPct < 70:
+		return RegimeTrendDown, ""
+	case trend > 0.002 && trend <= 0.01:
+		return RegimeSlowGrindUp, ""
+	case trend < -0.002 && trend >= -0.01:
+		return RegimeBleedDown, ""
+	case trend < -0.001:
+		return RegimeSlowGrindDown, ""
+	default:
+		return RegimeRange, ""
+	}
 }
 
 func calcVolPercentile(closes []float64, period int) float64 {

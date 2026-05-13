@@ -29,18 +29,20 @@ type TVAlert struct {
 // KnowledgeBase stores learned patterns and market insights
 type KnowledgeBase struct {
 	mu          sync.RWMutex
-	Signals     []TVAlert          `json:"signals"`
-	Patterns    []TradePattern     `json:"patterns"`
-	Sentiment   map[string]float64 `json:"sentiment"` // symbol → sentiment score (-1 to 1)
-	SignalCount int                `json:"signal_count"`
-	LastUpdate  int64              `json:"last_update"`
+	Signals     []TVAlert            `json:"signals"`
+	Patterns    []TradePattern       `json:"patterns"`
+	Sentiment   map[string]float64   `json:"sentiment"` // symbol → sentiment score (-1 to 1)
+	TVInsights  map[string]TVInsight `json:"tv_insights"`
+	SignalCount int                  `json:"signal_count"`
+	LastUpdate  int64                `json:"last_update"`
 }
 
 func NewKnowledgeBase() *KnowledgeBase {
 	return &KnowledgeBase{
-		Signals:   make([]TVAlert, 0, 1000),
-		Patterns:  make([]TradePattern, 0),
-		Sentiment: make(map[string]float64),
+		Signals:    make([]TVAlert, 0, 1000),
+		Patterns:   make([]TradePattern, 0),
+		Sentiment:  make(map[string]float64),
+		TVInsights: make(map[string]TVInsight),
 	}
 }
 
@@ -72,6 +74,9 @@ func (kb *KnowledgeBase) IngestAlert(alert TVAlert) {
 func (kb *KnowledgeBase) GetTVInsights(symbol string) string {
 	kb.mu.RLock()
 	defer kb.mu.RUnlock()
+	if insight, ok := kb.TVInsights[symbol]; ok && insight.Count > 0 {
+		return insight.Summary()
+	}
 	sentiment := kb.Sentiment[symbol]
 	bias := "中性"
 	if sentiment > 0.2 {
@@ -81,6 +86,16 @@ func (kb *KnowledgeBase) GetTVInsights(symbol string) string {
 	}
 	return fmt.Sprintf("社区情绪: %s(%.2f) 信号数: %d 模式数: %d",
 		bias, sentiment, len(kb.Signals), len(kb.Patterns))
+}
+
+func (kb *KnowledgeBase) UpdateTVInsight(insight TVInsight) {
+	if insight.Symbol == "" {
+		return
+	}
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
+	kb.TVInsights[insight.Symbol] = insight
+	kb.LastUpdate = time.Now().Unix()
 }
 
 // GetSentiment returns the current sentiment for a symbol
