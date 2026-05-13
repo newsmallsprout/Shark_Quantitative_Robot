@@ -343,6 +343,10 @@ body::before {
 .topbar-section-links a:hover {
   color: var(--text-secondary);
 }
+.topbar-section-links__plans {
+  color: #00ff88 !important;
+  text-shadow: 0 0 8px rgba(0, 255, 136, 0.35);
+}
 .topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .topbar-controls-trading {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

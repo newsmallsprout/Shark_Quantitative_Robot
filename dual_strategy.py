@@ -17,6 +17,7 @@ HIGH_VOL_ALTS = {
 # ═══════════════════════════════════════════════
 STABLE_CONFIG = {
     "margin_pct": 0.20,         # 保证金 20% 余额（主流是大头）
+    "min_plan_margin_pct": 0.03, # RangePlan 保证金地板：避免开成蚊子仓
     "max_positions": 3,        # BTC + ETH + SOL
     "min_volume": 500000,      # 最低成交量 50万（确保流动性）
     # Gate 24h 涨跌幅为百分数；0 表示不因波动过小拒单（避免 BTC/ETH 横盘不入池）
@@ -38,6 +39,7 @@ STABLE_CONFIG = {
 # ═══════════════════════════════════════════════
 VOLATILE_CONFIG = {
     "margin_pct": 0.02,         # 保证金 2% 余额（山寨起步）
+    "min_plan_margin_pct": 0.02, # 山寨也保持有效仓位，不做无意义小单
     "max_positions": 4,        # 最多 4 个山寨仓位（放宽）
     "min_volume": 1000000,     # 最低成交量 100万（放宽，更多机会）
     "min_change": 1.5,         # 涨跌幅至少 1.5%（放宽，不卡太死）

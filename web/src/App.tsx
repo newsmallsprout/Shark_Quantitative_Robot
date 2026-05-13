@@ -15,6 +15,18 @@ function Clock() {
   return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-muted)' }}>{time}</span>
 }
 
+export function TopbarSectionLinks() {
+  return (
+    <nav className="topbar-section-links" aria-label="页面与段落跳转">
+      <a href="#section-kpi">KPI</a>
+      <a href="#section-room">舱室</a>
+      <a href="#section-positions">持仓</a>
+      <a href="#section-history">历史</a>
+      <a className="topbar-section-links__plans" href="/plans">Plans</a>
+    </nav>
+  )
+}
+
 function num(v: unknown, fallback: number): number {
   if (typeof v === 'number' && Number.isFinite(v)) return v
   if (typeof v === 'string' && v.trim() !== '') {
@@ -541,12 +553,7 @@ export default function App() {
           <div className="topbar-brand">
             <span className="accent">Shark 2.0</span>
           </div>
-          <nav className="topbar-section-links" aria-label="段落跳转">
-            <a href="#section-kpi">KPI</a>
-            <a href="#section-room">舱室</a>
-            <a href="#section-positions">持仓</a>
-            <a href="#section-history">历史</a>
-          </nav>
+          <TopbarSectionLinks />
         </div>
         <div className="topbar-right">
           <div className="topbar-controls-trading">

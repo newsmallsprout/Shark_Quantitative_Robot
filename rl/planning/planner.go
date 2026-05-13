@@ -747,6 +747,18 @@ func clampPlan(plan *RangePlan, px float64) {
 		if plan.ShortStopLoss <= plan.ShortEntryHigh || plan.ShortStopLoss <= 0 {
 			plan.ShortStopLoss = plan.ShortEntryHigh * 1.03
 		}
+		rangeLow := minPositive(plan.RangeLow, plan.LongEntryLow, plan.LongEntryHigh, px*0.995)
+		rangeHigh := math.Max(math.Max(plan.RangeHigh, plan.ShortEntryLow), math.Max(plan.ShortEntryHigh, px*1.005))
+		if len(plan.LongTakeProfit) > 0 {
+			rangeHigh = math.Max(rangeHigh, plan.LongTakeProfit[len(plan.LongTakeProfit)-1])
+		}
+		if len(plan.ShortTakeProfit) > 0 {
+			rangeLow = minPositive(rangeLow, plan.ShortTakeProfit[len(plan.ShortTakeProfit)-1])
+		}
+		if rangeLow > 0 && rangeHigh > rangeLow {
+			plan.RangeLow = rangeLow
+			plan.RangeHigh = rangeHigh
+		}
 		plan.EntryZoneLow = plan.LongEntryLow
 		plan.EntryZoneHigh = plan.ShortEntryHigh
 		plan.StopLoss = plan.LongStopLoss
@@ -799,6 +811,19 @@ func clampPlan(plan *RangePlan, px float64) {
 			plan.StopLoss = plan.EntryZoneHigh * 1.03
 		}
 	}
+}
+
+func minPositive(values ...float64) float64 {
+	minVal := 0.0
+	for _, v := range values {
+		if v <= 0 {
+			continue
+		}
+		if minVal == 0 || v < minVal {
+			minVal = v
+		}
+	}
+	return minVal
 }
 
 func clampPlanRisk(plan *RangePlan) {

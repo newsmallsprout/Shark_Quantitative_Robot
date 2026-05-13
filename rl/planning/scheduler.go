@@ -2,6 +2,7 @@ package planning
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -42,15 +43,64 @@ func (s *Scheduler) Start(ctx context.Context) {
 	log.Printf("[Planning] 定时循环已启动（每%d分钟全量更新）", int(s.interval.Minutes()))
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
+	replanCh := s.replanChannel(ctx)
 
 	for {
 		select {
 		case <-ticker.C:
 			log.Println("[Planning] ⏰ 定时计划更新触发...")
 			s.planner.PlanAll(ctx)
+		case symbol := <-replanCh:
+			if symbol != "" {
+				log.Printf("[Planning] 🔁 单币种强制重规划: %s", symbol)
+				if err := s.planner.Plan(ctx, symbol, nil); err != nil {
+					log.Printf("[Planning] 强制重规划失败(%s): %v", symbol, err)
+				}
+			}
 		case <-ctx.Done():
 			log.Println("[Planning] 调度器停止")
 			return
 		}
 	}
+}
+
+func (s *Scheduler) replanChannel(ctx context.Context) <-chan string {
+	out := make(chan string, 8)
+	pubsub := s.planner.rdb.Subscribe(ctx, "shark:plan:replan")
+	go func() {
+		defer close(out)
+		defer pubsub.Close()
+		ch := pubsub.Channel()
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				if symbol := parseReplanSymbol(msg.Payload); symbol != "" {
+					select {
+					case out <- symbol:
+					case <-ctx.Done():
+						return
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func parseReplanSymbol(payload string) string {
+	var req struct {
+		Symbol string `json:"symbol"`
+	}
+	if err := json.Unmarshal([]byte(payload), &req); err == nil && IsLargeCap(req.Symbol) {
+		return req.Symbol
+	}
+	if IsLargeCap(payload) {
+		return payload
+	}
+	return ""
 }

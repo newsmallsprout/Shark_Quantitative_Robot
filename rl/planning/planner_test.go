@@ -133,3 +133,28 @@ func TestAuditRejectsInvalidBothSideStops(t *testing.T) {
 		t.Fatal("expected invalid both-side stops to be rejected")
 	}
 }
+
+func TestClampPlanKeepsBothSideRangeWideEnoughForShortZone(t *testing.T) {
+	plan := &RangePlan{
+		Bias:            "both",
+		RangeLow:        80100,
+		RangeHigh:       80865,
+		LongEntryLow:    80100,
+		LongEntryHigh:   80865,
+		LongStopLoss:    79500,
+		LongTakeProfit:  []float64{81500},
+		ShortEntryLow:   81269,
+		ShortEntryHigh:  81674,
+		ShortStopLoss:   82200,
+		ShortTakeProfit: []float64{80000},
+	}
+
+	clampPlan(plan, 80883.5)
+
+	if plan.RangeHigh < plan.ShortEntryHigh {
+		t.Fatalf("expected range high to include short zone, range_high=%.2f short_high=%.2f", plan.RangeHigh, plan.ShortEntryHigh)
+	}
+	if plan.RangeHigh < 80883.5 {
+		t.Fatalf("expected range high to include current price, got %.2f", plan.RangeHigh)
+	}
+}

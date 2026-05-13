@@ -86,9 +86,8 @@ except ImportError:
 TAKER_FEE = 0.0005        # Gate.io taker 费率 0.05%
 MAKER_FEE = 0.0002        # Gate.io maker 费率 0.02%
 SLIPPAGE_MAX = 0.0003     # 最大滑点 0.03%
-# 连续止损熔断：第 4 笔止损触发（streak>3）；新开单冷却阶梯；非止损平仓重置档位
+# 连续止损只记录告警，不再硬暂停开仓；数量策略需要平仓后立即续单。
 _FUSE_SL_STREAK_LIMIT = 3
-_FUSE_COOLDOWNS_SEC = (60.0, 180.0, 300.0, 86400.0)
 TRADE_INTERVAL = 1        # 交易循环间隔 1s（200ms盘口匹配）
 # TP_PCT = 2.0              # 已废弃：止盈改为 ATR 动态计算
 SL_PCT = -6.0             # 止损 -6%
@@ -259,11 +258,17 @@ app = FastAPI(title="Shark 2.0")
 init_device_lock(ROOT)
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(DeviceLockMiddleware)
+def _default_paper_trading_enabled() -> bool:
+    if os.environ.get("SHARK_MODE", "paper").strip().lower() != "paper":
+        return False
+    raw = os.environ.get("SHARK_AUTO_START_PAPER", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 _state = {"equity": 100.0, "balance": 100.0, "free_cash": 100.0, "initial_capital": 100.0,
           "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
           "positions": 0, "safety_blocked": False, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
           "position_list": [], "trade_history": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0,
-          "paper_trading": False, "live_trading": False, "shark_mode": "paper"}
+          "paper_trading": _default_paper_trading_enabled(), "live_trading": False, "shark_mode": "paper"}
 
 
 def _finite_float(v, default: float = 0.0) -> float:
@@ -522,7 +527,7 @@ async def set_shark_mode(request: Request, _: None = Depends(require_api_token))
         _state["live"]["active"] = True
         _state["paper_trading"] = False
     else:
-        _state["paper_trading"] = False
+        _state["paper_trading"] = _default_paper_trading_enabled()
         _state["live_trading"] = False
         if "live" in _state:
             _state["live"]["active"] = False
@@ -907,8 +912,6 @@ class StrategyRunner:
         self.total_fees = 0.0
         self.total_slippage = 0.0
         self._fuse_sl_streak: Dict[str, int] = {}      # 单币对连续止损笔数
-        self._fuse_escalation: Dict[str, int] = {}    # 熔断档位 0..3，非止损平掉后清零
-        self._fuse_block_until: Dict[str, float] = {}  # 该币对禁止新开仓直到该时间戳
         self._log: List[str] = []
         self._trade_history: List[dict] = []
         self._contract_specs: Dict[str, ContractSpec] = {}
@@ -940,20 +943,10 @@ class StrategyRunner:
             engine = create_live_engine(mode="live")
             if engine is None:
                 return {"error": "实盘引擎初始化失败，请检查 GATE_API_KEY/SECRET 和网络"}
-            # 保存纸盘余额
-            self._paper_balance = self.balance
-            self._paper_equity = self.equity
-            # 清空纸盘统计
-            self.realized_pnl = 0.0
-            self.gross_realized = 0.0
-            self.total_fees = 0.0
-            self.total_slippage = 0.0
-            self.wins = 0
-            self.closed_trades = 0
-            _state["realized_pnl"] = 0.0
-            _state["gross_realized"] = 0.0
-            _state["total_fees"] = 0.0
-            _state["win_rate"] = 0.0
+            # 切到实盘必须丢弃纸盘会话，不能把模拟仓位/历史带进实盘界面或后续 tick。
+            self._clear_trading_session_state(clear_redis_history=True)
+            self._paper_balance = 200.0
+            self._paper_equity = 200.0
             self._live = engine
             self._live_trading_enabled = False
             try:
@@ -983,6 +976,38 @@ class StrategyRunner:
                 _state["initial_capital"] = 200.0
             print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})", flush=True)
         return {"ok": True, "mode": mode, "balance": self.balance}
+
+    def _clear_trading_session_state(self, *, clear_redis_history: bool = False) -> None:
+        self.positions.clear()
+        self._trade_history.clear()
+        self._open_timestamps.clear()
+        self._ai_signal_cache.clear()
+        self._regime_cache.clear()
+        self.realized_pnl = 0.0
+        self.gross_realized = 0.0
+        self.total_fees = 0.0
+        self.total_slippage = 0.0
+        self.trades = 0
+        self.closed_trades = 0
+        self.wins = 0
+        _state["positions"] = 0
+        _state["position_list"] = []
+        _state["trade_history"] = []
+        _state["realized_pnl"] = 0.0
+        _state["gross_realized"] = 0.0
+        _state["total_fees"] = 0.0
+        _state["total_slippage"] = 0.0
+        _state["margin_locked"] = 0.0
+        _state["win_rate"] = 0.0
+        _state["trades"] = 0
+        _state["wins"] = 0
+        if clear_redis_history:
+            try:
+                import redis as _redis
+                _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                _r.delete("shark:trade_history")
+            except Exception as e:
+                _log.error("clear paper redis history failed: %s", e)
 
     def _get_maker_fee(self, sym: str) -> float:
         """从合约API获取实时maker费率"""
@@ -1225,15 +1250,27 @@ class StrategyRunner:
             pct = float((plan or {}).get("position_size_pct") or 0)
         except Exception:
             pct = 0.0
+        try:
+            min_pct = float((cfg or {}).get("min_plan_margin_pct") or 0)
+        except Exception:
+            min_pct = 0.0
+        if min_pct > 0:
+            pct = max(pct, min_pct)
         if pct <= 0:
             return 0.0
-        margin = self.balance * pct
+        sizing_base = max(
+            float(getattr(self, "static_equity", 0) or 0),
+            float(getattr(self, "equity", 0) or 0),
+            float(getattr(self, "_initial_capital", 0) or 0),
+            float(self.balance or 0),
+        )
+        margin = sizing_base * pct
         try:
             cap_pct = float((cfg or {}).get("max_plan_margin_pct") or 0)
         except Exception:
             cap_pct = 0.0
         if cap_pct > 0:
-            margin = min(margin, self.balance * cap_pct)
+            margin = min(margin, sizing_base * cap_pct)
         return max(0.0, margin)
 
     def _warmup_allows_open(self, *, has_kline: bool, has_detector: bool) -> bool:
@@ -1265,30 +1302,53 @@ class StrategyRunner:
         net = gross - est
         return net >= max(0.05, 0.25 * est)
 
+    def _side_from_plan(self, plan: dict, px: float) -> tuple:
+        """Return (side, reason, stop_loss, take_profit) using plan direction first."""
+        if not plan:
+            return "", "", None, None
+        bias = plan.get("bias", "")
+        if bias in ("long", "short"):
+            return bias, f"计划趋势 {bias}", plan.get("stop_loss"), plan.get("take_profit")
+        if bias != "both":
+            return "", "", None, None
+
+        macro = str(plan.get("macro_regime") or plan.get("regime") or "").lower()
+        if any(token in macro for token in ("up", "bull", "trend_up", "slow_grind_up", "breakout_up")):
+            return "long", f"计划顺势 {macro}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
+        if any(token in macro for token in ("down", "bear", "trend_down", "slow_grind_down", "breakout_down", "bleed")):
+            return "short", f"计划顺势 {macro}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+
+        mid = (plan.get("range_low", 0) + plan.get("range_high", 0)) / 2
+        if px < mid:
+            return "long", f"计划震荡 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
+        return "short", f"计划震荡 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+
+    def _request_symbol_replan(self, sym: str, reason: str) -> None:
+        payload = json.dumps({"symbol": sym, "reason": reason, "ts": time.time()}, ensure_ascii=False)
+        try:
+            import redis as _redis
+            _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            _r.delete(f"shark:plan:{sym}")
+            _r.publish("shark:plan:replan", payload)
+            if self._plan_gate:
+                self._plan_gate._plan_cache.pop(sym, None)
+                self._plan_gate._last_fetch.pop(sym, None)
+            print(f"[重规划] {sym} {reason} → 已请求 Go SlowLoop 立即重做计划", flush=True)
+        except Exception as e:
+            _log.error("request replan failed for %s: %s", sym, e)
+
     def _apply_stop_loss_fuse(self, sym: str, reason: str) -> None:
-        """单币对：连续止损次数 > _FUSE_SL_STREAK_LIMIT 后阶梯禁止新开（60s→180s→300s→24h）；非止损平仓重置连亏与档位。"""
+        """单币对连续止损只告警，不阻止下一单立即开。"""
         r = str(reason)
         is_sl = "止损" in r and "止盈" not in r
-        now = time.time()
-        n_tiers = len(_FUSE_COOLDOWNS_SEC)
         if is_sl:
             st = self._fuse_sl_streak.get(sym, 0) + 1
             self._fuse_sl_streak[sym] = st
-            if st > _FUSE_SL_STREAK_LIMIT:
-                tier = min(self._fuse_escalation.get(sym, 0), n_tiers - 1)
-                dur = _FUSE_COOLDOWNS_SEC[tier]
-                self._fuse_block_until[sym] = now + dur
-                self._fuse_escalation[sym] = min(tier + 1, n_tiers - 1)
+            if st >= _FUSE_SL_STREAK_LIMIT:
                 self._fuse_sl_streak[sym] = 0
-                dlab = f"{dur/3600:.0f}h" if dur >= 3600 else f"{int(dur)}s"
-                print(
-                    f"[熔断] {sym} 连续止损>{_FUSE_SL_STREAK_LIMIT}次 → {dlab} 内禁止新开 "
-                    f"(阶梯 {tier + 1}/{n_tiers})",
-                    flush=True,
-                )
+                self._request_symbol_replan(sym, f"连续止损{_FUSE_SL_STREAK_LIMIT}次")
         else:
             self._fuse_sl_streak[sym] = 0
-            self._fuse_escalation[sym] = 0
 
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
@@ -1338,9 +1398,6 @@ class StrategyRunner:
                 if px > 0:
                     self._close_position(sym, px, "手动停止(模拟)", 0, prices)
             print("[模拟] 已平掉所有持仓", flush=True)
-
-        # 清理已过期的单币对熔断窗口
-        self._fuse_block_until = {k: v for k, v in self._fuse_block_until.items() if now < v}
 
         # 偶尔飙句骚话调节气氛（5%概率/tick，不在交易时触发）
         if len(self.positions) == 0 and random.random() < 0.05:
@@ -1686,8 +1743,6 @@ class StrategyRunner:
             _can_open = self._warmup_allows_open(has_kline=bool(kc), has_detector=bool(detector))
         scored = []
         for sym in prices:
-            if now < self._fuse_block_until.get(sym, 0):
-                continue
             if sym in self.positions: continue
 
             vol = volumes.get(sym, 0)
@@ -1846,24 +1901,7 @@ class StrategyRunner:
 
             # 使用缓存计划（已在杠杆阶段读取）
             if plan_cache:
-                bias = plan_cache.get("bias", "")
-                if bias == "both":
-                    mid = (plan_cache.get("range_low", 0) + plan_cache.get("range_high", 0)) / 2
-                    if px < mid:
-                        side = "long"
-                        signal_src = f"计划震荡 价{px:.0f}<中{mid:.0f}→多"
-                        _plan_sl = plan_cache.get("long_stop_loss")
-                        _plan_tp = plan_cache.get("long_take_profit")
-                    else:
-                        side = "short"
-                        signal_src = f"计划震荡 价{px:.0f}>中{mid:.0f}→空"
-                        _plan_sl = plan_cache.get("short_stop_loss")
-                        _plan_tp = plan_cache.get("short_take_profit")
-                elif bias in ("long", "short"):
-                    side = bias
-                    signal_src = f"计划趋势 {bias}"
-                    _plan_sl = plan_cache.get("stop_loss")
-                    _plan_tp = plan_cache.get("take_profit")
+                side, signal_src, _plan_sl, _plan_tp = self._side_from_plan(plan_cache, px)
                 ai_confidence = int(plan_cache.get("ai_confidence", 0))
                 if ai_confidence > 0:
                     ai_use = True
