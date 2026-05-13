@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run --pool=vmThreads --maxWorkers=1 --no-file-parallelism",
     "test:watch": "vitest"
   },
   "dependencies": {
