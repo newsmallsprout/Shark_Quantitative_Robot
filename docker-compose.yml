@@ -48,7 +48,7 @@ services:
     working_dir: /app
     command: ["sh", "-c", "alembic upgrade head && exec python main.py"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 15s
       timeout: 5s
       retries: 3

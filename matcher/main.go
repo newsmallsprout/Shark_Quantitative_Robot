@@ -32,10 +32,14 @@ func connectRedis() *redis.Client {
 }
 
 type TradeCmd struct {
-	Symbol string `json:"symbol"`
-	Side   string `json:"side"`
-	Action string `json:"action"`
-	Mode   string `json:"mode"`
+	Symbol     string  `json:"symbol"`
+	Side       string  `json:"side"`
+	Action     string  `json:"action"`
+	Mode       string  `json:"mode"`
+	Size       int     `json:"size"`
+	Leverage   int     `json:"leverage"`
+	StopLoss   float64 `json:"stop_loss,omitempty"`
+	TakeProfit float64 `json:"take_profit,omitempty"`
 }
 
 func validateTradeCmd(cmd TradeCmd) error {
@@ -51,7 +55,17 @@ func validateTradeCmd(cmd TradeCmd) error {
 	if cmd.Symbol == "" {
 		return fmt.Errorf("symbol required")
 	}
+	if cmd.Size <= 0 {
+		return fmt.Errorf("size must be positive")
+	}
+	if cmd.Leverage < 1 || cmd.Leverage > 125 {
+		return fmt.Errorf("leverage out of range")
+	}
 	return nil
+}
+
+func paperStatusValue(cmd TradeCmd) string {
+	return cmd.Action + "_ok"
 }
 
 func main() {
@@ -88,15 +102,20 @@ func main() {
 		oid := fmt.Sprintf("paper-%d", time.Now().UnixNano())
 
 		status := map[string]interface{}{
-			"symbol":   cmd.Symbol,
-			"side":     cmd.Side,
-			"action":   cmd.Action,
-			"price":    price,
-			"order_id": oid,
-			"mode":     "paper",
+			"symbol":      cmd.Symbol,
+			"side":        cmd.Side,
+			"action":      cmd.Action,
+			"price":       price,
+			"order_id":    oid,
+			"mode":        "paper",
+			"size":        cmd.Size,
+			"leverage":    cmd.Leverage,
+			"stop_loss":   cmd.StopLoss,
+			"take_profit": cmd.TakeProfit,
 		}
 		b, _ := json.Marshal(status)
 		rdb.Publish(ctx, "shark:orders:status", string(b))
-		log.Printf("📝 %s %s %s @%.4f", cmd.Symbol, cmd.Side, cmd.Action, price)
+		rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, paperStatusValue(cmd), 0)
+		log.Printf("📝 %s %s %s size=%d lev=%dx @%.4f", cmd.Symbol, cmd.Side, cmd.Action, cmd.Size, cmd.Leverage, price)
 	}
 }

@@ -27,8 +27,8 @@ type Planner struct {
 	news  *NewsIngestor
 	http  *http.Client
 
-	// 自进化
-	evo      *EvoState
+	// 自进化 — 每币对独立
+	evo      map[string]*EvoState
 	lastPlan int64
 	symbols  []string
 
@@ -47,9 +47,20 @@ func NewPlanner(rdb *redis.Client, symbols []string) *Planner {
 		book:    NewBookIngestor(),
 		news:    NewNewsIngestor(),
 		http:    &http.Client{Timeout: 10 * time.Second},
-		evo:     DefaultEvo(),
+		evo:     make(map[string]*EvoState),
 		symbols: symbols,
 	}
+}
+
+// getEvo returns per-symbol EvoState, creating a default if none exists.
+// Each symbol evolves independently based on its own trade quality.
+func (p *Planner) getEvo(symbol string) *EvoState {
+	if e, ok := p.evo[symbol]; ok && e != nil {
+		return e
+	}
+	e := DefaultEvo()
+	p.evo[symbol] = e
+	return e
 }
 
 // SetTVFn sets the TradingView insights provider (closure from main.go)
@@ -57,9 +68,31 @@ func (p *Planner) SetTVFn(fn func(string) string) { p.tvFn = fn }
 
 func (p *Planner) State() PlanningState { return p.state }
 
+func (p *Planner) publishPlanningStatus(ctx context.Context, phase, symbol, message string, done, total int, active bool) {
+	if p == nil || p.rdb == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"active":  active,
+		"phase":   phase,
+		"symbol":  symbol,
+		"message": message,
+		"done":    done,
+		"total":   total,
+		"ts":      time.Now().Unix(),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = p.rdb.Set(ctx, "shark:planning:status", data, 10*time.Minute).Err()
+	_ = p.rdb.Publish(ctx, "shark:planning:status", string(data)).Err()
+}
+
 // Bootstrap → 全量数据拉取 → 生成所有币对计划
 func (p *Planner) Bootstrap(ctx context.Context) error {
 	log.Printf("[Planning] BOOTSTRAP — 拉取全量数据，覆盖%d个币对...", len(p.symbols))
+	p.publishPlanningStatus(ctx, "bootstrap", "", "启动全量计划生成，开仓会等新计划落地", 0, len(p.symbols), true)
 
 	p.fetchPrices(ctx)
 
@@ -67,7 +100,8 @@ func (p *Planner) Bootstrap(ctx context.Context) error {
 
 	bootstrapOrder := priorityOrder(p.symbols)
 	successCount := 0
-	for _, sym := range bootstrapOrder {
+	for i, sym := range bootstrapOrder {
+		p.publishPlanningStatus(ctx, "bootstrap", sym, fmt.Sprintf("正在生成 %s 计划 (%d/%d)", sym, i+1, len(bootstrapOrder)), i, len(bootstrapOrder), true)
 		if err := p.Plan(ctx, sym, digest); err != nil {
 			log.Printf("[Planning] Bootstrap计划生成失败(%s): %v", sym, err)
 		} else {
@@ -81,14 +115,16 @@ func (p *Planner) Bootstrap(ctx context.Context) error {
 	}
 
 	p.state = StateLive
-	log.Printf("[Planning] BOOTSTRAP → LIVE (%d/%d 成功) · 进化代数=%d ATR×%.1f STOP×%.1f TP×%.1f",
-		successCount, len(p.symbols), p.evo.Generation, p.evo.AtRMult, p.evo.StopOffset, p.evo.TpMult)
+	p.publishPlanningStatus(ctx, "live", "", fmt.Sprintf("全量计划完成 %d/%d，恢复按计划开仓", successCount, len(p.symbols)), successCount, len(p.symbols), false)
+	log.Printf("[Planning] BOOTSTRAP → LIVE (%d/%d 成功) · 各币对独立进化参数见日志",
+		successCount, len(p.symbols))
 	return nil
 }
 
 func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) error {
 	start := time.Now()
 	p.state = StatePlanning
+	p.publishPlanningStatus(ctx, "planning", symbol, fmt.Sprintf("%s 正在拉宏观/深度/AI计划", symbol), 0, len(p.symbols), true)
 
 	if !IsLargeCap(symbol) {
 		return nil
@@ -125,9 +161,10 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 	if p.prices[symbol] > 0 {
 		plan.PlanPrice = p.prices[symbol]
 	}
+	plan.FuseThresholdPct = calcFuseThreshold(macro.ATR14, p.prices[symbol])
 	plan.GeneratedAt = time.Now().Unix()
 	plan.ValidUntil = plan.GeneratedAt + 1800
-	plan.EvoGen = p.evo.Generation
+	plan.EvoGen = p.getEvo(symbol).Generation
 	if digest.RiskLevel >= 2 {
 		plan.State = string(StatePaused)
 		p.state = StatePaused
@@ -154,17 +191,22 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 	p.plans[symbol] = plan
 	p.lastPlan = time.Now().Unix()
 
+	// 每币对独立自进化：累计计划数达到阈值后评估调优
+	p.evolveSymbol(ctx, symbol)
+
 	log.Printf("[Planning] ✅ %s: regime=%s bias=%s range=[%.0f,%.0f] entry=[%.0f,%.0f] sl=%.0f evo=gen%d (%.1fs)",
 		symbol, plan.Regime, plan.Bias,
 		plan.RangeLow, plan.RangeHigh,
 		plan.EntryZoneLow, plan.EntryZoneHigh,
 		plan.StopLoss, plan.EvoGen, time.Since(start).Seconds())
+	p.publishPlanningStatus(ctx, "planning", symbol, fmt.Sprintf("%s 计划已落地，用时%.1fs", symbol, time.Since(start).Seconds()), 0, len(p.symbols), true)
 	return nil
 }
 
 // PlanAll — 批量为所有币对生成计划；完成后评估并自进化
 func (p *Planner) PlanAll(ctx context.Context) {
 	log.Printf("[Planning] 开始全量计划更新 (%d个币对)...", len(p.symbols))
+	p.publishPlanningStatus(ctx, "full_replan", "", "正在全量重做计划，开仓会等新计划落地", 0, len(p.symbols), true)
 
 	p.fetchPrices(ctx)
 
@@ -172,7 +214,8 @@ func (p *Planner) PlanAll(ctx context.Context) {
 
 	bootstrapOrder := priorityOrder(p.symbols)
 	successCount := 0
-	for _, sym := range bootstrapOrder {
+	for i, sym := range bootstrapOrder {
+		p.publishPlanningStatus(ctx, "full_replan", sym, fmt.Sprintf("正在重做 %s 计划 (%d/%d)", sym, i+1, len(bootstrapOrder)), i, len(bootstrapOrder), true)
 		if err := p.Plan(ctx, sym, digest); err != nil {
 			log.Printf("[Planning] 计划生成失败(%s): %v", sym, err)
 		} else {
@@ -180,26 +223,37 @@ func (p *Planner) PlanAll(ctx context.Context) {
 		}
 	}
 
-	// 自进化：每6个周期评估一次（3币对×6=18计划）
-	p.evo.PlansGenerated += successCount
-	if p.evo.PlansGenerated >= 18 && p.evo.PlansGenerated%18 == 0 {
-		p.evolve(ctx)
-	}
-
+	// 所有币对计划完成（自进化已由各币对 Plan() 独立完成）
 	log.Printf("[Planning] 全量计划完成 (%d/%d)", successCount, len(bootstrapOrder))
+	p.publishPlanningStatus(ctx, "live", "", fmt.Sprintf("全量计划完成 %d/%d，恢复按计划开仓", successCount, len(bootstrapOrder)), successCount, len(bootstrapOrder), false)
 }
 
-// ── 自进化 ──
+// ── 自进化（每币对独立）──
 
-func (p *Planner) evolve(ctx context.Context) {
+// evolveSymbol 单币对自进化：过滤该币对成交，评估质量，自适应调优参数。
+// 每积累6个计划触发一次进化（6×30min = 3小时）。
+func (p *Planner) evolveSymbol(ctx context.Context, symbol string) {
+	e := p.getEvo(symbol)
+	e.PlansGenerated++
+	if e.PlansGenerated < 6 || e.PlansGenerated%6 != 0 {
+		return // 未达到进化周期
+	}
+
 	trades := p.readRecentTrades(ctx, 50)
-	if len(trades) < 5 {
-		return
+	// 过滤该币对成交
+	var symTrades []TradeSnapshot
+	for _, t := range trades {
+		if t.Symbol == symbol {
+			symTrades = append(symTrades, t)
+		}
+	}
+	if len(symTrades) < 3 {
+		return // 该币对数据不足，暂不进化
 	}
 
 	var wins, stops int
 	var totalPnl float64
-	for _, t := range trades {
+	for _, t := range symTrades {
 		if t.Pnl > 0 {
 			wins++
 		}
@@ -209,38 +263,38 @@ func (p *Planner) evolve(ctx context.Context) {
 		totalPnl += t.PnlPct
 	}
 
-	p.evo.WinRate = float64(wins) / float64(len(trades))
-	p.evo.StopHitRate = float64(stops) / float64(len(trades))
-	p.evo.AvgPnlPct = totalPnl / float64(len(trades))
-	p.evo.Generation++
-	p.evo.LastEval = time.Now().Unix()
+	e.WinRate = float64(wins) / float64(len(symTrades))
+	e.StopHitRate = float64(stops) / float64(len(symTrades))
+	e.AvgPnlPct = totalPnl / float64(len(symTrades))
+	e.Generation++
+	e.LastEval = time.Now().Unix()
 
 	// 自适应调优
-	prevAtR := p.evo.AtRMult
-	prevStop := p.evo.StopOffset
-	prevTp := p.evo.TpMult
+	prevAtR := e.AtRMult
+	prevStop := e.StopOffset
+	prevTp := e.TpMult
 
 	// 止损率高 → 放宽止损
-	if p.evo.StopHitRate > 0.5 {
-		p.evo.StopOffset = clamp(p.evo.StopOffset+0.2, 0.3, 2.0)
-		p.evo.AtRMult = clamp(p.evo.AtRMult*1.1, 1.0, 4.0)
+	if e.StopHitRate > 0.5 {
+		e.StopOffset = clamp(e.StopOffset+0.2, 0.3, 2.0)
+		e.AtRMult = clamp(e.AtRMult*1.1, 1.0, 4.0)
 	}
 	// 胜率低 → 收紧入场带
-	if p.evo.WinRate < 0.4 {
-		p.evo.EntryMargin = clamp(p.evo.EntryMargin*0.8, 0.1, 1.0)
+	if e.WinRate < 0.4 {
+		e.EntryMargin = clamp(e.EntryMargin*0.8, 0.1, 1.0)
 	}
 	// 胜率高 → 放大止盈
-	if p.evo.WinRate > 0.6 {
-		p.evo.TpMult = clamp(p.evo.TpMult*1.15, 1.0, 5.0)
+	if e.WinRate > 0.6 {
+		e.TpMult = clamp(e.TpMult*1.15, 1.0, 5.0)
 	}
 	// 平均亏损 → 收窄区间
-	if p.evo.AvgPnlPct < -0.5 {
-		p.evo.AtRMult = clamp(p.evo.AtRMult*0.9, 1.0, 4.0)
+	if e.AvgPnlPct < -0.5 {
+		e.AtRMult = clamp(e.AtRMult*0.9, 1.0, 4.0)
 	}
 
-	log.Printf("[Evo] gen=%d trades=%d win=%.0f%% stop=%.0f%% avgPnl=%.1f%% adjustments: ATR×%.1f→%.1f STOP×%.1f→%.1f TP×%.1f→%.1f entry×%.1f",
-		p.evo.Generation, len(trades), p.evo.WinRate*100, p.evo.StopHitRate*100, p.evo.AvgPnlPct,
-		prevAtR, p.evo.AtRMult, prevStop, p.evo.StopOffset, prevTp, p.evo.TpMult, p.evo.EntryMargin)
+	log.Printf("[Evo] %s gen=%d trades=%d win=%.0f%% stop=%.0f%% avgPnl=%.1f%% adjustments: ATR×%.1f→%.1f STOP×%.1f→%.1f TP×%.1f→%.1f entry×%.1f",
+		symbol, e.Generation, len(symTrades), e.WinRate*100, e.StopHitRate*100, e.AvgPnlPct,
+		prevAtR, e.AtRMult, prevStop, e.StopOffset, prevTp, e.TpMult, e.EntryMargin)
 }
 
 func (p *Planner) readRecentTrades(ctx context.Context, limit int) []TradeSnapshot {
@@ -486,7 +540,7 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 	plan := &RangePlan{
 		Symbol:             symbol,
 		Regime:             string(macro.Regime),
-		LeverageCap:        125,
+		LeverageCap:        35,
 		ATR14:              atr,
 		AiModel:            "deepseek",
 		AiRationale:        ai.Rationale,
@@ -564,6 +618,7 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 	// 基于 AI 的区间调用 clampPlan
 	widenBothSideStops(plan, atr)
 	clampPlan(plan, px)
+	enforceSwingHeavyPlan(plan, atr)
 	return plan, nil
 }
 
@@ -571,11 +626,11 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 	depth *DepthProfile, macro *MacroContext, news *NewsDigest, funding float64) *RangePlan {
 
-	e := p.evo
+	e := p.getEvo(symbol)
 	plan := &RangePlan{
 		Symbol:      symbol,
 		Regime:      string(macro.Regime),
-		LeverageCap: 125,
+		LeverageCap: 35,
 		ATR14:       atr,
 		AiModel:     "math",
 	}
@@ -636,6 +691,7 @@ func (p *Planner) mathBuild(symbol string, pxPlan, atr float64,
 
 	applyRegimePlaybook(plan, macro, pxPlan, atr)
 	clampPlan(plan, pxPlan)
+	enforceSwingHeavyPlan(plan, atr)
 	return plan
 }
 
@@ -643,36 +699,36 @@ func applyRegimePlaybook(plan *RangePlan, macro *MacroContext, px, atr float64) 
 	if plan == nil || macro == nil {
 		return
 	}
-	plan.LeverageCap = 125
+	plan.LeverageCap = 35
 	switch macro.Regime {
 	case RegimeTrendUp, RegimeTrendDown:
-		plan.PositionSizePct = 0.018
-		plan.Leverage = 90
-		plan.CutLossPct = 0.035
+		plan.PositionSizePct = 0.18
+		plan.Leverage = 32
+		plan.CutLossPct = 0.08
 	case RegimeBreakoutUp, RegimeBreakoutDown:
-		plan.PositionSizePct = 0.015
-		plan.Leverage = 85
-		plan.CutLossPct = 0.03
+		plan.PositionSizePct = 0.14
+		plan.Leverage = 30
+		plan.CutLossPct = 0.07
 	case RegimeSlowGrindUp, RegimeSlowGrindDown:
-		plan.PositionSizePct = 0.012
-		plan.Leverage = 80
-		plan.CutLossPct = 0.025
+		plan.PositionSizePct = 0.12
+		plan.Leverage = 26
+		plan.CutLossPct = 0.06
 	case RegimeBleedDown:
-		plan.PositionSizePct = 0.012
-		plan.Leverage = 80
-		plan.CutLossPct = 0.025
+		plan.PositionSizePct = 0.10
+		plan.Leverage = 24
+		plan.CutLossPct = 0.06
 	case RegimeChoppy:
-		plan.PositionSizePct = 0.004
-		plan.Leverage = 45
-		plan.CutLossPct = 0.02
+		plan.PositionSizePct = 0.08
+		plan.Leverage = 20
+		plan.CutLossPct = 0.06
 	case RegimeDead:
-		plan.PositionSizePct = 0.001
+		plan.PositionSizePct = 0.02
 		plan.Leverage = 1
-		plan.CutLossPct = 0.01
+		plan.CutLossPct = 0.03
 	default:
-		plan.PositionSizePct = 0.01
-		plan.Leverage = 75
-		plan.CutLossPct = 0.025
+		plan.PositionSizePct = 0.10
+		plan.Leverage = 25
+		plan.CutLossPct = 0.06
 	}
 	applyQuickProfitWideStop(plan, px, atr)
 }
@@ -681,9 +737,9 @@ func applyQuickProfitWideStop(plan *RangePlan, px, atr float64) {
 	if plan == nil || px <= 0 || atr <= 0 {
 		return
 	}
-	firstTP := atr * 0.75
-	secondTP := atr * 1.25
-	stopDistance := atr * 1.8
+	firstTP := atr * 2.5
+	secondTP := atr * 4.5
+	stopDistance := atr * 3.5
 	if plan.Bias == "long" {
 		entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
 		if entry <= 0 {
@@ -725,7 +781,7 @@ func widenBothSideStops(plan *RangePlan, atr float64) {
 	if plan == nil || plan.Bias != "both" || atr <= 0 {
 		return
 	}
-	stopDistance := atr * 2.4
+	stopDistance := atr * 4.0
 	longEntry := (plan.LongEntryLow + plan.LongEntryHigh) / 2
 	if longEntry > 0 && (plan.LongStopLoss <= 0 || longEntry-plan.LongStopLoss < stopDistance) {
 		plan.LongStopLoss = longEntry - stopDistance
@@ -735,6 +791,152 @@ func widenBothSideStops(plan *RangePlan, atr float64) {
 		plan.ShortStopLoss = shortEntry + stopDistance
 	}
 	plan.StopLoss = plan.LongStopLoss
+}
+
+func enforceSwingHeavyPlan(plan *RangePlan, atr float64) {
+	if plan == nil || atr <= 0 {
+		return
+	}
+	plan.LeverageCap = 35
+	if plan.Leverage <= 0 {
+		plan.Leverage = 25
+	}
+	if plan.Leverage > 35 {
+		plan.Leverage = 35
+	}
+	if plan.Leverage < 20 {
+		plan.Leverage = 20
+	}
+	if plan.PositionSizePct < 0.10 {
+		plan.PositionSizePct = 0.10
+	}
+	if plan.PositionSizePct > 0.18 {
+		plan.PositionSizePct = 0.18
+	}
+	if plan.CutLossPct < 0.06 {
+		plan.CutLossPct = 0.06
+	}
+	if plan.CutLossPct > 0.10 {
+		plan.CutLossPct = 0.10
+	}
+
+	firstTPPct := 0.50
+	secondTPPct := 1.00
+	stopPct := 0.50
+	ref := plan.PlanPrice
+	if ref <= 0 && plan.RangeLow > 0 && plan.RangeHigh > 0 {
+		ref = (plan.RangeLow + plan.RangeHigh) / 2
+	}
+	if ref <= 0 {
+		ref = math.Max(plan.EntryZoneLow, plan.EntryZoneHigh)
+	}
+	halfRange := math.Max(atr*6.0, ref*0.035)
+	if plan.Bias == "long" {
+		entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
+		if entry <= 0 {
+			return
+		}
+		stopDistance := leveragedPriceDistance(entry, plan.Leverage, stopPct)
+		firstTP := leveragedPriceDistance(entry, plan.Leverage, firstTPPct)
+		secondTP := leveragedPriceDistance(entry, plan.Leverage, secondTPPct)
+		plan.StopLoss = entry - stopDistance
+		plan.LongStopLoss = plan.StopLoss
+		plan.TakeProfit = []float64{entry + firstTP, entry + secondTP}
+		plan.LongTakeProfit = plan.TakeProfit
+		ensureSwingPlanRange(plan, entry, halfRange)
+		return
+	}
+	if plan.Bias == "short" {
+		entry := (plan.EntryZoneLow + plan.EntryZoneHigh) / 2
+		if entry <= 0 {
+			return
+		}
+		stopDistance := leveragedPriceDistance(entry, plan.Leverage, stopPct)
+		firstTP := leveragedPriceDistance(entry, plan.Leverage, firstTPPct)
+		secondTP := leveragedPriceDistance(entry, plan.Leverage, secondTPPct)
+		plan.StopLoss = entry + stopDistance
+		plan.ShortStopLoss = plan.StopLoss
+		plan.TakeProfit = []float64{entry - firstTP, entry - secondTP}
+		plan.ShortTakeProfit = plan.TakeProfit
+		ensureSwingPlanRange(plan, entry, halfRange)
+		return
+	}
+	if plan.Bias == "both" {
+		longEntry := (plan.LongEntryLow + plan.LongEntryHigh) / 2
+		if longEntry > 0 {
+			longStopDistance := leveragedPriceDistance(longEntry, plan.Leverage, stopPct)
+			longFirstTP := leveragedPriceDistance(longEntry, plan.Leverage, firstTPPct)
+			longSecondTP := leveragedPriceDistance(longEntry, plan.Leverage, secondTPPct)
+			plan.LongStopLoss = longEntry - longStopDistance
+			plan.LongTakeProfit = []float64{longEntry + longFirstTP, longEntry + longSecondTP}
+			plan.StopLoss = plan.LongStopLoss
+			plan.TakeProfit = plan.LongTakeProfit
+		}
+		shortEntry := (plan.ShortEntryLow + plan.ShortEntryHigh) / 2
+		if shortEntry > 0 {
+			shortStopDistance := leveragedPriceDistance(shortEntry, plan.Leverage, stopPct)
+			shortFirstTP := leveragedPriceDistance(shortEntry, plan.Leverage, firstTPPct)
+			shortSecondTP := leveragedPriceDistance(shortEntry, plan.Leverage, secondTPPct)
+			plan.ShortStopLoss = shortEntry + shortStopDistance
+			plan.ShortTakeProfit = []float64{shortEntry - shortFirstTP, shortEntry - shortSecondTP}
+		}
+		center := ref
+		if center <= 0 && longEntry > 0 && shortEntry > 0 {
+			center = (longEntry + shortEntry) / 2
+		}
+		ensureSwingPlanRange(plan, center, halfRange)
+	}
+}
+
+func leveragedPriceDistance(entry float64, leverage int, pnlPct float64) float64 {
+	lev := leverage
+	if lev <= 0 {
+		lev = 25
+	}
+	return entry * pnlPct / float64(lev)
+}
+
+func ensureSwingPlanRange(plan *RangePlan, center, halfRange float64) {
+	if plan == nil || center <= 0 || halfRange <= 0 {
+		return
+	}
+	low := center - halfRange
+	if low <= 0 {
+		low = center * 0.5
+	}
+	high := center + halfRange
+	if plan.RangeLow <= 0 || plan.RangeLow > low {
+		plan.RangeLow = low
+	}
+	if plan.RangeHigh <= 0 || plan.RangeHigh < high {
+		plan.RangeHigh = high
+	}
+	if plan.StopLoss > 0 {
+		plan.RangeLow = math.Min(plan.RangeLow, plan.StopLoss)
+		plan.RangeHigh = math.Max(plan.RangeHigh, plan.StopLoss)
+	}
+	if plan.LongStopLoss > 0 {
+		plan.RangeLow = math.Min(plan.RangeLow, plan.LongStopLoss)
+	}
+	if plan.ShortStopLoss > 0 {
+		plan.RangeHigh = math.Max(plan.RangeHigh, plan.ShortStopLoss)
+	}
+	for _, tp := range plan.TakeProfit {
+		if tp > 0 {
+			plan.RangeLow = math.Min(plan.RangeLow, tp)
+			plan.RangeHigh = math.Max(plan.RangeHigh, tp)
+		}
+	}
+	for _, tp := range plan.LongTakeProfit {
+		if tp > 0 {
+			plan.RangeHigh = math.Max(plan.RangeHigh, tp)
+		}
+	}
+	for _, tp := range plan.ShortTakeProfit {
+		if tp > 0 {
+			plan.RangeLow = math.Min(plan.RangeLow, tp)
+		}
+	}
 }
 
 func clampPlan(plan *RangePlan, px float64) {
@@ -929,6 +1131,17 @@ func clamp(v, low, high float64) float64 {
 		return high
 	}
 	return v
+}
+
+// calcFuseThreshold 根据币对ATR波动率计算自适应熔断阈值。
+// BTC(~1.8%日ATR)→3.0%, ETH(~2.5%)→3.75%, SOL(~9%)→12.0%封顶。
+func calcFuseThreshold(atr, price float64) float64 {
+	if price <= 0 || atr <= 0 {
+		return 3.0
+	}
+	atrPct := atr / price         // 日ATR占价格百分比
+	threshold := 3.0 * (atrPct / 0.02) // 以BTC(2%日ATR)为基准缩放
+	return clamp(threshold, 3.0, 12.0)
 }
 
 func priorityOrder(symbols []string) []string {

@@ -266,6 +266,20 @@ export function normalizeDashboardPayload(
     realized_pnl: num(data.realized_pnl, prev.realized_pnl),
     win_rate: num(data.win_rate, prev.win_rate),
     safety_blocked: bool(data.safety_blocked, prev.safety_blocked),
+    fuse_reason: typeof data.fuse_reason === 'string' ? data.fuse_reason : prev.fuse_reason ?? '',
+    live_api_ok:
+      typeof data.live_api_ok === 'boolean' ? data.live_api_ok : prev.live_api_ok ?? true,
+    last_tick_block: (() => {
+      if (data.last_tick_block === null) return null
+      if (data.last_tick_block && typeof data.last_tick_block === 'object') {
+        const b = data.last_tick_block as Record<string, unknown>
+        const code = typeof b.code === 'string' ? b.code : ''
+        const detail = typeof b.detail === 'string' ? b.detail : ''
+        const ts = typeof b.ts === 'number' && Number.isFinite(b.ts) ? b.ts : undefined
+        return { code, detail, ts }
+      }
+      return prev.last_tick_block ?? null
+    })(),
     position_list: Array.isArray(data.position_list) ? data.position_list : prev.position_list,
     live_prices: data.live_prices && typeof data.live_prices === 'object'
       ? (data.live_prices as Status['live_prices'])
@@ -295,6 +309,13 @@ export function normalizeDashboardPayload(
       return prev.shark_mode ?? 'paper'
     })(),
     evo_pending: Array.isArray(data.evo_pending) ? data.evo_pending : prev.evo_pending ?? [],
+    dynamic_high_vol_alts: Array.isArray(data.dynamic_high_vol_alts)
+      ? data.dynamic_high_vol_alts.map(String)
+      : prev.dynamic_high_vol_alts ?? [],
+    strategy_profile:
+      data.strategy_profile && typeof data.strategy_profile === 'object'
+        ? (data.strategy_profile as Status['strategy_profile'])
+        : prev.strategy_profile,
   }
 }
 
@@ -449,6 +470,10 @@ export default function App() {
   const tradingOn = isPaperMode
     ? (paper?.trading_enabled === true)
     : (live?.trading_enabled === true)
+  /** 价格闪崩熔断或实盘连续报单熔断（与「开始交易」开关独立） */
+  const riskHalt =
+    status.safety_blocked === true ||
+    (status.shark_mode === 'live' && status.live_api_ok === false)
   const showTradeButton =
     connected && (isPaperMode || (status.shark_mode === 'live' && liveActive))
 
@@ -628,9 +653,9 @@ export default function App() {
                 进化 {status.evo_pending!.length}
               </button>
             )}
-            <span className={`status-dot ${status.safety_blocked ? 'blocked' : connected ? 'live' : 'disconnected'}`} />
+            <span className={`status-dot ${riskHalt ? 'blocked' : connected ? 'live' : 'disconnected'}`} />
             <span style={{ fontSize: '11px', color: 'var(--text-secondary)', fontWeight: 500 }}>
-              {status.safety_blocked ? '熔断' : connected ? '运行中' : '离线'}
+              {riskHalt ? (status.safety_blocked ? '熔断' : '实盘API熔断') : connected ? '运行中' : '离线'}
             </span>
           </div>
           <Clock />
@@ -648,7 +673,7 @@ export default function App() {
             winRate={status.win_rate}
             positions={status.positions}
             equityChange={equityChange}
-            safetyBlocked={status.safety_blocked}
+            safetyBlocked={riskHalt}
             totalFees={status.total_fees}
             marginLocked={status.margin_locked}
           />
@@ -676,7 +701,7 @@ export default function App() {
             <div className="card-body" style={{ flex: 1 }}>
               <SafetyPanel
                 status={status}
-                blocked={status.safety_blocked}
+                blocked={riskHalt}
                 connected={connected}
                 latencyMs={pollLatencyMs}
                 uptimeLabel={fmtUptime}

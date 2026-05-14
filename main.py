@@ -5,7 +5,7 @@ import asyncio, os, sys, time, json, secrets, uuid, math, random
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from fastapi import Request
 
@@ -57,9 +57,19 @@ except ImportError:
 # 开仓方向：plan = 仅 Redis RangePlan（默认，与 SlowLoop 一致）；ai = DeepSeek 预取缓存
 SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
 
+
+def _plan_authority_enabled() -> bool:
+    """为真时：Redis RangePlan（非本地 alt_dynamic）开仓后，Python 侧不覆盖计划的 SL/TP/仓位/杠杆意图。"""
+    v = os.environ.get("SHARK_PLAN_AUTHORITY", "").strip().lower()
+    return v in ("1", "true", "yes", "on", "strict")
+
+
 # 导入双轨策略
 try:
-    from dual_strategy import get_config, is_stable, get_capital_limit, is_high_vol_alt
+    from dual_strategy import (
+        get_config, is_stable, get_capital_limit, is_high_vol_alt,
+        set_dynamic_high_vol_alts, trading_track, trading_track_allows_open,
+    )
     DUAL_STRATEGY = True
 except ImportError:
     DUAL_STRATEGY = False
@@ -67,6 +77,9 @@ except ImportError:
     def is_stable(s): return False
     def get_capital_limit(b, s): return b
     def is_high_vol_alt(s): return True
+    def set_dynamic_high_vol_alts(symbols): return set(symbols)
+    def trading_track(): return "dual"
+    def trading_track_allows_open(_s): return True
 
 # K线缓存（自进化引擎依赖）
 try:
@@ -89,6 +102,7 @@ SLIPPAGE_MAX = 0.0003     # 最大滑点 0.03%
 # 连续止损只记录告警，不再硬暂停开仓；数量策略需要平仓后立即续单。
 _FUSE_SL_STREAK_LIMIT = 3
 TRADE_INTERVAL = 1        # 交易循环间隔 1s（200ms盘口匹配）
+ALT_PLAN_TTL_SEC = 600    # 高波动山寨约10分钟全量刷新计划
 # TP_PCT = 2.0              # 已废弃：止盈改为 ATR 动态计算
 SL_PCT = -6.0             # 止损 -6%
 TIMEOUT_SEC = 300         # 超时平仓 5min
@@ -165,6 +179,36 @@ async def fetch_top_symbols(n: int = 30, min_vol: float = 30000) -> List[str]:
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return [s[0] for s in scored[:n]]
+
+def rank_hot_volatile_symbols(tickers: list, n: int = 18, min_vol: float = 500_000,
+                              min_change: float = 8.0) -> List[str]:
+    """Rank non-main USDT contracts by pure volatility (24h change %).
+    高波动 = 日涨跌幅大，不是成交量大。"""
+    scored = []
+    for t in tickers or []:
+        try:
+            vol = float(t.get("volume_24h_quote", 0) or 0)
+            chg = abs(float(t.get("change_percentage", 0) or 0))
+            sym = str(t.get("contract", "") or "")
+            if vol < min_vol or chg < min_change or not sym.endswith("_USDT"):
+                continue
+            symbol = sym.replace("_USDT", "/USDT")
+            if is_stable(symbol):
+                continue
+            # 纯按波动率排名，成交量只做门槛
+            scored.append((symbol, chg, vol))
+        except Exception as e:
+            _log.debug("hot volatile row skipped: %s", e)
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [s[0] for s in scored[:n]]
+
+async def fetch_hot_volatile_symbols(n: int = 18) -> List[str]:
+    await _wait_gate_rl()
+    url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+    return rank_hot_volatile_symbols(data, n=n)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -264,11 +308,21 @@ def _default_paper_trading_enabled() -> bool:
     raw = os.environ.get("SHARK_AUTO_START_PAPER", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
-_state = {"equity": 100.0, "balance": 100.0, "free_cash": 100.0, "initial_capital": 100.0,
+_state = {"equity": 500.0, "balance": 500.0, "free_cash": 500.0, "initial_capital": 500.0,
           "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
-          "positions": 0, "safety_blocked": False, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
+          "positions": 0, "safety_blocked": False, "fuse_reason": "", "live_api_ok": True,
+          "last_tick_block": None, "symbols": [], "symbol_count": 0, "trades": 0, "wins": 0,
           "position_list": [], "trade_history": [], "total_fees": 0.0, "total_slippage": 0.0, "margin_locked": 0.0,
-          "paper_trading": _default_paper_trading_enabled(), "live_trading": False, "shark_mode": "paper"}
+          "paper_trading": _default_paper_trading_enabled(), "live_trading": False, "shark_mode": "paper",
+          "dynamic_high_vol_alts": [],
+          "planning_status": {"active": False, "phase": "idle", "message": "等待计划刷新", "done": 0, "total": 0},
+          "strategy_profile": {
+              "stable_capital_pct": 0.60,
+              "alt_capital_pct": 0.40,
+              "stable_profile": "主流中长线重仓，BTC/ETH/SOL 三仓按60%资金桶分配，严格命中计划入场带才开",
+              "alt_profile": "动态热门高波动山寨，方向趋势没坏可扛，10分钟全量刷新",
+              "alt_plan_ttl_sec": ALT_PLAN_TTL_SEC,
+          }}
 
 
 def _finite_float(v, default: float = 0.0) -> float:
@@ -466,7 +520,7 @@ async def evo_metrics(_: None = Depends(require_api_token)):
             _log.debug("evo_metrics redis: %s", e)
     from evolution.reward_signal import compute_reward_breakdown
 
-    ic = float(_state.get("initial_capital") or 200.0)
+    ic = float(_state.get("initial_capital") or 500.0)
     return compute_reward_breakdown(_state.get("trade_history") or [], initial_equity=ic)
 
 
@@ -545,19 +599,30 @@ async def trade_history(
     page = list(reversed(trades))[offset:offset + limit]
     return {"trades": page, "total": total, "offset": offset, "limit": limit}
 
+@app.get("/health")
+async def health_check():
+    """生产健康检查：Redis连通性 + 计划数 + 持仓数"""
+    from execution.prod_utils import build_health_check
+    pg = _state.get("_plan_gate")
+    return build_health_check(plan_gate=pg, positions=_state.get("positions", 0))
+
+
 @app.get("/api/plans")
 async def plans_dashboard():
-    """计划看板：直接读取 Redis 中所有 RangePlan + 熔断状态"""
+    """计划看板：直接读取 Redis 中所有 RangePlan + 单币对熔断状态"""
     pg = _state.get("_plan_gate")
     fuse_info = None
     plans = {}
 
-    if pg and pg.is_fused:
-        fuse_info = {
-            "triggered": True,
-            "remaining": pg.fuse_remaining,
-            "reason": pg.fuse_reason,
-        }
+    if pg:
+        fused = pg.get_fused_symbols()
+        if fused:
+            fuse_info = {
+                "triggered": True,
+                "per_symbol": fused,
+                "remaining": pg.fuse_remaining,
+                "reason": pg.fuse_reason,
+            }
 
     # 直接从 Redis 读取所有计划
     redis_client = _state.get("_redis_client")
@@ -671,7 +736,7 @@ h.push('<tr style=font-size:9px;color:#4a8><td colspan=4><span style=color:#0f8>
 }}
 h.push('</table>')
 if(ks.length>n)h.push('<div style=font-size:9px;color:#555>... 还有'+(ks.length-n)+'个计划</div>')}
-if(fuse&&fuse.triggered)h.push('<div style=color:red;font-weight:bold;margin-top:4px>⛔ 熔断中 '+ft(fuse.remaining)+' '+fuse.reason+'</div>')
+if(fuse&&fuse.triggered){var ps=fuse.per_symbol||{};var fusedSyms=Object.keys(ps);if(fusedSyms.length)h.push('<div style=color:red;font-weight:bold;margin-top:4px>⛔ 熔断: '+fusedSyms.join(', ')+' ('+ft(fuse.remaining)+')</div>')}
 else h.push('<div style=font-size:9px;color:#555;margin-top:4px>'+ks.length+'个计划 · 无熔断</div>')
 pd.innerHTML='<div style=font-weight:bold;color:#0ff;margin-bottom:4px>📊 <a href=/plans style=color:#0ff;text-decoration:underline>RangePlan 全屏看板→</a></div>'+h.join('')
 }).catch(function(e){panel().innerHTML='<div style=color:#f44>📊 Plan API 错误</div>'})}
@@ -728,10 +793,13 @@ fetch('/api/plans').then(r=>r.json()).then(d=>{
 var plans=d.plans||{},fuse=d.fuse,ks=Object.keys(plans).sort()
 var g=document.getElementById('grid'),fs=document.getElementById('fuse')
 var sub=document.getElementById('sub')
-sub.textContent=ks.length+'个计划 · '+(fuse&&fuse.triggered?'⛔ 熔断':'无熔断')+' · 每30分钟更新'
+sub.textContent=ks.length+'个计划 · '+(fuse&&fuse.triggered?'⛔ 单币对熔断':'无熔断')+' · 每30分钟更新'
 
-if(fuse&&fuse.triggered)fs.innerHTML='<div class=fuse>⛔ 熔断保护中 '+ft(fuse.remaining)+' — '+fuse.reason+'</div>'
-else fs.innerHTML=''
+var ps=fuse&&fuse.per_symbol||{}
+if(fuse&&fuse.triggered){
+  var fusedList=Object.keys(ps).map(function(s){return s.replace('/USDT','')+'('+ps[s].reason+')'}).join(', ')
+  fs.innerHTML='<div class=fuse>⛔ 熔断保护中 '+ft(fuse.remaining)+' — '+fusedList+'</div>'
+}else fs.innerHTML=''
 
 if(ks.length===0){g.innerHTML='<div class=empty>等待 SlowLoop 生成计划...</div>';return}
 var h=''
@@ -739,6 +807,7 @@ for(var i=0;i<ks.length;i++){
 var sym=ks[i],p=plans[sym],bias=p.bias||''
 h+='<div class=card>'
 h+='<h2>'+sym.replace('/USDT','')+' <span style=font-size:11px>'+bdg(bias)+'</span> '+rsk(p.news_risk_level||0)+'</h2>'
+if(ps&&ps[sym])h+='<div style=background:#3b0000;color:#f44;font-size:10px;padding:2px 6px;border-radius:4px;margin-bottom:4px;display:inline-block>⛔ '+ps[sym].reason+'</div>'
 h+='<div class=meta>'+am(p.ai_model)+' 置信'+(p.ai_confidence?Math.round(p.ai_confidence)+'%':'--')+' · '+ (p.macro_regime||'')+' · ATR '+f(p.atr14)+'</div>'
 h+='<div class=row><span class=lbl>区间</span><span class=val>'+f(p.range_low)+' ~ '+f(p.range_high)+'</span></div>'
 if(bias==='both'){
@@ -941,6 +1010,15 @@ class StrategyRunner:
         self._plan_gate = None  # FastLoop 门禁，由 main() 注入
         self._loss_replay_guard: Dict[str, dict] = {}
         self._price_replan_last: Dict[str, float] = {}
+        # 山寨币独立进化状态（动态币对，首次见到自动初始化）
+        self._alt_evo: Dict[str, dict] = {}  # sym → {gen, plans, wins, stops, atr_mult, stop_mult, tp_mult}
+        self._last_tick_block: Optional[dict] = None
+        self._block_log_ts: Dict[str, float] = {}
+        if _plan_authority_enabled():
+            print(
+                "📌 SHARK_PLAN_AUTHORITY 已启用：RangePlan 开仓后 Python 不覆盖 SL/TP/仓位/杠杆（不含 alt_dynamic）",
+                flush=True,
+            )
 
     def switch_mode(self, mode: str) -> dict:
         """运行时切换 paper/live 模式，重新初始化实盘引擎"""
@@ -1082,6 +1160,8 @@ class StrategyRunner:
                 self._ai_signal_cache[sym] = {"plan": plan, "ts": now}
                 if sym in self.positions:
                     pos = self.positions[sym]
+                    if pos.get("plan_stick"):
+                        return
                     # 存储完整AI计划（多层仓位管理用）
                     pos["ai_plan"] = plan
                     pos["ai_targets"] = plan["targets"]
@@ -1254,7 +1334,15 @@ class StrategyRunner:
         except Exception:
             return px
 
-    def _margin_from_plan(self, plan: dict, cfg: dict, regime_cfg: dict, change_abs: float) -> float:
+    def _margin_from_plan(
+        self,
+        plan: dict,
+        cfg: dict,
+        regime_cfg: dict,
+        change_abs: float,
+        *,
+        strict_plan: bool = False,
+    ) -> float:
         """Use RangePlan sizing as intent; local config may only cap risk lower."""
         try:
             pct = float((plan or {}).get("position_size_pct") or 0)
@@ -1264,7 +1352,7 @@ class StrategyRunner:
             min_pct = float((cfg or {}).get("min_plan_margin_pct") or 0)
         except Exception:
             min_pct = 0.0
-        if min_pct > 0:
+        if min_pct > 0 and not strict_plan:
             pct = max(pct, min_pct)
         if pct <= 0:
             return 0.0
@@ -1279,9 +1367,285 @@ class StrategyRunner:
             cap_pct = float((cfg or {}).get("max_plan_margin_pct") or 0)
         except Exception:
             cap_pct = 0.0
-        if cap_pct > 0:
+        if cap_pct > 0 and not strict_plan:
             margin = min(margin, sizing_base * cap_pct)
         return max(0.0, margin)
+
+    def _clamp_leverage_for_config(self, sym: str, lev: int, cfg: dict) -> int:
+        try:
+            out = int(lev)
+        except Exception:
+            out = 0
+        try:
+            max_lev = int((cfg or {}).get("max_leverage") or 0)
+        except Exception:
+            max_lev = 0
+        try:
+            min_lev = int((cfg or {}).get("min_leverage") or 0)
+        except Exception:
+            min_lev = 0
+        if max_lev > 0:
+            out = min(out, max_lev)
+        spec = self._contract_specs.get(sym) if hasattr(self, "_contract_specs") else None
+        try:
+            exchange_max = int(getattr(spec, "leverage_max", 0) or 0)
+        except Exception:
+            exchange_max = 0
+        if exchange_max > 0:
+            out = min(out, exchange_max)
+        if min_lev > 0:
+            out = max(out, min(min_lev, exchange_max) if exchange_max > 0 else min_lev)
+        return max(1, out)
+
+    def _alt_dynamic_leverage(self, sym: str, cfg: dict, change_pct: float, funding: float) -> Tuple[int, str]:
+        change_abs = abs(float(change_pct or 0))
+        funding_abs = abs(float(funding or 0))
+        # 默认先降杠杆抗抖；只有波动和资金费率都支持单边时才放大。
+        if change_abs >= 12 and funding_abs >= 0.00025:
+            raw = 65
+            tag = "强单边放大"
+        elif change_abs >= 8 and funding_abs >= 0.00015:
+            raw = 55
+            tag = "单边进攻"
+        elif change_abs >= 10:
+            raw = 32
+            tag = "高波动降杠杆"
+        elif change_abs >= 5:
+            raw = 28
+            tag = "中波动抗抖"
+        else:
+            raw = 24
+            tag = "普通热币抗抖"
+        if change_abs >= 15 and funding_abs < 0.00015:
+            raw = min(raw, 26)
+            tag = "巨震低确认降杠杆"
+        lev_cfg = {
+            "min_leverage": (cfg or {}).get("min_leverage", 15),
+            "max_leverage": (cfg or {}).get("max_leverage", 70),
+        }
+        return self._clamp_leverage_for_config(sym, raw, lev_cfg), tag
+
+    async def _ai_build_alt_plan(self, sym: str, px: float, change_abs: float,
+                                  volume: float, funding: float) -> Optional[dict]:
+        """山寨AI计划：单次DeepSeek调用，失败返回None回退数学"""
+        try:
+            import aiohttp, os
+            key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+            if not key:
+                return None
+            prompt = (
+                f"你是超短线山寨币交易员。{sym} 现价{px} 24h波动{change_abs:+.1f}% "
+                f"24h成交量{volume:,.0f} 资金费率{funding*100:+.4f}%。"
+                f"输出JSON: bias(both/long/short), long_entry_low, long_entry_high, "
+                f"long_sl, long_tp1, long_tp2, short_entry_low, short_entry_high, "
+                f"short_sl, short_tp1, short_tp2, leverage(5-65), rationale(≤25字)。"
+                f"默认bias=both双向区间，仅强单边(波动>15%+费率>0.025%)才用long/short。"
+                f"入场带≈现价±0.5%-1.2%，止损≈入场带外扩波动率×0.4，止盈≈波动率×0.7和1.2。"
+            )
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 400,
+                        "temperature": 0.3,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    text = data["choices"][0]["message"]["content"]
+                    import json as _json
+                    ai = _json.loads(text) if isinstance(text, str) else text
+            return ai if isinstance(ai, dict) else None
+        except Exception:
+            return None
+
+    def _build_alt_attack_plan(self, sym: str, px: float, change_abs: float,
+                               volume: float, funding: float) -> dict:
+        cfg = get_config(sym)
+        now = time.time()
+        vol_band = max(0.025, min(0.070, abs(float(change_abs or 0)) / 100.0 * 0.9))
+        entry_band = max(0.004, min(0.012, vol_band * 0.35))
+        lev, lev_tag = self._alt_dynamic_leverage(sym, cfg, change_abs, funding)
+        lev_cap = self._clamp_leverage_for_config(sym, int((cfg or {}).get("max_leverage") or 70), {"max_leverage": (cfg or {}).get("max_leverage", 70)})
+        pos_pct = float((cfg or {}).get("min_plan_margin_pct") or (cfg or {}).get("margin_pct") or 0.02)
+        loss_budget = 0.70
+        # 止损：取杠杆保护和波动率保护的最大值，避免高杠杆高波币被噪声触发
+        lev_stop = loss_budget / max(float(lev), 1.0)
+        vol_stop = vol_band * 0.45  # 波动率 45% 作为止损底线
+        stop_move = max(0.008, min(vol_band * 0.75, max(lev_stop, vol_stop)))
+        carry_band = max(vol_band * 2.4, stop_move * 1.35)
+        tp1 = max(0.012, vol_band * 0.7)
+        tp2 = max(0.025, vol_band * 1.2)
+
+        # 判断单边：日波动>15% 且 资金费率极端 → 纯单边，否则双向区间
+        abs_funding = abs(float(funding or 0))
+        is_one_sided = change_abs >= 15 and abs_funding >= 0.00025
+        if is_one_sided:
+            bias = "long" if funding <= 0 else "short"
+            bias_tag = "纯单边拉盘" if bias == "long" else "纯单边砸盘"
+        else:
+            bias = "both"
+            bias_tag = "双向区间"
+
+        # 山寨币独立进化：每个币对各自追踪代数和质量
+        evo = self._alt_evo.setdefault(sym, {"gen": 0, "plans": 0, "wins": 0, "stops": 0,
+                                              "atr_mult": 1.0, "stop_mult": 1.0, "tp_mult": 1.0})
+        evo["plans"] += 1
+
+        # ATR自适应熔断阈值（以日波动5%为基准锚点，动态币对自动缩放）
+        chg = abs(float(change_abs or 5.0))
+        fuse_pct = max(3.0, min(12.0, 3.0 * (chg / 5.0)))
+        base = {
+            "symbol": sym,
+            "generated_at": int(now),
+            "valid_until": int(now + ALT_PLAN_TTL_SEC),
+            "state": "LIVE",
+            "regime": "hot_volatile_alt",
+            "macro_regime": "hot_volatile_alt",
+            "bias": bias,
+            "range_low": px * (1 - carry_band),
+            "range_high": px * (1 + carry_band),
+            "plan_price": px,
+            "position_size_pct": pos_pct,
+            "leverage": lev,
+            "leverage_cap": lev_cap,
+            "cut_loss_pct": loss_budget,
+            "ai_model": "alt_dynamic",
+            "ai_confidence": 70,
+            "ai_rationale": f"高波山寨({bias_tag}) {lev_tag} 成交额{volume:.0f}",
+            "news_risk_level": 0,
+            "risk_flags": [],
+            "fuse_threshold_pct": round(fuse_pct, 2),
+            "evo_gen": evo["gen"],
+        }
+        # 默认双向区间，超短线多空都做
+        base["long_entry_low"] = px * (1 - entry_band)
+        base["long_entry_high"] = px * (1 + entry_band * 0.4)
+        base["long_stop_loss"] = px * (1 - stop_move)
+        base["long_take_profit"] = [px * (1 + tp1), px * (1 + tp2)]
+        base["short_entry_low"] = px * (1 - entry_band * 0.4)
+        base["short_entry_high"] = px * (1 + entry_band)
+        base["short_stop_loss"] = px * (1 + stop_move)
+        base["short_take_profit"] = [px * (1 - tp1), px * (1 - tp2)]
+        base["entry_zone_low"] = base["long_entry_low"]
+        base["entry_zone_high"] = base["short_entry_high"]
+        base["stop_loss"] = base["long_stop_loss"]
+        base["take_profit"] = base["long_take_profit"]
+        return base
+
+    def _ai_to_alt_plan(self, sym: str, px: float, ai: dict,
+                        change_abs: float, volume: float, funding: float) -> dict:
+        """将AI返回的JSON转为标准RangePlan格式"""
+        now = time.time()
+        bias = ai.get("bias", "both")
+        chg = abs(float(change_abs or 5.0))
+        fuse_pct = max(3.0, min(12.0, 3.0 * (chg / 5.0)))
+        evo = self._alt_evo.setdefault(sym, {"gen": 0, "plans": 0, "wins": 0, "stops": 0,
+                                              "atr_mult": 1.0, "stop_mult": 1.0, "tp_mult": 1.0})
+        evo["plans"] += 1
+        plan = {
+            "symbol": sym, "generated_at": int(now), "valid_until": int(now + ALT_PLAN_TTL_SEC),
+            "state": "LIVE", "regime": "hot_volatile_alt", "macro_regime": "hot_volatile_alt",
+            "bias": bias, "plan_price": px, "ai_model": "deepseek",
+            "ai_confidence": 75, "ai_rationale": str(ai.get("rationale", ""))[:30],
+            "news_risk_level": 0, "risk_flags": [],
+            "fuse_threshold_pct": round(fuse_pct, 2), "evo_gen": evo["gen"],
+        }
+        lev = ai.get("leverage", 25)
+        plan["leverage"] = max(5, min(65, int(lev)))
+        plan["position_size_pct"] = 0.02
+        plan["cut_loss_pct"] = 0.70
+        # 长仓
+        plan["long_entry_low"] = float(ai.get("long_entry_low", px * 0.995))
+        plan["long_entry_high"] = float(ai.get("long_entry_high", px * 1.005))
+        plan["long_stop_loss"] = float(ai.get("long_sl", px * 0.98))
+        plan["long_take_profit"] = [float(ai.get("long_tp1", px * 1.02)), float(ai.get("long_tp2", px * 1.04))]
+        # 空仓
+        plan["short_entry_low"] = float(ai.get("short_entry_low", px * 0.995))
+        plan["short_entry_high"] = float(ai.get("short_entry_high", px * 1.005))
+        plan["short_stop_loss"] = float(ai.get("short_sl", px * 1.02))
+        plan["short_take_profit"] = [float(ai.get("short_tp1", px * 0.98)), float(ai.get("short_tp2", px * 0.96))]
+        # 区间
+        plan["range_low"] = min(plan["long_entry_low"], plan["long_stop_loss"])
+        plan["range_high"] = max(plan["short_entry_high"], plan["short_stop_loss"])
+        plan["entry_zone_low"] = plan["long_entry_low"]
+        plan["entry_zone_high"] = plan["short_entry_high"]
+        plan["stop_loss"] = plan["long_stop_loss"]
+        plan["take_profit"] = plan["long_take_profit"]
+        return plan
+
+    def _is_alt_dynamic_plan(self, plan: Optional[dict]) -> bool:
+        return bool(plan and plan.get("ai_model") in ("alt_dynamic", "deepseek"))
+
+    async def _ensure_alt_attack_plan(self, sym: str, px: float, change_abs: float,
+                                       volume: float, funding: float, *,
+                                       force: bool = False, reason: str = "") -> Optional[dict]:
+        if is_stable(sym) or not is_high_vol_alt(sym) or px <= 0:
+            return None
+        if trading_track() == "stable":
+            return None
+        now = time.time()
+        old = self._plan_gate.get_plan(sym) if self._plan_gate else None
+        if old and self._is_alt_dynamic_plan(old) and not force:
+            generated = float(old.get("generated_at") or 0)
+            valid_until = float(old.get("valid_until") or 0)
+            if now - generated < ALT_PLAN_TTL_SEC and valid_until > now:
+                return old
+
+        # 尝试AI生成，失败回退数学
+        ai_plan = None
+        if force or not old or now - float(old.get("generated_at", 0)) >= ALT_PLAN_TTL_SEC:
+            ai_plan = await self._ai_build_alt_plan(sym, px, change_abs, volume, funding)
+
+        if ai_plan and ai_plan.get("bias") in ("long", "short", "both"):
+            plan = self._ai_to_alt_plan(sym, px, ai_plan, change_abs, volume, funding)
+            plan["ai_model"] = "deepseek"
+            plan["ai_confidence"] = 75
+        else:
+            plan = self._build_alt_attack_plan(sym, px, change_abs, volume, funding)
+
+        if reason:
+            plan["ai_rationale"] = f"{reason}；" + str(plan.get("ai_rationale", ""))
+        try:
+            import redis as _redis
+            _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            _r.set(f"shark:plan:{sym}", json.dumps(plan, ensure_ascii=False), ex=ALT_PLAN_TTL_SEC + 30)
+        except Exception as e:
+            _log.debug("dynamic alt plan redis write failed for %s: %s", sym, e)
+        if self._plan_gate:
+            self._plan_gate._plan_cache[sym] = plan
+            self._plan_gate._last_fetch[sym] = now
+        return plan
+
+    async def _refresh_alt_plan_if_needed(self, sym: str, plan: dict, px: float,
+                                           change_abs: float, volume: float,
+                                           funding: float, now: float) -> tuple:
+        if not self._is_alt_dynamic_plan(plan):
+            return plan, False, ""
+        generated = float(plan.get("generated_at") or 0)
+        reason = ""
+        if generated <= 0 or now - generated >= ALT_PLAN_TTL_SEC:
+            reason = "山寨10分钟全量刷新"
+            full_refresh = True
+        else:
+            reason = self._plan_replan_reason(plan, px)
+            full_refresh = False
+        if not reason:
+            return plan, False, ""
+        last = self._price_replan_last.get(sym, 0)
+        if (not full_refresh) and now - last < 60:
+            return plan, False, ""
+        self._price_replan_last[sym] = now
+        new_plan = await self._ensure_alt_attack_plan(
+            sym, px, change_abs, volume, funding, force=True, reason=reason
+        )
+        return new_plan or plan, True, reason
 
     def _warmup_allows_open(self, *, has_kline: bool, has_detector: bool) -> bool:
         """RangePlan-first trading should not wait on Python kline helpers."""
@@ -1312,10 +1676,36 @@ class StrategyRunner:
         net = gross - est
         return net >= max(0.05, 0.25 * est)
 
+    def _planned_stop_pnl_pct(self, pos: dict, stop_price: float) -> float:
+        """Convert a planned stop price into leveraged PnL%, matching pnl_pct comparisons."""
+        entry = float(pos.get("entry") or 0)
+        lev = max(float(pos.get("leverage") or 1), 1.0)
+        if entry <= 0 or stop_price <= 0:
+            return 0.0
+        if pos.get("side") == "long":
+            return -((entry - stop_price) / entry) * lev * 100
+        return -((stop_price - entry) / entry) * lev * 100
+
+    def _planned_take_profit_pnl_pct(self, pos: dict, take_profit_price: float) -> float:
+        """Convert a planned TP price into leveraged PnL%, matching pnl_pct comparisons."""
+        entry = float(pos.get("entry") or 0)
+        lev = max(float(pos.get("leverage") or 1), 1.0)
+        if entry <= 0 or take_profit_price <= 0:
+            return 0.0
+        if pos.get("side") == "long":
+            return ((take_profit_price - entry) / entry) * lev * 100
+        return ((entry - take_profit_price) / entry) * lev * 100
+
     def _plan_entry_zone(self, plan: dict, side: str) -> tuple:
         if side == "long":
-            return plan.get("long_entry_low", 0), plan.get("long_entry_high", 0)
-        return plan.get("short_entry_low", 0), plan.get("short_entry_high", 0)
+            return (
+                plan.get("long_entry_low") or plan.get("entry_zone_low", 0),
+                plan.get("long_entry_high") or plan.get("entry_zone_high", 0),
+            )
+        return (
+            plan.get("short_entry_low") or plan.get("entry_zone_low", 0),
+            plan.get("short_entry_high") or plan.get("entry_zone_high", 0),
+        )
 
     def _price_in_plan_entry_zone(self, plan: dict, side: str, px: float) -> bool:
         low, high = self._plan_entry_zone(plan, side)
@@ -1329,6 +1719,12 @@ class StrategyRunner:
         if low > high:
             low, high = high, low
         return low <= px <= high
+
+    def _main_coin_entry_allowed(self, sym: str, plan: dict, side: str, px: float) -> bool:
+        """Main coins are swing positions: only open at the planned side entry band."""
+        if not is_stable(sym):
+            return True
+        return self._price_in_plan_entry_zone(plan, side, px)
 
     def _plan_range(self, plan: dict) -> tuple:
         try:
@@ -1404,6 +1800,10 @@ class StrategyRunner:
 
     def _entry_risk_adjustment(self, sym: str, plan: dict, side: str, px: float) -> tuple:
         """Aggressive entry: keep opening inside range, but downshift chase entries."""
+        cfg = get_config(sym)
+        if (cfg or {}).get("disable_aggressive_entry"):
+            lev_cap = int((cfg or {}).get("max_leverage") or 35)
+            return 1.0, lev_cap, "中长线重仓"
         if not plan or plan.get("bias") != "both":
             return 1.0, 125, "标准"
 
@@ -1484,6 +1884,19 @@ class StrategyRunner:
         return "short", f"计划震荡激进 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
 
     def _request_symbol_replan(self, sym: str, reason: str) -> None:
+        if trading_track() != "stable" and (not is_stable(sym)) and is_high_vol_alt(sym):
+            try:
+                import redis as _redis
+                _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                _r.delete(f"shark:plan:{sym}")
+                if self._plan_gate:
+                    self._plan_gate._plan_cache.pop(sym, None)
+                    self._plan_gate._last_fetch.pop(sym, None)
+                self._price_replan_last.pop(sym, None)
+                print(f"[山寨重规划] {sym} {reason} → 清旧计划，下个tick本地重做进攻计划", flush=True)
+            except Exception as e:
+                _log.error("request alt replan failed for %s: %s", sym, e)
+            return
         payload = json.dumps({"symbol": sym, "reason": reason, "ts": time.time()}, ensure_ascii=False)
         try:
             import redis as _redis
@@ -1514,6 +1927,17 @@ class StrategyRunner:
             self._fuse_sl_streak[sym] = 0
             self._loss_replay_guard.pop(sym, None)
 
+    def _note_tick_block(self, code: str, detail: str, *, log_every_sec: float = 25.0) -> None:
+        """记录本轮暂停新开仓的原因，并节流打日志（避免刷屏）。"""
+        now = time.time()
+        self._last_tick_block = {"code": code, "detail": detail, "ts": now}
+        last = self._block_log_ts.get(code, 0.0)
+        if now - last >= log_every_sec:
+            self._block_log_ts[code] = now
+            line = f"[交易暂停] {code}: {detail}"
+            print(line, flush=True)
+            _log.warning("%s", line)
+
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
                    mark_prices: Dict[str, float] = None):
@@ -1522,6 +1946,7 @@ class StrategyRunner:
         # 同步实盘/模拟盘开关
         self._live_trading_enabled = _state.get("live_trading", False)
         self._paper_trading_enabled = _state.get("paper_trading", False)
+        self._last_tick_block = None
 
         # 处理审批通过的进化修改
         evo_apply = _state.pop("evo_apply", None)
@@ -1540,6 +1965,7 @@ class StrategyRunner:
                 print(f"[模式切换] 失败: {result['error']}", flush=True)
 
         # 发布价格到 Redis（Go matcher 撮合用，必须在开仓前）
+        _redis_ok = True
         try:
             import redis as _rp
             _r = _rp.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
@@ -1547,7 +1973,12 @@ class StrategyRunner:
                 if px > 0:
                     _r.set(f"shark:price:{sym}", px, ex=10)
         except Exception:
-            pass
+            _redis_ok = False
+            try:
+                from execution.prod_alert import alert_redis_down
+                asyncio.create_task(alert_redis_down())
+            except Exception:
+                pass
 
         # 停止交易 → 平掉所有持仓
         if _state.pop("live_close_all", False):
@@ -1572,17 +2003,17 @@ class StrategyRunner:
                     "Facial_Expression": "idle", "Emotion_Index": 5,
                 }
 
-        # ── 实盘安全 + 持仓同步 ──
+        # ── 实盘：定期同步 + 对账（不因 API 熔断整段跳过；止盈止损仍按行情跑）──
         if self._live and self._live.active:
-            if not self._live.is_healthy:
-                return  # 熔断：暂停交易
-            # 每60秒同步一次交易所持仓
             if now - self._live._last_sync > 60:
-                real = self._live.sync_positions()
-                # 对账：paper有但交易所没有 → 警告
-                for sym in list(self.positions):
-                    if sym not in real:
-                        _log.warning("⚠ 对账异常: %s paper有持仓但交易所无", sym)
+                mismatches = self._live.reconcile(self.positions)
+                if mismatches:
+                    try:
+                        from execution.prod_alert import _send_slack
+                        asyncio.create_task(_send_slack(
+                            f"🔴 [Shark] 持仓对账不一致: {'; '.join(mismatches[:3])}"))
+                    except Exception:
+                        pass
 
         # 检查持仓：动态止损 / 移动止盈 / 浮盈加仓
         for sym in list(self.positions):
@@ -1605,6 +2036,11 @@ class StrategyRunner:
             _rc = self._regime_cache.get(sym, {}).get("cfg", {})
             _stop_mult = _rc.get("stop_atr_mult", 2.0)
             _tp_mult = _rc.get("tp_atr_mult", 3.0)
+            if cfg.get("hold_profile") == "swing":
+                try:
+                    _tp_mult = max(float(_tp_mult), float(cfg.get("tp_atr_mult") or _tp_mult))
+                except Exception:
+                    pass
             
             # ── ATR 实时止损/止盈（5分钟ATR，避免1分钟噪声）──
             vol_chg = abs(pos.get("vol_chg", 3.0))
@@ -1620,27 +2056,25 @@ class StrategyRunner:
             if atr_pct <= 0:
                 atr_pct = vol_chg * 0.3  # 日波动30% ≈ 5m ATR
             
-            # 止损地板：不低于 2%（确保手续费+滑点有空间，不是噪音止损）
+            # ATR 侧：sl_raw / tp_raw 是「价格波动百分比」(例如 2.0 = 2% 价格)
+            # pnl_pct 是「杠杆盈亏百分比」，二者必须先换算再比较，否则会 -2% 杠杆就平仓
+            lev_f = max(float(pos.get("leverage") or 1), 1.0)
             sl_raw = atr_pct * _stop_mult
-            sl_floor = 2.0  # 最低 2% 价格止损
+            sl_floor = 2.0  # 最低 2% 价格波动（再乘杠杆得到杠杆侧止损）
             sl_raw = max(sl_raw, sl_floor)
-            # 反思器额外放宽
             _sl_boost = self._reflector.stop_boost if self._reflector else 0
-            dyn_sl = -(sl_raw + _sl_boost)
-            dyn_sl = max(dyn_sl, -25.0)  # 上限 25%
-            
-            # 止盈 = ATR% × 行情倍率（不低于地板 3%）
-            dyn_tp = max(atr_pct * _tp_mult, 3.0)
+            dyn_sl = -((sl_raw + _sl_boost) * lev_f)
+            dyn_sl = max(dyn_sl, -95.0)
+
+            tp_raw = max(atr_pct * _tp_mult, 3.0)
+            dyn_tp = tp_raw * lev_f
 
             # ── 计划精确 SL/TP 优先 ──
             _psl = pos.get("plan_sl")
             _ptp = pos.get("plan_tp")
             if _psl and isinstance(_psl, (int, float)) and _psl > 0:
-                if pos["side"] == "long":
-                    plan_sl_pct = -(pos["entry"] - _psl) / pos["entry"] * 100
-                else:
-                    plan_sl_pct = -(_psl - pos["entry"]) / pos["entry"] * 100
-                if -25 <= plan_sl_pct <= -0.5:
+                plan_sl_pct = self._planned_stop_pnl_pct(pos, float(_psl))
+                if -95 <= plan_sl_pct <= -0.5:
                     dyn_sl = plan_sl_pct
             if _ptp:
                 if isinstance(_ptp, list) and len(_ptp) > 0:
@@ -1650,16 +2084,18 @@ class StrategyRunner:
                 else:
                     _tp_first = None
                 if _tp_first and _tp_first > 0:
-                    if pos["side"] == "long":
-                        plan_tp_pct = (_tp_first - pos["entry"]) / pos["entry"] * 100
-                    else:
-                        plan_tp_pct = (pos["entry"] - _tp_first) / pos["entry"] * 100
-                    if 0.5 <= plan_tp_pct <= 50:
+                    plan_tp_pct = self._planned_take_profit_pnl_pct(pos, float(_tp_first))
+                    if 0.5 <= plan_tp_pct <= 500:
                         dyn_tp = plan_tp_pct
             
-            # 移动止盈：ATR × 3 触发或最低 4%
+            # 移动止盈：主流中长线更慢，山寨短线更贴
             trail_trigger = max(atr_pct * 1.5, 2.0)  # 超短线：更低阈值
             trail_ratio = 0.3
+            try:
+                trail_trigger = max(trail_trigger, float(cfg.get("trail_trigger") or 0))
+                trail_ratio = float(cfg.get("trail_pct") or trail_ratio)
+            except Exception:
+                pass
 
             # 更新最高盈利
             if pnl_pct > pos.get("best_pnl", -999):
@@ -1668,7 +2104,7 @@ class StrategyRunner:
 
             best_pnl = pos.get("best_pnl", pnl_pct)
 
-            if pos.get("entry_risk_tag") not in ("标准", "入场带"):
+            if not pos.get("plan_stick") and (not is_st) and pos.get("entry_risk_tag") not in ("标准", "入场带"):
                 gross_now = self._gross_pnl_usd(sym, pos, px)
                 fee_bar = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
                 if gross_now > fee_bar:
@@ -1677,7 +2113,7 @@ class StrategyRunner:
 
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
-            if ai_plan:
+            if ai_plan and not pos.get("plan_stick"):
                 pside = pos["side"]
                 # 1. AI 止损（含方向校验）
                 ai_sl = ai_plan.get("stop_loss")
@@ -1806,10 +2242,10 @@ class StrategyRunner:
                             pos["trailing_stop"] = px * 0.99 if pside == "long" else px * 1.01
                             print(f"[AI止盈] {sym} 部分{ratio*100:.0f}% @{px:.4f} 余{pos['size']:.4f}")
 
-            # ── 现有逻辑兜底 ──
+            # 现有逻辑兜底 ──
             # 浮盈加仓后检查AI目标价
             ai_targets = pos.get("ai_targets")
-            if ai_targets:
+            if ai_targets and not pos.get("plan_stick"):
                 actions = apply_ai_targets(pos, px, ai_targets, sym, self)
                 for act in actions:
                     if act["type"] == "take_profit":
@@ -1831,7 +2267,12 @@ class StrategyRunner:
                             self._persist_margin_delta(prices, sym, pos, -add_m, "margin_add", "ai_targets_pyramid")
             # 金字塔加仓（仅主流币）
             pyramid_max = cfg.get("pyramid_levels", 0)
-            if pyramid_max > 0 and pnl_pct > vol_chg and pos.get("pyramid_count", 0) < pyramid_max:
+            if (
+                not pos.get("plan_stick")
+                and pyramid_max > 0
+                and pnl_pct > vol_chg
+                and pos.get("pyramid_count", 0) < pyramid_max
+            ):
                 funding = funding_rates.get(sym, 0)
                 signal_valid = (
                     (pos["side"] == "short" and funding > 0.0001) or
@@ -1851,8 +2292,16 @@ class StrategyRunner:
                         self.trades += 1
                         self._persist_margin_delta(prices, sym, pos, -add_margin, "margin_add", "funding_pyramid")
 
-            # 保本止损：盈利 ≥ 3%（杠杆后） → 止损移至开仓价，防止盈利变亏损
-            if pnl_pct >= 3.0 and not pos.get("_breakeven_set"):
+            # 保本止损：盈利 ≥ 阈值（杠杆后）→ 止损移至开仓价（会覆盖计划 SL；计划锁定时关闭）
+            try:
+                breakeven_trigger = float(cfg.get("breakeven_trigger") or 3.0)
+            except Exception:
+                breakeven_trigger = 3.0
+            if (
+                not pos.get("plan_stick")
+                and pnl_pct >= breakeven_trigger
+                and not pos.get("_breakeven_set")
+            ):
                 pos["_breakeven_set"] = True
                 # 把计划止损价提升到 entry（相当于 dyn_sl = -0.01%，留手续费空间）
                 if pos["side"] == "long":
@@ -1860,14 +2309,27 @@ class StrategyRunner:
                 else:
                     pos["plan_sl"] = pos["entry"] * 0.9995
 
-            # 移动止盈：从最高点回撤，覆盖手续费
-            trail_bar = trail_trigger if not is_st else min(trail_trigger, 5.0)
-            if best_pnl > trail_bar:
+            # 移动止盈：从最高点回撤（计划锁定时仅用计划 TP / ATR 目标，不用回撤强平）
+            trail_bar = trail_trigger
+            if (
+                not pos.get("plan_stick")
+                and best_pnl > trail_bar
+            ):
                 trail_pct = abs(dyn_sl) * trail_ratio
                 if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
                     if self._take_profit_net_ok(sym, pos, px):
                         self._close_position(sym, px, "移动止盈", pnl_pct, prices)
                         continue
+
+            # ── 山寨微利止盈：盈利>5倍手续费 + 保证金比例门槛 ──
+            if not pos.get("plan_stick") and not is_stable(sym):
+                gross_usd = self._gross_pnl_usd(sym, pos, px)
+                est_fee = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
+                margin = pos.get("margin", 4)
+                min_profit = max(0.30, margin * 0.075)  # 保证金越大门槛越高
+                if gross_usd > max(est_fee * 5, min_profit):
+                    self._close_position(sym, px, "山寨微利止盈", pnl_pct, prices)
+                    continue
 
             # ── ATR动态止盈（无固定值）──
             if pnl_pct >= dyn_tp and self._take_profit_net_ok(sym, pos, px):
@@ -1886,10 +2348,22 @@ class StrategyRunner:
         # self.balance 已是扣除锁定保证金后的可支配资金，不再减 total_margin
         available = self.balance
         if available <= 0:
+            self._note_tick_block("no_cash", "可用余额≤0，暂停新开仓（持仓仍管理）", log_every_sec=45.0)
             self._update_state(prices)
             return
 
         # 开仓：对所有符合条件的币对尽可能开单
+        # ── 预生成山寨计划（不管交易开关，让计划看板可见）──
+        for sym in list(_state.get("dynamic_high_vol_alts", [])):
+            if sym not in prices or prices[sym] <= 0:
+                continue
+            await self._ensure_alt_attack_plan(
+                sym, prices[sym],
+                abs(changes.get(sym, 0)),
+                volumes.get(sym, 0),
+                funding_rates.get(sym, 0),
+            )
+
         # ── 开关检查：实盘/模拟盘都需手动开启 ──
         _is_live_mode = self._live and self._live.active
         if _is_live_mode and not self._live_trading_enabled:
@@ -1899,12 +2373,13 @@ class StrategyRunner:
             self._update_state(prices)
             return  # 模拟盘模式但开关关闭，不交易
 
-        # ── Fuse 熔断检查（1分钟波动>3% → PAUSED 5分钟）──
+        # ── Fuse 熔断检查（单币对独立：触发→请求重规划→30秒冷却，不阻塞其他币对）──
         if self._plan_gate:
-            fuse_reason = self._plan_gate.check_fuse(prices)
-            if fuse_reason:
-                self._update_state(prices)
-                return  # 熔断中，跳过本tick
+            triggered = self._plan_gate.check_fuse(prices)
+            if triggered:
+                for sym in triggered:
+                    self._note_tick_block("price_fuse", f"{sym}: {self._plan_gate.fuse_reason_for(sym)}", log_every_sec=15.0)
+                # 不 return — 单币对阻塞在 can_open() 中处理，其他币对继续交易
 
         # ── 启动预热：等K线+行情就绪后再开仓（持仓管理不受影响）──
         _can_open = True
@@ -1936,16 +2411,14 @@ class StrategyRunner:
             scored.append((sym, score, vol, chg_abs))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        # BTC/ETH 优先尝试开仓（分数排序后仍插到队首）
-        scored_stable = [s for s in scored if is_stable(s[0])]
-        scored_alt = [s for s in scored if not is_stable(s[0])]
-        scored = scored_stable + scored_alt
 
         # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
         # 方向判定已内联（读 RangePlan 区间中点判定），无需外部引擎
         if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
             prefetch_tasks = []
             for psym, _, _, _ in scored[:35]:
+                if not trading_track_allows_open(psym):
+                    continue
                 if len(prefetch_tasks) >= 4:
                     break
                 prefetch_tasks.append(
@@ -1961,6 +2434,8 @@ class StrategyRunner:
             # 启动预热中 → 不开新仓
             if not _can_open:
                 break
+            if not trading_track_allows_open(sym):
+                continue
             # 进化引擎：连亏时暂停山寨
             if self._evo_skip_alts and not is_stable(sym):
                 continue
@@ -2004,55 +2479,42 @@ class StrategyRunner:
 
             # ── 读 AI 计划，提取杠杆（完全由 AI 决定） ──
             plan_cache = None
+            if (not is_stable(sym)) and is_high_vol_alt(sym):
+                await self._ensure_alt_attack_plan(sym, px, change, vol, funding_rates.get(sym, 0))
             if self._plan_gate:
                 plan_cache = self._plan_gate.get_plan(sym)
                 if plan_cache:
-                    replan_now, replan_reason = self._should_replan_for_price_drift(sym, plan_cache, px, now)
-                    if replan_now:
-                        self._request_symbol_replan(sym, replan_reason)
-                        continue
+                    if (not is_stable(sym)) and self._is_alt_dynamic_plan(plan_cache):
+                        plan_cache, refreshed, replan_reason = await self._refresh_alt_plan_if_needed(
+                            sym, plan_cache, px, change, vol, funding_rates.get(sym, 0), now
+                        )
+                        if refreshed:
+                            print(f"[山寨计划] {sym} {replan_reason} → 本地进攻计划已刷新", flush=True)
+                    else:
+                        replan_now, replan_reason = self._should_replan_for_price_drift(sym, plan_cache, px, now)
+                        if replan_now:
+                            self._request_symbol_replan(sym, replan_reason)
+                            continue
                     plan_lev = plan_cache.get("leverage", 0)
                     if plan_lev and 1 <= plan_lev <= 125:
-                        lev = int(plan_lev)
+                        lev = self._clamp_leverage_for_config(sym, int(plan_lev), cfg)
             if lev <= 0:
                 continue  # AI 未产出有效杠杆，不交易
-            
-            margin = self._margin_from_plan(plan_cache, cfg, _regime_cfg, chg_abs)
+
+            plan_stick = bool(
+                _plan_authority_enabled()
+                and plan_cache
+                and not self._is_alt_dynamic_plan(plan_cache)
+            )
+
+            margin = self._margin_from_plan(
+                plan_cache, cfg, _regime_cfg, chg_abs, strict_plan=plan_stick
+            )
             if margin <= 0:
                 continue
 
-            # 检查最小下单量（考虑 quanto_multiplier）
-            quanto = spec.quanto_multiplier if spec else 1.0
-            size = (margin * lev) / max(quanto * px, 1e-9)
-            bumped_for_min = False
-            if spec and size < spec.order_size_min:
-                size = spec.order_size_min
-                margin = (size * quanto * px) / lev
-                bumped_for_min = True
-
-            # 山寨：仅当「为凑最小张数」把保证金抬得过高时跳过（避免误伤正常 0.2%～数% 仓）
-            if bumped_for_min and not is_stable(sym):
-                alt_ceiling = max(5.0, self.balance * 0.06)
-                if margin > alt_ceiling:
-                    continue
-
-            # Maker 手续费
-            fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
-            fee = size * quanto * px * fee_rate_maker
-
-            # 余额不够就跳过
-            if margin + fee > self.balance:
-                continue
-
-            # 双轨资金上限：只统计同桶（主流/山寨）已用保证金，避免 BTC+ETH 占仓后山寨永不开单
             cap = get_capital_limit(self.balance, sym)
             st_bucket = is_stable(sym)
-            bucket_used = sum(
-                p["margin"] for s, p in self.positions.items()
-                if is_stable(s) == st_bucket
-            )
-            if bucket_used + margin > cap:
-                continue
 
             entry_price = px  # 默认市价，策略入场在方向确定后调整
 
@@ -2085,6 +2547,8 @@ class StrategyRunner:
 
             # 实际下单为市价；计划层 entry zone 只用于门禁，不由 Python 改写。
             entry_price = px
+            if plan_cache and not self._main_coin_entry_allowed(sym, plan_cache, side, entry_price):
+                continue
 
             # ── FastLoop 计划门禁：无计划/走廊外/熔断/方向不匹配 → 禁止开仓 ──
             if self._plan_gate:
@@ -2092,12 +2556,21 @@ class StrategyRunner:
                 if not can:
                     continue
 
+            quanto = spec.quanto_multiplier if spec else 1.0
+            fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
+
             entry_risk_tag = "标准"
             if plan_cache:
-                margin_mult, lev_cap, entry_risk_tag = self._entry_risk_adjustment(sym, plan_cache, side, entry_price)
+                if plan_stick:
+                    margin_mult, lev_cap, entry_risk_tag = 1.0, 125, "计划锁定"
+                else:
+                    margin_mult, lev_cap, entry_risk_tag = self._entry_risk_adjustment(
+                        sym, plan_cache, side, entry_price
+                    )
                 if margin_mult <= 0 or lev_cap <= 0:
                     continue
                 lev = max(1, min(int(lev), int(lev_cap)))
+                lev = self._clamp_leverage_for_config(sym, lev, cfg)
                 margin *= margin_mult
 
                 size = (margin * lev) / max(quanto * entry_price, 1e-9)
@@ -2124,7 +2597,14 @@ class StrategyRunner:
             _live_oid = None
             _is_live = self._live and self._live.active
             mode = "live" if (_is_live and self._live_trading_enabled) else "paper"
-            
+            if mode == "live" and self._live and self._live.active and not self._live.is_healthy:
+                self._note_tick_block(
+                    "live_api",
+                    "实盘引擎已连续报单错误熔断，本轮跳过开仓",
+                    log_every_sec=20.0,
+                )
+                continue
+
             _ct_size = max(1, int(size))
             cmd = build_order_command(
                 symbol=sym, side=side, size=_ct_size, leverage=lev,
@@ -2155,10 +2635,11 @@ class StrategyRunner:
                 "plan_tp": _plan_tp,  # AI计划精确止盈价
                 "plan_signature": self._plan_signature(plan_cache, side) if plan_cache else None,
                 "entry_risk_tag": entry_risk_tag,
+                "plan_stick": plan_stick,
             }
             
             # AI分析（异步，不阻塞开仓）
-            if AI_ENABLED and SHARK_SIGNAL_SOURCE == "ai":
+            if AI_ENABLED and SHARK_SIGNAL_SOURCE == "ai" and not plan_stick:
                 asyncio.create_task(self._fetch_ai_plan(sym, px,
                                         funding_rates.get(sym, 0),
                                         changes.get(sym, 0), vol))
@@ -2231,26 +2712,27 @@ class StrategyRunner:
         self._update_state(prices)
 
     def _close_position(self, sym, px, reason, pnl_pct, prices=None):
-        # ── 实盘平仓 → Redis 发布给 Go 执行器 ──
+        # ── 统一平仓通道：实盘给 executor，纸盘给 matcher，避免撮合流只有 open 没有 close ──
         _live_close_ok = True
         _live_close_px = px
-        if self._live and self._live.active and self._live_trading_enabled:
-            lp = self.positions.get(sym)
-            if lp:
-                cmd = build_order_command(
-                    symbol=sym,
-                    side=lp["side"],
-                    action="close",
-                    mode="live",
-                    size=max(1, int(lp.get("size", 1))),
-                    leverage=max(1, int(lp.get("leverage", 1))),
-                )
-                try:
-                    import redis as _redis
-                    _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
-                    _r.publish("shark:orders:new", cmd)
-                except Exception as e:
-                    _log.error("Redis close publish failed: %s", e)
+        lp = self.positions.get(sym)
+        close_mode = "live" if (self._live and self._live.active and self._live_trading_enabled) else "paper"
+        if lp:
+            cmd = build_order_command(
+                symbol=sym,
+                side=lp["side"],
+                action="close",
+                mode=close_mode,
+                size=max(1, int(lp.get("size", 1))),
+                leverage=max(1, int(lp.get("leverage", 1))),
+            )
+            try:
+                import redis as _redis
+                _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                _r.publish("shark:orders:new", cmd)
+            except Exception as e:
+                _log.error("Redis close publish failed: %s", e)
+                if close_mode == "live":
                     _live_close_ok = False
                     _log.error("🔥 实盘平仓失败 %s, 人工介入!", sym)
 
@@ -2308,7 +2790,30 @@ class StrategyRunner:
             "opened_at": pos["opened"], "closed_at": closed_ts,
             "signal_src": pos.get("signal_src", ""),
             "ai_confidence": pos.get("ai_confidence", 0),
+            "exit_type": "tp" if realized > 0 else ("sl" if pnl_pct < -0.01 else "timeout"),
         })
+        # ── 山寨币独立进化：每笔平仓追踪该币对质量 ──
+        if not is_stable(sym) and is_high_vol_alt(sym):
+            evo = self._alt_evo.get(sym)
+            if evo:
+                if realized > 0:
+                    evo["wins"] += 1
+                elif pnl_pct < -0.01:
+                    evo["stops"] += 1
+                if evo["plans"] >= 6 and evo["plans"] % 6 == 0:
+                    total = max(1, evo["wins"] + evo["stops"])
+                    wr = evo["wins"] / max(1, total)
+                    sr = evo["stops"] / max(1, total)
+                    if sr > 0.5:
+                        evo["stop_mult"] = min(1.4, evo["stop_mult"] + 0.15)
+                        evo["atr_mult"] = max(0.6, evo["atr_mult"] - 0.1)
+                    if wr < 0.35:
+                        evo["atr_mult"] = max(0.5, evo["atr_mult"] - 0.1)
+                    if wr > 0.6:
+                        evo["tp_mult"] = min(1.5, evo["tp_mult"] + 0.1)
+                    evo["gen"] += 1
+                    print(f"[山寨进化] {sym} gen={evo['gen']} trades={total} wr={wr:.1%} sr={sr:.1%} "
+                          f"atr×{evo['atr_mult']:.2f} stop×{evo['stop_mult']:.2f} tp×{evo['tp_mult']:.2f}", flush=True)
         # 发布到 Redis 供 Go 进化引擎消费
         try:
             import redis as _redis2
@@ -2461,10 +2966,55 @@ class StrategyRunner:
         _state["symbol_count"] = len(prices)
         _state["total_fees"] = self.total_fees
         _state["gross_realized"] = self.gross_realized  # 毛利累计
+
+        # 定期快照到磁盘（崩溃恢复用，每10秒）
+        if int(time.time()) % 10 == 0:
+            try:
+                from execution.prod_utils import save_snapshot
+                save_snapshot(_state)
+            except Exception:
+                pass
         _state["total_slippage"] = self.total_slippage
         _state["trade_history"] = _trade_history_for_state(self)
         _state["margin_locked"] = locked
         _state["position_list"] = _position_list_for_state(self, prices)
+
+        fuse_active = bool(self._plan_gate and self._plan_gate.is_fused)
+        _state["safety_blocked"] = fuse_active
+        fr = ""
+        if fuse_active and self._plan_gate:
+            fr = str(getattr(self._plan_gate, "fuse_reason", "") or "")
+        _state["fuse_reason"] = fr
+
+        live_api_ok = True
+        if self._live and self._live.active:
+            live_api_ok = bool(self._live.is_healthy)
+        _state["live_api_ok"] = live_api_ok
+
+        block: Optional[dict] = None
+        if fuse_active:
+            block = {
+                "code": "price_fuse",
+                "detail": (fr[:300] if fr else "1分钟价格波动>3%，约5分钟内暂停新开仓"),
+                "ts": time.time(),
+            }
+        elif not live_api_ok:
+            block = {
+                "code": "live_api",
+                "detail": "Gate 连续报单错误≥3次，已暂停新开仓（持仓仍按价格管理）",
+                "ts": time.time(),
+            }
+        elif self._last_tick_block:
+            block = dict(self._last_tick_block)
+        _state["last_tick_block"] = block
+
+        if self._plan_gate:
+            try:
+                raw = self._plan_gate._redis.get("shark:planning:status")
+                if raw:
+                    _state["planning_status"] = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+            except Exception:
+                pass
 
         # 反思器状态供API/战报使用
         if self._reflector:
@@ -2552,21 +3102,55 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
 
     _kline_inited = False
     _tick = 0
+    _cached_hot_alts: List[str] = []
+    _last_alt_refresh = 0.0
+    ALT_REFRESH_SEC = 600  # 山寨池每10分钟全量重扫
+
     while True:
         try:
             _tick += 1
-            symbols = await fetch_top_symbols(n=30)
-            # 强制加入 BTC/ETH，山寨只保留高波动精选
-            MUST_HAVE = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-            for m in MUST_HAVE:
-                if m not in symbols:
-                    symbols.insert(0, m)
-            # 过滤山寨：只保留高波动精选
-            symbols = [s for s in symbols if is_stable(s) or is_high_vol_alt(s)]
+            _trk = trading_track()
+            now = time.time()
+
+            # ── 山寨池刷新：每10分钟重扫Gate.io，替换高波币对 ──
+            if _trk in ("dual", "volatile") and now - _last_alt_refresh >= ALT_REFRESH_SEC:
+                try:
+                    hot_alts = await fetch_hot_volatile_symbols(n=18)
+                    set_dynamic_high_vol_alts(hot_alts)
+                    _cached_hot_alts = list(hot_alts)
+                    _last_alt_refresh = now
+                    if hot_alts:
+                        print(f"[山寨池] 10分钟刷新: {len(hot_alts)}个高波币 {hot_alts[:3]}...", flush=True)
+                except Exception as e:
+                    print(f"[山寨池] 刷新失败: {e}，沿用旧池", flush=True)
+
+            if _trk == "stable":
+                set_dynamic_high_vol_alts([])
+                _cached_hot_alts = []
+                symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+            elif _trk == "volatile":
+                symbols = list(_cached_hot_alts)
+                if not symbols:
+                    if _tick % 60 == 1:
+                        print("[volatile] 山寨池暂空，等待刷新...", flush=True)
+                    await asyncio.sleep(interval)
+                    continue
+            else:
+                symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"] + _cached_hot_alts
             # 去重保持顺序
             seen = set()
             symbols = [s for s in symbols if not (s in seen or seen.add(s))]
-            await feed.refresh(symbols)
+            _state["dynamic_high_vol_alts"] = list(_cached_hot_alts)
+            if _tick == 1:
+                _trk_label = {"dual": "双轨(主流+山寨)", "stable": "单线·仅主流", "volatile": "单线·仅山寨池"}.get(
+                    _trk, _trk
+                )
+                print(f"🛤️ SHARK_TRADING_TRACK={_trk} → {_trk_label}", flush=True)
+            # 价格由 price_feed_loop 维护，trading_loop 只读缓存
+            prices = dict(feed.get_prices())
+            for psym, pos in runner.positions.items():
+                if psym not in prices or prices.get(psym, 0) <= 0:
+                    prices[psym] = float(pos.get("entry", 0) or 0)
             
             # 初始化K线缓存（首次）
             if not _kline_inited:
@@ -2591,13 +3175,13 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                             await kc.update(s)
                 except Exception:
                     pass
-            prices = feed.get_prices()
             volumes = {s: t.volume_24h for s, t in feed._cache.items()}
             changes = feed.get_changes()
             funding_rates = feed.get_funding_rates()
             mark_prices = feed.get_mark_prices()
             await runner.tick(prices, volumes, changes, funding_rates, mark_prices)
             _state["symbols"] = list(symbols)
+            _state["trading_track"] = _trk
 
         except Exception as e:
             _log.error("交易循环: %s", e, exc_info=True)
@@ -2615,6 +3199,12 @@ async def main():
     _, session_factory = create_engine_and_sessionmaker()
     repo = AccountRepository(session_factory) if session_factory else None
     redis_url = os.environ.get("SHARK_REDIS_URL", "").strip()
+
+    # ── 启动等待依赖服务就绪 ──
+    from execution.prod_utils import wait_for_redis, load_snapshot
+    if redis_url:
+        wait_for_redis(redis_url, timeout=60)
+
     redis_client = await create_redis(redis_url) if redis_url else None
     _storage_bridge = PersistenceBridge(repository=repo, redis_client=redis_client)
     if repo:
@@ -2623,13 +3213,25 @@ async def main():
         _log.info("Redis enabled (state cache + gate REST rate limit)")
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
-    runner = StrategyRunner(initial_balance=200.0, persistence=_storage_bridge)
+    runner = StrategyRunner(initial_balance=500.0, persistence=_storage_bridge)
     # FastLoop 门禁注入
     if redis_client:
         from execution.plan_gate import PlanGate
-        # PlanGate 需要 sync Redis 客户端（async 客户端在同步上下文中不可用）
         import redis as sync_redis
         sync_rdb = sync_redis.from_url(redis_url or "redis://redis:6379/0", decode_responses=True)
+
+        # ── 启动时清空所有计划，触发 Go planner 重新生成 ──
+        try:
+            old_keys = list(sync_rdb.scan_iter(match="shark:plan:*", count=100))
+            if old_keys:
+                sync_rdb.delete(*old_keys)
+                print(f"[启动] 已清除 {len(old_keys)} 个旧计划", flush=True)
+            # 通知 Go planner 立即重新 Bootstrap
+            for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+                sync_rdb.publish("shark:plan:replan", json.dumps({"symbol": sym}))
+        except Exception as e:
+            print(f"[启动] 计划清理失败: {e}", flush=True)
+
         runner._plan_gate = PlanGate(sync_rdb)
         _state["_plan_gate"] = runner._plan_gate
         _state["_redis_client"] = redis_client  # 供 Plans API 直接读取（async）
@@ -2647,7 +3249,13 @@ async def main():
     )
     server = uvicorn.Server(config)
 
-    print(f"\U0001f988 Shark 2.0 启动成功 :{port}", flush=True)
+    print(f"🦈 Shark 2.0 启动成功 :{port}", flush=True)
+    # 启动告警
+    try:
+        from execution.prod_alert import _send_slack
+        asyncio.create_task(_send_slack("🟢 [Shark] 系统启动 paper模式 初始$500"))
+    except Exception:
+        pass
     
     # 启动状态一览
     _shark_mode = os.environ.get("SHARK_MODE", "paper").lower()

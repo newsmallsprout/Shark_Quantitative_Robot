@@ -1,20 +1,24 @@
-"""FastLoop 门禁：读取 RangePlan → 判断是否允许开仓 / 熔断检查"""
+"""FastLoop 门禁：读取 RangePlan → 判断是否允许开仓 / 单币对熔断检查"""
 import json
 import time
 from typing import Optional, Dict, List, Tuple
 
 
 class PlanGate:
-    """从 Redis 读取 RangePlan，在每个 tick 判断是否允许开仓"""
+    """从 Redis 读取 RangePlan，在每个 tick 判断是否允许开仓。
+    v2: 单币对独立熔断 — 一个币对异常不阻塞其他币对交易。触发后自动请求重规划。"""
+
+    FUSE_COOLDOWN = 30  # 熔断冷却秒数（留给 Go planner 重规划时间）
 
     def __init__(self, redis_client):
         self._redis = redis_client
         self._plan_cache: Dict[str, dict] = {}
         self._last_fetch: Dict[str, float] = {}
-        self._fuse_paused_until = 0.0
-        self._fuse_reason = ""
+        self._fuse_per_symbol: Dict[str, dict] = {}  # {symbol: {triggered_at, reason, chg_pct}}
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
         self._last_all_fetch = 0.0
+
+    # ── 计划读取 ──
 
     def get_plan(self, symbol: str) -> Optional[dict]:
         now = time.time()
@@ -49,13 +53,25 @@ class PlanGate:
             pass
         return dict(self._plan_cache)
 
-    def check_fuse(self, prices: Dict[str, float]) -> Optional[str]:
+    # ── 单币对独立熔断 ──
+
+    def check_fuse(self, prices: Dict[str, float]) -> Optional[List[str]]:
+        """追踪每币对价格历史。触发熔断时：
+        1. 标记该币对熔断（30秒冷却）
+        2. 向 Go planner 发送重规划请求（Redis pub/sub）
+        3. 返回新触发币对列表（供日志记录）
+        
+        不再全局阻塞 — 单币对阻塞在 can_open() 中处理。
+        """
         now = time.time()
-        if self._fuse_paused_until > 0 and now > self._fuse_paused_until:
-            self._fuse_paused_until = 0
-            self._fuse_reason = ""
-        if self._fuse_paused_until > now:
-            return self._fuse_reason
+
+        # 清理过期熔断
+        expired = [sym for sym, fs in self._fuse_per_symbol.items()
+                   if now - fs["triggered_at"] >= self.FUSE_COOLDOWN]
+        for sym in expired:
+            del self._fuse_per_symbol[sym]
+
+        # 追踪价格历史
         for sym, px in prices.items():
             if px <= 0:
                 continue
@@ -64,10 +80,23 @@ class PlanGate:
             self._price_history[sym].append((now, px))
             cutoff = now - 90
             self._price_history[sym] = [(t, p) for t, p in self._price_history[sym] if t > cutoff]
+
+        # 检测各币对熔断（只检查有计划的币对）
+        triggered = []
         for sym, px in prices.items():
+            if sym in self._fuse_per_symbol:
+                continue  # 已在熔断冷却中
+
+            # 无计划 → 不检查熔断（该币对不在交易范围内）
+            plan = self.get_plan(sym)
+            if plan is None:
+                continue
+
             hist = self._price_history.get(sym, [])
             if len(hist) < 2:
                 continue
+
+            # 找 ~1分钟前的价格
             px_1m_ago = None
             for t, p in reversed(hist):
                 if now - t >= 55:
@@ -75,31 +104,89 @@ class PlanGate:
                     break
             if px_1m_ago is None or px_1m_ago <= 0:
                 continue
+
             chg_pct = abs((px - px_1m_ago) / px_1m_ago) * 100
-            if chg_pct > 3.0:
-                self._fuse_paused_until = now + 300
-                self._fuse_reason = f"{sym} 1分钟波动{chg_pct:.1f}% > 3%阈值"
-                return self._fuse_reason
-        return None
+            # 从计划中读取该币对的自适应熔断阈值
+            threshold = plan.get("fuse_threshold_pct", 3.0)
+            if chg_pct > threshold:
+                self._fuse_per_symbol[sym] = {
+                    "triggered_at": now,
+                    "reason": f"1分钟波动{chg_pct:.1f}% > {threshold:.1f}%阈值",
+                    "chg_pct": chg_pct,
+                }
+                # 请求 Go planner 重规划该币对
+                try:
+                    self._redis.publish("shark:plan:replan", json.dumps({"symbol": sym}))
+                except Exception:
+                    pass
+                triggered.append(sym)
+
+        return triggered if triggered else None
+
+    def is_fused_for(self, symbol: str) -> bool:
+        """检查指定币对是否在熔断冷却中"""
+        fs = self._fuse_per_symbol.get(symbol)
+        if fs is None:
+            return False
+        if time.time() - fs["triggered_at"] >= self.FUSE_COOLDOWN:
+            del self._fuse_per_symbol[symbol]
+            return False
+        return True
+
+    def fuse_reason_for(self, symbol: str) -> str:
+        """返回指定币对熔断原因"""
+        fs = self._fuse_per_symbol.get(symbol)
+        if fs and self.is_fused_for(symbol):
+            return fs.get("reason", "")
+        return ""
 
     @property
     def is_fused(self) -> bool:
-        return self._fuse_paused_until > time.time()
+        """是否有任何币对在熔断中（前端面板聚合用）"""
+        self.check_fuse({})  # 触发过期清理
+        return len(self._fuse_per_symbol) > 0
 
     @property
     def fuse_remaining(self) -> float:
-        return max(0, self._fuse_paused_until - time.time()) if self.is_fused else 0
+        """最长剩余熔断秒数（前端面板用）"""
+        now = time.time()
+        max_rem = 0.0
+        for sym, fs in list(self._fuse_per_symbol.items()):
+            rem = self.FUSE_COOLDOWN - (now - fs["triggered_at"])
+            if rem > max_rem:
+                max_rem = rem
+            elif rem <= 0:
+                del self._fuse_per_symbol[sym]
+        return max(0, max_rem)
 
     @property
     def fuse_reason(self) -> str:
-        return self._fuse_reason if self.is_fused else ""
+        """所有熔断币对的汇总原因（前端面板用）"""
+        reasons = []
+        for sym, fs in list(self._fuse_per_symbol.items()):
+            if self.is_fused_for(sym):
+                reasons.append(f"{sym}: {fs.get('reason', '')}")
+        return "; ".join(reasons) if reasons else ""
+
+    def get_fused_symbols(self) -> Dict[str, dict]:
+        """返回所有熔断中币对的状态（供 API 和前端面板使用）"""
+        result = {}
+        for sym, fs in list(self._fuse_per_symbol.items()):
+            if self.is_fused_for(sym):
+                result[sym] = {
+                    "reason": fs.get("reason", ""),
+                    "remaining": max(0, self.FUSE_COOLDOWN - (time.time() - fs["triggered_at"])),
+                    "chg_pct": fs.get("chg_pct", 0),
+                }
+        return result
 
     # ── 开仓门禁 ──
 
     def can_open(self, symbol: str, side: str, px: float) -> tuple:
         """判断是否允许开仓。返回 (允许:bool, 原因:str)"""
-        if self.is_fused:
-            return False, f"熔断保护中({self._fuse_reason})"
+        # 单币对熔断检查（不再全局）
+        if self.is_fused_for(symbol):
+            return False, f"熔断保护中({self.fuse_reason_for(symbol)})"
 
         plan = self.get_plan(symbol)
         if plan is None:

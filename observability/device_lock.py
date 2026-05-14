@@ -25,6 +25,7 @@ _log = logging.getLogger(__name__)
 
 _DENY_BODY: bytes = b""
 _LOCK_ENABLED: bool = False
+_SERVER_MODE: bool = False
 _ALLOWED_IPS: FrozenSet[str] = frozenset()
 _ALLOW_PRIVATE: bool = True
 _TRUST_XFF: bool = False
@@ -51,7 +52,8 @@ def init_device_lock(repo_root: Path) -> None:
     global _ALLOWED_CIDRS
 
     _LOCK_ENABLED = _truthy(os.environ.get("SHARK_DEVICE_LOCK", ""))
-    _TRUST_XFF = _truthy(os.environ.get("SHARK_TRUST_X_FORWARDED_FOR", ""))
+    _SERVER_MODE = _truthy(os.environ.get("SHARK_SERVER_MODE", ""))
+    _TRUST_XFF = _truthy(os.environ.get("SHARK_TRUST_X_FORWARDED_FOR", "")) or _SERVER_MODE
     raw_ap = os.environ.get("SHARK_DEVICE_LOCK_ALLOW_PRIVATE")
     if raw_ap is None or str(raw_ap).strip() == "":
         _ALLOW_PRIVATE = False
@@ -104,7 +106,8 @@ def init_device_lock(repo_root: Path) -> None:
 
     if _LOCK_ENABLED:
         _log.warning(
-            "[device_lock] 已启用 allow_private=%s trust_xff=%s allowed_ips=%s cidrs=%s mac_norm=%s deny_png=%dB",
+            "[device_lock] %s allow_private=%s trust_xff=%s allowed_ips=%s cidrs=%s mac_norm=%s deny_png=%dB",
+            "SERVER_MODE" if _SERVER_MODE else "已启用",
             _ALLOW_PRIVATE,
             _TRUST_XFF,
             sorted(_ALLOWED_IPS),
@@ -235,7 +238,7 @@ def _http_path_exempt_from_mac(path: str) -> bool:
     """首页与静态资源请求在浏览器里无法带自定义 Header；仅校验 IP；JS 执行后再对 API 带 MAC。"""
     if path in ("", "/"):
         return True
-    if path == "/api/bootstrap.js" or path == "/api/health":
+    if path == "/api/bootstrap.js" or path == "/api/health" or path == "/health":
         return True
     # 只读接口：旧版内联脚本或外部工具可能只带 Bearer 不带 MAC；IP 已放行时不再强制 MAC
     if path == "/api/live/status" or path == "/api/evo/pending":
@@ -265,7 +268,8 @@ def http_request_check(request: Request) -> Tuple[bool, str]:
             f"若在 Docker/Cloudflare Tunnel 下日志里出现 172.64.x.x 等，请把该 IP 写入 SHARK_ALLOWED_IPS "
             f"或使用 SHARK_ALLOWED_CIDRS（见 .env.example）"
         )
-    if _ALLOWED_MAC_NORM and not _http_path_exempt_from_mac(request.url.path):
+    # 服务器模式跳过 MAC 检查（远程浏览器 MAC 不可控），其余安全限制不变
+    if not _SERVER_MODE and _ALLOWED_MAC_NORM and not _http_path_exempt_from_mac(request.url.path):
         got = _mac_from_request(request)
         if got != _ALLOWED_MAC_NORM:
             return False, f"mac mismatch path={request.url.path!r} got={got!r} need={_ALLOWED_MAC_NORM!r}"

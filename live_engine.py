@@ -33,26 +33,38 @@ def _gate_headers(method: str, path: str, query: str = "", body: str = "") -> di
     }
 
 
-def _api(method: str, path: str, body: dict = None, query: str = "", timeout: int = 10) -> dict:
-    """调用 Gate.io API，返回 JSON"""
+def _api(method: str, path: str, body: dict = None, query: str = "", timeout: int = 10,
+        retries: int = 3) -> dict:
+    """调用 Gate.io API，带指数退避重试"""
     import urllib.request, urllib.error
     url = f"{GATE_BASE}{path}"
     if query:
         url += f"?{query}"
     data = json.dumps(body) if body else ""
-    # Gate.io v4 签名需要完整 API 路径 + query
     full_path = f"/api/v4/futures/usdt{path}"
     headers = _gate_headers(method, full_path, query=query, body=data)
 
-    req = urllib.request.Request(url, data=data.encode() if data else None,
-                                  headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()
-        _log.error("Gate API %s %s → %s %s", method, path, e.code, err[:200])
-        raise
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=data.encode() if data else None,
+                                          headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            err = e.read().decode()
+            last_err = e
+            _log.error("Gate API %s %s → %s %s (attempt %d/%d)",
+                       method, path, e.code, err[:200], attempt + 1, retries + 1)
+            if attempt < retries:
+                time.sleep(1.0 * (2 ** attempt))  # 1s, 2s, 4s
+        except Exception as e:
+            last_err = e
+            _log.error("Gate API %s %s network error: %s (attempt %d/%d)",
+                       method, path, e, attempt + 1, retries + 1)
+            if attempt < retries:
+                time.sleep(1.5 * (2 ** attempt))
+    raise last_err
 
 
 # ═══════════════════════════════════════════════
@@ -221,7 +233,7 @@ class LiveEngine:
             self._consecutive_errors += 1
             return False, 0
 
-    # ── 持仓同步 ──
+    # ── 持仓同步 + 对账恢复 ──
 
     def sync_positions(self) -> Dict[str, dict]:
         """
@@ -248,6 +260,31 @@ class LiveEngine:
         except Exception as e:
             _log.error("持仓同步失败: %s", e)
             return {}
+
+    def reconcile(self, memory_positions: dict) -> list:
+        """对账：内存持仓 vs 交易所持仓，返回不一致列表"""
+        try:
+            exchange = self.sync_positions()
+        except Exception:
+            return []
+        mismatches = []
+        # 内存有但交易所无
+        for sym, pos in memory_positions.items():
+            if sym not in exchange:
+                mismatches.append(f"{sym}: 内存有({pos.get('side','?')}) 交易所无")
+        # 交易所有但内存无
+        for sym in exchange:
+            if sym not in memory_positions:
+                mismatches.append(f"{sym}: 交易所有({exchange[sym]['side']}) 内存无")
+        # 方向不一致
+        for sym in set(memory_positions) & set(exchange):
+            m_side = memory_positions[sym].get("side", "")
+            e_side = exchange[sym]["side"]
+            if m_side != e_side:
+                mismatches.append(f"{sym}: 内存={m_side} 交易所={e_side}")
+        if mismatches:
+            _log.error("持仓对账不一致: %s", "; ".join(mismatches))
+        return mismatches
 
     # ── 账户余额 ──
 

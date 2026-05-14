@@ -78,6 +78,9 @@ type RangePlan struct {
 	NewsRiskLevel int      `json:"news_risk_level"` // 0=正常, 1=警告, 2=熔断
 	RiskFlags     []string `json:"risk_flags"`
 
+	// 熔断阈值（ATR自适应，不同波动率的币对用不同阈值）
+	FuseThresholdPct float64 `json:"fuse_threshold_pct"` // 1分钟波动>此%触发熔断，范围3.0-12.0
+
 	// 宏观联动
 	MacroRegime Regime  `json:"macro_regime"`
 	FundingRate float64 `json:"funding_rate"`

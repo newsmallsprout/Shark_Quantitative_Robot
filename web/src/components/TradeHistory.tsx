@@ -5,7 +5,7 @@ const PAGE_SIZE = 20
 interface TradeRecord {
   symbol: string; side: string; entry_price: number; exit_price: number;
   size: number; leverage: number; margin: number; realized_pnl: number;
-  pnl_pct: number; reason: string; fee_open: number; fee_close: number;
+  gross_pnl?: number; pnl_pct: number; reason: string; fee_open: number; fee_close: number;
   opened_at: number; closed_at: number;
 }
 
@@ -39,6 +39,10 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
   const pageRows = ordered.slice(start, start + PAGE_SIZE)
   const showFrom = total ? start + 1 : 0
   const showTo = Math.min(start + PAGE_SIZE, total)
+  const feeTotal = (t: TradeRecord) => Number(t.fee_open || 0) + Number(t.fee_close || 0)
+  const grossPnl = (t: TradeRecord) => Number.isFinite(Number(t.gross_pnl))
+    ? Number(t.gross_pnl)
+    : Number(t.realized_pnl || 0) + feeTotal(t)
 
   return (
     <div style={{ overflowX: 'auto' }}>
@@ -86,7 +90,9 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
             <th style={{ textAlign: 'right' }}>入场</th>
             <th style={{ textAlign: 'right' }}>出场</th>
             <th style={{ textAlign: 'right' }}>杠杆</th>
-            <th style={{ textAlign: 'right' }}>盈亏</th>
+            <th style={{ textAlign: 'right' }}>毛利润</th>
+            <th style={{ textAlign: 'right' }}>手续费</th>
+            <th style={{ textAlign: 'right' }}>净利润</th>
             <th>原因</th>
           </tr>
         </thead>
@@ -109,6 +115,12 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
                 ${t.exit_price?.toFixed(4)}
               </td>
               <td style={{ textAlign: 'right' }}>{t.leverage}x</td>
+              <td style={{ textAlign: 'right' }} className={grossPnl(t) >= 0 ? 'pnl-up' : 'pnl-down'}>
+                {grossPnl(t) >= 0 ? '+' : ''}{grossPnl(t).toFixed(4)}
+              </td>
+              <td style={{ textAlign: 'right', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                -{feeTotal(t).toFixed(4)}
+              </td>
               <td style={{ textAlign: 'right' }} className={t.realized_pnl >= 0 ? 'pnl-up' : 'pnl-down'}>
                 {t.realized_pnl >= 0 ? '+' : ''}{t.realized_pnl?.toFixed(4)}
               </td>

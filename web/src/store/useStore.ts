@@ -46,6 +46,9 @@ export interface Status {
   equity: number; balance: number; free_cash: number; positions: number;
   realized_pnl: number; win_rate: number;
   safety_blocked: boolean; mode: string;
+  fuse_reason?: string
+  live_api_ok?: boolean
+  last_tick_block?: { code: string; detail: string; ts?: number } | null
   initial_capital: number;
   unrealized_pnl: number;
   position_list: Position[];
@@ -64,6 +67,30 @@ export interface Status {
   shark_mode: 'paper' | 'live'
   /** 待审批进化修改 */
   evo_pending?: EvoChange[]
+  /** Gate 接口动态筛出的高波动山寨池 */
+  dynamic_high_vol_alts?: string[]
+  /** 当前双轨策略配置摘要 */
+  strategy_profile?: StrategyProfile
+  /** Go 计划服务当前重规划状态 */
+  planning_status?: PlanningStatus
+}
+
+export interface PlanningStatus {
+  active?: boolean
+  phase?: string
+  symbol?: string
+  message?: string
+  done?: number
+  total?: number
+  ts?: number
+}
+
+export interface StrategyProfile {
+  stable_capital_pct?: number
+  alt_capital_pct?: number
+  stable_profile?: string
+  alt_profile?: string
+  alt_plan_ttl_sec?: number
 }
 
 export interface EvoChange {
@@ -86,7 +113,11 @@ export const useStore = create<Store>((set) => ({
     equity: 100, balance: 100, free_cash: 100, positions: 0,
     initial_capital: 100, unrealized_pnl: 0,
     realized_pnl: 0, win_rate: 0,
-    safety_blocked: false, mode: 'Paper',
+    safety_blocked: false,
+    fuse_reason: '',
+    live_api_ok: true,
+    last_tick_block: null,
+    mode: 'Paper',
     position_list: [],
     live_prices: {},
     total_fees: 0,
@@ -96,6 +127,9 @@ export const useStore = create<Store>((set) => ({
     live: undefined,
     paper: { active: true, trading_enabled: false },
     shark_mode: 'paper',
+    dynamic_high_vol_alts: [],
+    planning_status: { active: false, phase: 'idle', message: '等待计划刷新', done: 0, total: 0 },
+    strategy_profile: undefined,
   },
   connected: false,
   setStatus: (s) => set((st) => ({ status: { ...st.status, ...s } })),
