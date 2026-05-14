@@ -347,6 +347,44 @@ body::before {
   color: #00ff88 !important;
   text-shadow: 0 0 8px rgba(0, 255, 136, 0.35);
 }
+.payment-qr-rail {
+  position: fixed;
+  left: 14px;
+  top: 78px;
+  width: 190px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 12px;
+  border: 1px solid rgba(0, 240, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(8, 12, 24, 0.62);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 0 24px rgba(0, 240, 255, 0.08);
+}
+.payment-qr-rail__title {
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.16em;
+  color: var(--accent-cyan);
+  text-align: center;
+  text-transform: uppercase;
+  font-family: var(--font-display);
+}
+.payment-qr-rail__item {
+  border: 1px solid rgba(0, 240, 255, 0.14);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.92);
+}
+.payment-qr-rail__item img {
+  display: block;
+  width: 100%;
+  height: 166px;
+  object-fit: contain;
+}
 .topbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .topbar-controls-trading {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -498,6 +536,9 @@ body::before {
 }
 
 @media (max-width: 900px) {
+  .payment-qr-rail {
+    display: none;
+  }
   .layout-room-risk {
     grid-template-columns: 1fr;
   }

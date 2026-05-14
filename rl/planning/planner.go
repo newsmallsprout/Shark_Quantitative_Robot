@@ -122,6 +122,9 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 	if plan == nil {
 		return nil // 无价格数据，跳过
 	}
+	if p.prices[symbol] > 0 {
+		plan.PlanPrice = p.prices[symbol]
+	}
 	plan.GeneratedAt = time.Now().Unix()
 	plan.ValidUntil = plan.GeneratedAt + 1800
 	plan.EvoGen = p.evo.Generation
@@ -559,6 +562,7 @@ func (p *Planner) tryAIBuild(ctx context.Context, symbol string, px, atr float64
 	}
 
 	// 基于 AI 的区间调用 clampPlan
+	widenBothSideStops(plan, atr)
 	clampPlan(plan, px)
 	return plan, nil
 }
@@ -711,11 +715,26 @@ func applyQuickProfitWideStop(plan *RangePlan, px, atr float64) {
 		if shortEntry <= 0 {
 			shortEntry = px * 1.005
 		}
-		plan.LongStopLoss = longEntry - stopDistance
 		plan.LongTakeProfit = []float64{longEntry + firstTP, longEntry + secondTP}
-		plan.ShortStopLoss = shortEntry + stopDistance
 		plan.ShortTakeProfit = []float64{shortEntry - firstTP, shortEntry - secondTP}
+		widenBothSideStops(plan, atr)
 	}
+}
+
+func widenBothSideStops(plan *RangePlan, atr float64) {
+	if plan == nil || plan.Bias != "both" || atr <= 0 {
+		return
+	}
+	stopDistance := atr * 2.4
+	longEntry := (plan.LongEntryLow + plan.LongEntryHigh) / 2
+	if longEntry > 0 && (plan.LongStopLoss <= 0 || longEntry-plan.LongStopLoss < stopDistance) {
+		plan.LongStopLoss = longEntry - stopDistance
+	}
+	shortEntry := (plan.ShortEntryLow + plan.ShortEntryHigh) / 2
+	if shortEntry > 0 && (plan.ShortStopLoss <= 0 || plan.ShortStopLoss-shortEntry < stopDistance) {
+		plan.ShortStopLoss = shortEntry + stopDistance
+	}
+	plan.StopLoss = plan.LongStopLoss
 }
 
 func clampPlan(plan *RangePlan, px float64) {
@@ -761,6 +780,7 @@ func clampPlan(plan *RangePlan, px float64) {
 		}
 		plan.EntryZoneLow = plan.LongEntryLow
 		plan.EntryZoneHigh = plan.ShortEntryHigh
+		widenBothSideStops(plan, plan.ATR14)
 		plan.StopLoss = plan.LongStopLoss
 		return
 	}

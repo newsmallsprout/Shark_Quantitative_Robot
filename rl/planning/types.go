@@ -59,6 +59,7 @@ type RangePlan struct {
 	// 价格区间
 	RangeLow  float64 `json:"range_low"`
 	RangeHigh float64 `json:"range_high"`
+	PlanPrice float64 `json:"plan_price"` // 生成计划时的参考价格，用于 FastLoop 漂移重规划
 
 	// 入场带
 	EntryZoneLow  float64 `json:"entry_zone_low"`

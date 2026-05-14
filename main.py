@@ -327,6 +327,7 @@ def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float])
             "unrealized_pnl": _finite_float(unrealized),
             "pnl_pct": _finite_float(pnl_pct),
             "current_price": px,
+            "entry_risk_tag": str(pos.get("entry_risk_tag", "")),
         })
     return out
 
@@ -790,6 +791,11 @@ _public_dir = ROOT / "web" / "public"
 if _public_dir.exists():
     app.mount("/public", StaticFiles(directory=str(_public_dir)), name="public")
 
+# Mount repo static assets (device-deny image, payment QR codes, etc.)
+_static_dir = ROOT / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
 # 宠物舱 MP4：依次尝试 web/video → 仓库根 video → 构建产物 dist/video
 _pet_video_dir = next(
     (
@@ -933,6 +939,8 @@ class StrategyRunner:
         self._evo_cooldown_bonus = 0        # 进化额外冷却
         self._persistence = persistence
         self._plan_gate = None  # FastLoop 门禁，由 main() 注入
+        self._loss_replay_guard: Dict[str, dict] = {}
+        self._price_replan_last: Dict[str, float] = {}
 
     def switch_mode(self, mode: str) -> dict:
         """运行时切换 paper/live 模式，重新初始化实盘引擎"""
@@ -983,6 +991,8 @@ class StrategyRunner:
         self._open_timestamps.clear()
         self._ai_signal_cache.clear()
         self._regime_cache.clear()
+        self._loss_replay_guard.clear()
+        self._price_replan_last.clear()
         self.realized_pnl = 0.0
         self.gross_realized = 0.0
         self.total_fees = 0.0
@@ -1302,6 +1312,143 @@ class StrategyRunner:
         net = gross - est
         return net >= max(0.05, 0.25 * est)
 
+    def _plan_entry_zone(self, plan: dict, side: str) -> tuple:
+        if side == "long":
+            return plan.get("long_entry_low", 0), plan.get("long_entry_high", 0)
+        return plan.get("short_entry_low", 0), plan.get("short_entry_high", 0)
+
+    def _price_in_plan_entry_zone(self, plan: dict, side: str, px: float) -> bool:
+        low, high = self._plan_entry_zone(plan, side)
+        try:
+            low = float(low or 0)
+            high = float(high or 0)
+        except (TypeError, ValueError):
+            return False
+        if low <= 0 or high <= 0:
+            return False
+        if low > high:
+            low, high = high, low
+        return low <= px <= high
+
+    def _plan_range(self, plan: dict) -> tuple:
+        try:
+            low = float(plan.get("range_low") or 0)
+            high = float(plan.get("range_high") or 0)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        if low > high:
+            low, high = high, low
+        return low, high
+
+    def _plan_mid_price(self, plan: dict) -> float:
+        low, high = self._plan_range(plan)
+        return (low + high) / 2 if low > 0 and high > 0 else 0.0
+
+    def _plan_reference_price(self, plan: dict) -> float:
+        try:
+            ref = float(plan.get("plan_price") or 0)
+        except (TypeError, ValueError):
+            ref = 0.0
+        return ref if ref > 0 else self._plan_mid_price(plan)
+
+    def _plan_replan_reason(self, plan: dict, px: float) -> str:
+        low, high = self._plan_range(plan)
+        if low > 0 and high > 0 and (px < low or px > high):
+            return f"价格{px:.4f}跑出计划区间[{low:.4f},{high:.4f}]"
+        ref = self._plan_reference_price(plan)
+        if ref > 0:
+            drift = abs(px - ref) / ref
+            if drift >= 0.005:
+                return f"价格偏离计划参考{drift*100:.2f}% px={px:.4f} ref={ref:.4f}"
+        return ""
+
+    def _should_replan_for_price_drift(self, sym: str, plan: dict, px: float, now: float) -> tuple:
+        reason = self._plan_replan_reason(plan, px)
+        if not reason:
+            return False, ""
+        last = self._price_replan_last.get(sym, 0)
+        generated = float(plan.get("generated_at") or 0)
+        if now - last < 60:
+            return False, ""
+        if generated > 0 and last >= generated:
+            return False, ""
+        self._price_replan_last[sym] = now
+        return True, reason
+
+    def _plan_price_debug(self, plan: dict, side: str, px: float) -> str:
+        mid = self._plan_mid_price(plan)
+        ref = self._plan_reference_price(plan)
+        llo, lhi = self._plan_entry_zone(plan, "long")
+        slo, shi = self._plan_entry_zone(plan, "short")
+        parts = [f"点位=现价{px:.4f}"]
+        if mid > 0:
+            parts.append(f"中点{mid:.4f}")
+        if ref > 0:
+            parts.append(f"生成价{ref:.4f}")
+        if llo and lhi:
+            parts.append(f"多带[{float(llo):.4f},{float(lhi):.4f}]")
+        if slo and shi:
+            parts.append(f"空带[{float(slo):.4f},{float(shi):.4f}]")
+        parts.append(f"开{side}")
+        return " ".join(parts)
+
+    def _plan_signature(self, plan: dict, side: str) -> tuple:
+        low, high = self._plan_entry_zone(plan, side)
+        return (
+            plan.get("generated_at"),
+            plan.get("macro_regime") or plan.get("regime"),
+            side,
+            low,
+            high,
+        )
+
+    def _entry_risk_adjustment(self, sym: str, plan: dict, side: str, px: float) -> tuple:
+        """Aggressive entry: keep opening inside range, but downshift chase entries."""
+        if not plan or plan.get("bias") != "both":
+            return 1.0, 125, "标准"
+
+        range_low, range_high = self._plan_range(plan)
+        if range_low <= 0 or range_high <= 0 or px < range_low or px > range_high:
+            return 0.0, 0, "区间外"
+
+        if self._price_in_plan_entry_zone(plan, side, px):
+            margin_mult, lev_cap, tag = 1.0, 125, "入场带"
+        else:
+            low, high = self._plan_entry_zone(plan, side)
+            opp = "short" if side == "long" else "long"
+            opp_low, opp_high = self._plan_entry_zone(plan, opp)
+            try:
+                low, high = float(low or 0), float(high or 0)
+                opp_low, opp_high = float(opp_low or 0), float(opp_high or 0)
+            except (TypeError, ValueError):
+                low = high = opp_low = opp_high = 0.0
+            if low > high:
+                low, high = high, low
+            if opp_low > opp_high:
+                opp_low, opp_high = opp_high, opp_low
+
+            in_opp_zone = opp_low > 0 and opp_high > 0 and opp_low <= px <= opp_high
+            past_opp_zone = (
+                side == "long" and opp_high > 0 and px > opp_high
+            ) or (
+                side == "short" and opp_low > 0 and px < opp_low
+            )
+            if in_opp_zone or past_opp_zone:
+                margin_mult, lev_cap, tag = 0.28, 45, "反向区探单"
+            elif side == "long" and high > 0 and px > high:
+                margin_mult, lev_cap, tag = 0.55, 80, "追多降档"
+            elif side == "short" and low > 0 and px < low:
+                margin_mult, lev_cap, tag = 0.55, 80, "追空降档"
+            else:
+                margin_mult, lev_cap, tag = 0.70, 90, "偏离入场带"
+
+        guard = self._loss_replay_guard.get(sym)
+        if guard and guard.get("signature") == self._plan_signature(plan, side):
+            margin_mult = min(margin_mult, 0.35)
+            lev_cap = min(lev_cap, 50)
+            tag += "+连损探单"
+        return margin_mult, lev_cap, tag
+
     def _side_from_plan(self, plan: dict, px: float) -> tuple:
         """Return (side, reason, stop_loss, take_profit) using plan direction first."""
         if not plan:
@@ -1313,15 +1460,28 @@ class StrategyRunner:
             return "", "", None, None
 
         macro = str(plan.get("macro_regime") or plan.get("regime") or "").lower()
+        long_ok = self._price_in_plan_entry_zone(plan, "long", px)
+        short_ok = self._price_in_plan_entry_zone(plan, "short", px)
         if any(token in macro for token in ("up", "bull", "trend_up", "slow_grind_up", "breakout_up")):
-            return "long", f"计划顺势 {macro}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
+            tag = "命中入场带" if long_ok else "激进区间开"
+            return "long", f"计划顺势 {macro}→多({tag})", plan.get("long_stop_loss"), plan.get("long_take_profit")
         if any(token in macro for token in ("down", "bear", "trend_down", "slow_grind_down", "breakout_down", "bleed")):
-            return "short", f"计划顺势 {macro}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+            tag = "命中入场带" if short_ok else "激进区间开"
+            return "short", f"计划顺势 {macro}→空({tag})", plan.get("short_stop_loss"), plan.get("short_take_profit")
 
+        if long_ok and not short_ok:
+            return "long", "计划震荡命中多头入场带", plan.get("long_stop_loss"), plan.get("long_take_profit")
+        if short_ok and not long_ok:
+            return "short", "计划震荡命中空头入场带", plan.get("short_stop_loss"), plan.get("short_take_profit")
+        if long_ok and short_ok:
+            mid = (plan.get("range_low", 0) + plan.get("range_high", 0)) / 2
+            if px < mid:
+                return "long", f"计划震荡重叠区 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
+            return "short", f"计划震荡重叠区 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
         mid = (plan.get("range_low", 0) + plan.get("range_high", 0)) / 2
         if px < mid:
-            return "long", f"计划震荡 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
-        return "short", f"计划震荡 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+            return "long", f"计划震荡激进 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
+        return "short", f"计划震荡激进 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
 
     def _request_symbol_replan(self, sym: str, reason: str) -> None:
         payload = json.dumps({"symbol": sym, "reason": reason, "ts": time.time()}, ensure_ascii=False)
@@ -1337,7 +1497,7 @@ class StrategyRunner:
         except Exception as e:
             _log.error("request replan failed for %s: %s", sym, e)
 
-    def _apply_stop_loss_fuse(self, sym: str, reason: str) -> None:
+    def _apply_stop_loss_fuse(self, sym: str, reason: str, pos: Optional[dict] = None) -> None:
         """单币对连续止损只告警，不阻止下一单立即开。"""
         r = str(reason)
         is_sl = "止损" in r and "止盈" not in r
@@ -1345,10 +1505,14 @@ class StrategyRunner:
             st = self._fuse_sl_streak.get(sym, 0) + 1
             self._fuse_sl_streak[sym] = st
             if st >= _FUSE_SL_STREAK_LIMIT:
+                signature = (pos or {}).get("plan_signature")
+                if signature:
+                    self._loss_replay_guard[sym] = {"signature": signature, "ts": time.time()}
                 self._fuse_sl_streak[sym] = 0
                 self._request_symbol_replan(sym, f"连续止损{_FUSE_SL_STREAK_LIMIT}次")
         else:
             self._fuse_sl_streak[sym] = 0
+            self._loss_replay_guard.pop(sym, None)
 
     async def tick(self, prices: Dict[str, float], volumes: Dict[str, float],
                    changes: Dict[str, float], funding_rates: Dict[str, float],
@@ -1503,6 +1667,13 @@ class StrategyRunner:
                 pos["best_price"] = px
 
             best_pnl = pos.get("best_pnl", pnl_pct)
+
+            if pos.get("entry_risk_tag") not in ("标准", "入场带"):
+                gross_now = self._gross_pnl_usd(sym, pos, px)
+                fee_bar = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
+                if gross_now > fee_bar:
+                    self._close_position(sym, px, "激进单手续费3倍止盈", pnl_pct, prices)
+                    continue
 
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
@@ -1836,6 +2007,10 @@ class StrategyRunner:
             if self._plan_gate:
                 plan_cache = self._plan_gate.get_plan(sym)
                 if plan_cache:
+                    replan_now, replan_reason = self._should_replan_for_price_drift(sym, plan_cache, px, now)
+                    if replan_now:
+                        self._request_symbol_replan(sym, replan_reason)
+                        continue
                     plan_lev = plan_cache.get("leverage", 0)
                     if plan_lev and 1 <= plan_lev <= 125:
                         lev = int(plan_lev)
@@ -1917,6 +2092,34 @@ class StrategyRunner:
                 if not can:
                     continue
 
+            entry_risk_tag = "标准"
+            if plan_cache:
+                margin_mult, lev_cap, entry_risk_tag = self._entry_risk_adjustment(sym, plan_cache, side, entry_price)
+                if margin_mult <= 0 or lev_cap <= 0:
+                    continue
+                lev = max(1, min(int(lev), int(lev_cap)))
+                margin *= margin_mult
+
+                size = (margin * lev) / max(quanto * entry_price, 1e-9)
+                bumped_for_min = False
+                if spec and size < spec.order_size_min:
+                    size = spec.order_size_min
+                    margin = (size * quanto * entry_price) / lev
+                    bumped_for_min = True
+                if bumped_for_min and not is_stable(sym):
+                    alt_ceiling = max(5.0, self.balance * 0.06)
+                    if margin > alt_ceiling:
+                        continue
+                fee = size * quanto * entry_price * fee_rate_maker
+                if margin + fee > self.balance:
+                    continue
+                bucket_used = sum(
+                    p["margin"] for s, p in self.positions.items()
+                    if is_stable(s) == st_bucket
+                )
+                if bucket_used + margin > cap:
+                    continue
+
             # ── 统一下单通道 → Redis → Go 执行器 ──
             _live_oid = None
             _is_live = self._live and self._live.active
@@ -1950,6 +2153,8 @@ class StrategyRunner:
                 "_learner_feat": _learner_feat,
                 "plan_sl": _plan_sl,  # AI计划精确止损价
                 "plan_tp": _plan_tp,  # AI计划精确止盈价
+                "plan_signature": self._plan_signature(plan_cache, side) if plan_cache else None,
+                "entry_risk_tag": entry_risk_tag,
             }
             
             # AI分析（异步，不阻塞开仓）
@@ -1971,6 +2176,10 @@ class StrategyRunner:
             fee_str = f" 手续费={fee:.4f}" if fee > 0.0001 else ""
             stype = "主流" if is_stable(sym) else "山寨"
             msg = f"[开仓-{stype}] {sym} {side.upper()} @ {entry_price:.4f} 保证金={margin:.2f} 杠杆={lev}x 信号={signal_src}{' 行情='+_regime.value if _regime else ''}"
+            if entry_risk_tag != "标准":
+                msg += f" 风控={entry_risk_tag}"
+            if plan_cache:
+                msg += " " + self._plan_price_debug(plan_cache, side, entry_price)
             if _plan_sl:
                 msg += f" SL=计划{_plan_sl:.1f}"
             if _tp_mult:
@@ -2207,7 +2416,7 @@ class StrategyRunner:
         _state["character_event"] = ev_close
         _schedule_loli_speech(ev_close)
 
-        self._apply_stop_loss_fuse(sym, reason)
+        self._apply_stop_loss_fuse(sym, reason, pos)
 
     def _recalc_equity(self, prices):
         locked = sum(p["margin"] for p in self.positions.values())

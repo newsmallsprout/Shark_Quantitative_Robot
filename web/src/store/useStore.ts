@@ -4,6 +4,7 @@ export interface Position {
   symbol: string; side: string; size: number; entry_price: number;
   leverage: number; margin: number; unrealized_pnl: number; pnl_pct: number;
   current_price?: number;
+  entry_risk_tag?: string;
 }
 
 export interface LivePrice {

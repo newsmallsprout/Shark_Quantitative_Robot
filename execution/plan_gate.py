@@ -119,19 +119,12 @@ class PlanGate:
         if side not in ("long", "short"):
             return False, f"方向无效({side})"
 
-        # 双方向：必须在入场带内才开仓（硬门禁）
+        # 双方向：激进快开，只拦大区间外；入场带外由 Python 风险降档处理。
         if bias == "both":
             range_low = plan.get("range_low", 0)
             range_high = plan.get("range_high", 0)
             if px < range_low or px > range_high:
                 return False, f"价格({px:.0f})不在区间[{range_low:.0f},{range_high:.0f}]"
-            if side == "long":
-                entry_low = plan.get("long_entry_low", 0)
-                entry_high = plan.get("long_entry_high", 0)
-            else:
-                entry_low = plan.get("short_entry_low", 0)
-                entry_high = plan.get("short_entry_high", 0)
-            # 双向计划的 long/short entry zone 只作为倾向参考；开仓速度优先，区间门禁已足够。
         elif bias in ("long", "short"):
             if side != bias:
                 return False, f"方向不匹配(plan={bias}, side={side})"

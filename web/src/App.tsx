@@ -27,6 +27,20 @@ export function TopbarSectionLinks() {
   )
 }
 
+function PaymentQrRail() {
+  return (
+    <aside className="payment-qr-rail" aria-label="收款码">
+      <div className="payment-qr-rail__title">支持 Shark</div>
+      <div className="payment-qr-rail__item">
+        <img src="/static/IMG_2372.jpg" alt="收款码 1" />
+      </div>
+      <div className="payment-qr-rail__item">
+        <img src="/static/IMG_2373.jpg" alt="收款码 2" />
+      </div>
+    </aside>
+  )
+}
+
 function num(v: unknown, fallback: number): number {
   if (typeof v === 'number' && Number.isFinite(v)) return v
   if (typeof v === 'string' && v.trim() !== '') {
@@ -141,11 +155,23 @@ function dashboardAuthHeaders(init?: HeadersInit): Headers {
   return h
 }
 
+async function showImageDenyIfNeeded(r: Response): Promise<boolean> {
+  const ct = r.headers.get('content-type') || ''
+  if (r.status !== 403 || !ct.includes('image/')) return false
+  const blob = await r.blob()
+  const url = URL.createObjectURL(blob)
+  document.body.innerHTML = `<img src="${url}" style="display:block;max-width:100vw;max-height:100vh;margin:auto" />`
+  document.body.style.margin = '0'
+  document.body.style.background = '#000'
+  return true
+}
+
 async function postLiveToggle(): Promise<{ trading_enabled?: boolean; error?: string }> {
   const r = await fetch('/api/live/toggle', {
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
+  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
   let j: { trading_enabled?: boolean; error?: string } = {}
   try {
     j = (await r.json()) as { trading_enabled?: boolean; error?: string }
@@ -163,6 +189,7 @@ async function postPaperToggle(): Promise<{ trading_enabled?: boolean; error?: s
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
+  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
   let j: { trading_enabled?: boolean; error?: string } = {}
   try {
     j = (await r.json()) as { trading_enabled?: boolean; error?: string }
@@ -180,6 +207,7 @@ async function postEvoApprove(id: number): Promise<{ ok?: boolean; error?: strin
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
+  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
   const j = await r.json() as { ok?: boolean; error?: string }
   return j
 }
@@ -189,6 +217,7 @@ async function postEvoReject(id: number): Promise<{ ok?: boolean; error?: string
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
+  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
   const j = await r.json() as { ok?: boolean; error?: string }
   return j
 }
@@ -199,6 +228,7 @@ async function postSharkMode(mode: 'paper' | 'live'): Promise<{ error?: string }
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ mode }),
   })
+  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
   let raw: { detail?: unknown; error?: unknown } = {}
   try {
     raw = (await r.json()) as { detail?: unknown; error?: unknown }
@@ -547,6 +577,7 @@ export default function App() {
       </div>
     )}
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      <PaymentQrRail />
       {/* 顶栏 */}
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4 }}>
@@ -644,6 +675,7 @@ export default function App() {
             <div className="card-header">风控状态</div>
             <div className="card-body" style={{ flex: 1 }}>
               <SafetyPanel
+                status={status}
                 blocked={status.safety_blocked}
                 connected={connected}
                 latencyMs={pollLatencyMs}

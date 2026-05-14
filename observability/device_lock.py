@@ -1,5 +1,5 @@
 """
-设备锁：未授权客户端所有 HTTP 请求返回固定 PNG（无法操作看板/API）。
+设备锁：看板公开只读；非本机写操作返回固定 PNG（无法点击按钮/API 改状态）。
 
 说明：HTTP 协议无法获取浏览器端网卡 MAC，因此以来源 IP 白名单为主；
 可选 SHARK_ALLOWED_MAC：部分 API 请求须带 Header（同源 bootstrap 注入）。
@@ -170,6 +170,19 @@ def _request_loopback_host(request: Request) -> Optional[str]:
     return _host_header_loopback(request.headers.get("host") or request.headers.get("Host") or "")
 
 
+def _request_from_loopback_peer(request: Request) -> bool:
+    client = request.client
+    if client and client.host and _host_is_loopback(client.host):
+        return True
+    scope = request.scope.get("client")
+    return bool(scope and len(scope) >= 1 and scope[0] and _host_is_loopback(str(scope[0])))
+
+
+def _request_is_local_control(request: Request) -> bool:
+    """Only localhost/127.0.0.1 pages can perform button/write actions."""
+    return bool(_request_loopback_host(request) or _request_from_loopback_peer(request))
+
+
 def _proxy_peer_trusted(host: str) -> bool:
     """只信任显式白名单代理写入的 XFF，避免直连客户端伪造 X-Forwarded-For。"""
     if not host:
@@ -240,6 +253,11 @@ def _http_path_exempt_from_mac(path: str) -> bool:
 def http_request_check(request: Request) -> Tuple[bool, str]:
     if not _LOCK_ENABLED:
         return True, ""
+    method = str(request.method or "GET").upper()
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return True, ""
+    if not _request_is_local_control(request):
+        return False, f"非本机禁止写操作 method={method} path={request.url.path!r}"
     ip = _client_ip(request)
     if not _ip_allowed(ip):
         return False, (
@@ -279,33 +297,7 @@ def websocket_connection_allowed(
     headers: List[Tuple[bytes, bytes]],
     device_mac_query: Optional[str],
 ) -> Tuple[bool, str]:
-    if not _LOCK_ENABLED:
-        return True, ""
-    host = client_host or ""
-    hdr = {k.lower(): v for k, v in headers}
-    hh = hdr.get(b"host")
-    if hh:
-        loopback_host = _host_header_loopback(hh.decode("latin-1", errors="replace"))
-        if loopback_host:
-            return True, ""
-    if _host_is_loopback(host):
-        return True, ""
-    if _TRUST_XFF and _proxy_peer_trusted(host):
-        xff = hdr.get(b"x-forwarded-for")
-        if xff:
-            host = xff.decode("latin-1", errors="replace").split(",")[0].strip()
-    if not _ip_allowed(host):
-        return False, f"ws ip={host!r} denied"
-    if _ALLOWED_MAC_NORM:
-        got: Optional[str] = None
-        hdr = {k.lower(): v for k, v in headers}
-        mh = hdr.get(b"x-shark-client-mac")
-        if mh:
-            got = normalize_mac(mh.decode("latin-1", errors="replace"))
-        if got != _ALLOWED_MAC_NORM and device_mac_query and device_mac_query.strip():
-            got = normalize_mac(device_mac_query)
-        if got != _ALLOWED_MAC_NORM:
-            return False, f"ws mac got={got!r} need={_ALLOWED_MAC_NORM!r}"
+    # WebSocket only streams dashboard state; viewing is intentionally public.
     return True, ""
 
 
