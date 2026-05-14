@@ -291,17 +291,16 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from observability.context import REQUEST_ID_CTX, RequestIdMiddleware, configure_logging
-from observability.device_lock import (
-    DeviceLockMiddleware,
-    bootstrap_client_mac_js_value,
-    init_device_lock,
-    websocket_connection_allowed,
+from license import (
+    LicenseMiddleware,
+    init_license_middleware,
+    license_from_request,
 )
 
 app = FastAPI(title="Shark 2.0")
-init_device_lock(ROOT)
+init_license_middleware(ROOT)
 app.add_middleware(RequestIdMiddleware)
-app.add_middleware(DeviceLockMiddleware)
+app.add_middleware(LicenseMiddleware)
 def _default_paper_trading_enabled() -> bool:
     if os.environ.get("SHARK_MODE", "paper").strip().lower() != "paper":
         return False
@@ -439,12 +438,12 @@ async def health(): return {"ok": True}
 
 @app.get("/api/bootstrap.js")
 async def api_bootstrap_js():
-    """运行时注入与 SHARK_API_TOKEN 一致的仪表板密钥（Docker 构建阶段无法读取 .env 中的 VITE_*）。"""
+    """运行时注入 API token 和 license 开关状态。"""
     exp = _shark_api_token_configured()
-    mac = bootstrap_client_mac_js_value()
+    lic_enabled = os.environ.get("SHARK_LICENSE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
     lines = [
         "window.__SHARK_API_TOKEN__=%s;" % json.dumps(exp or ""),
-        "window.__SHARK_CLIENT_MAC__=%s;\n" % json.dumps(mac or ""),
+        "window.__SHARK_LICENSE_ENABLED__=%s;\n" % json.dumps(lic_enabled),
     ]
     body = "\n".join(lines)
     return Response(
@@ -563,6 +562,47 @@ async def paper_toggle(_: None = Depends(require_api_token)):
         _state["paper_close_all"] = True
     return {"trading_enabled": new_val}
 
+
+@app.post("/api/paper/reset")
+async def paper_reset(request: Request, _: None = Depends(require_api_token)):
+    """重置模拟盘：清零持仓/历史，重置资金为指定金额（默认500）。"""
+    try:
+        body = await request.json()
+        capital = float(body.get("capital", 500))
+    except Exception:
+        capital = 500.0
+    capital = max(50.0, min(1000000.0, capital))
+    _state["paper_reset_request"] = {"capital": capital}
+    return {"ok": True, "capital": capital}
+
+
+@app.get("/api/license/check")
+async def license_check(request: Request):
+    """前端检查 license 是否有效。"""
+    from license import _verify_license_redis, license_from_request
+    token = license_from_request(request)
+    if not token:
+        return {"ok": False, "reason": "missing license"}
+    ok, reason = _verify_license_redis(token)
+    return {"ok": ok, "reason": reason}
+
+
+@app.post("/api/license/login")
+async def license_login(request: Request):
+    """前端登录：验证 license token 是否与 Redis 中一致。"""
+    try:
+        body = await request.json()
+        token = str(body.get("license", "")).strip()
+    except Exception:
+        return {"ok": False, "reason": "请提供 license"}
+
+    if not token:
+        return {"ok": False, "reason": "license 不能为空"}
+
+    from license import _verify_license_redis
+    ok, reason = _verify_license_redis(token)
+    return {"ok": ok, "reason": reason}
+
 @app.post("/api/shark/mode")
 async def set_shark_mode(request: Request, _: None = Depends(require_api_token)):
     """切换模拟盘/实盘模式"""
@@ -651,14 +691,6 @@ async def ws(
     device_mac: Optional[str] = Query(default=None),
 ):
     scope = websocket.scope
-    _client = scope.get("client")
-    _host = _client[0] if _client else ""
-    _hdrs = list(scope.get("headers") or [])
-    _ws_ok, _ws_reason = websocket_connection_allowed(_host, _hdrs, device_mac)
-    if not _ws_ok:
-        _log.warning("[device_lock] ws 拒绝 %s", _ws_reason)
-        await websocket.close(code=1008)
-        return
     hdr = websocket.headers.get("x-request-id") or websocket.headers.get("X-Request-ID")
     hdr = hdr.strip() if hdr else ""
     rid = (hdr if hdr else str(uuid.uuid4()))[:128]
@@ -1031,8 +1063,9 @@ class StrategyRunner:
                 return {"error": "实盘引擎初始化失败，请检查 GATE_API_KEY/SECRET 和网络"}
             # 切到实盘必须丢弃纸盘会话，不能把模拟仓位/历史带进实盘界面或后续 tick。
             self._clear_trading_session_state(clear_redis_history=True)
-            self._paper_balance = 200.0
-            self._paper_equity = 200.0
+            # 保存当前纸盘余额（用于切回时恢复）
+            self._paper_balance = self.balance
+            self._paper_equity = self.equity
             self._live = engine
             self._live_trading_enabled = False
             try:
@@ -1052,16 +1085,129 @@ class StrategyRunner:
             if hasattr(self, '_paper_balance'):
                 self.balance = self._paper_balance
                 self.equity = self._paper_equity
-                self._initial_capital = 200.0
+                self._initial_capital = self._paper_balance
                 self.gross_realized = 0.0
                 self.total_fees = 0.0
                 self.realized_pnl = 0.0
                 _state["balance"] = self.balance
                 _state["equity"] = self.equity
                 _state["free_cash"] = self.balance
-                _state["initial_capital"] = 200.0
+                _state["initial_capital"] = self._paper_balance
             print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})", flush=True)
         return {"ok": True, "mode": mode, "balance": self.balance}
+
+    def _reset_paper(self, capital: float) -> None:
+        """重置模拟盘：清零所有状态，重新设置初始资金。"""
+        self._clear_trading_session_state(clear_redis_history=True)
+        self._paper_balance = capital
+        self._paper_equity = capital
+        self.balance = capital
+        self.equity = capital
+        self.static_equity = capital
+        self.peak_static_equity = capital
+        self._initial_capital = capital
+        self.realized_pnl = 0.0
+        self.gross_realized = 0.0
+        self.total_fees = 0.0
+        self.total_slippage = 0.0
+        self.trades = 0
+        self.closed_trades = 0
+        self.wins = 0
+        self._alt_evo.clear()
+        self._loss_replay_guard.clear()
+        self._price_replan_last.clear()
+        _state["balance"] = capital
+        _state["equity"] = capital
+        _state["free_cash"] = capital
+        _state["initial_capital"] = capital
+        _state["realized_pnl"] = 0.0
+        _state["gross_realized"] = 0.0
+        _state["total_fees"] = 0.0
+        _state["total_slippage"] = 0.0
+        _state["trades"] = 0
+        _state["wins"] = 0
+        _state["win_rate"] = 0.0
+        _state["margin_locked"] = 0.0
+        _state["positions"] = 0
+        _state["position_list"] = []
+        _state["trade_history"] = []
+        # 保存到 Redis
+        self._save_paper_state()
+        # 异步清空 DB 中的订单/成交/资金流水记录
+        self._clear_paper_db_records()
+        print(f"[模拟盘] 已重置，初始资金=${capital:.2f}", flush=True)
+
+    def _clear_paper_db_records(self) -> None:
+        """清空 PostgreSQL 中模拟盘的所有订单/成交/资金流水。"""
+        if not self._persistence or not self._persistence.enabled_db():
+            return
+        try:
+            import asyncio
+            async def _go():
+                repo = self._persistence.repository
+                # 直接删表（更高效）
+                from persistence.session import create_engine_and_sessionmaker
+                import os as _os
+                engine, _ = create_engine_and_sessionmaker(_os.environ.get("DATABASE_URL", "postgresql://shark:shark@db:5432/shark"))
+                from sqlalchemy import text
+                with engine.begin() as conn:
+                    conn.execute(text("DELETE FROM balance_logs"))
+                    conn.execute(text("DELETE FROM trades"))
+                    conn.execute(text("DELETE FROM orders"))
+                engine.dispose()
+                _log.info("paper db records cleared")
+            asyncio.get_event_loop().create_task(_go())
+        except Exception as e:
+            _log.warning("clear paper db records failed: %s", e)
+
+    def _save_paper_state(self) -> None:
+        """持久化模拟盘状态到 Redis。"""
+        try:
+            import redis as _redis
+            _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            state = {
+                "balance": self.balance,
+                "equity": self.equity,
+                "static_equity": self.static_equity,
+                "peak_static_equity": self.peak_static_equity,
+                "initial_capital": self._initial_capital,
+                "realized_pnl": self.realized_pnl,
+                "gross_realized": self.gross_realized,
+                "total_fees": self.total_fees,
+                "total_slippage": self.total_slippage,
+                "trades": self.trades,
+                "closed_trades": self.closed_trades,
+                "wins": self.wins,
+            }
+            _r.set("shark:paper_state", json.dumps(state, ensure_ascii=False))
+        except Exception as e:
+            _log.warning("save paper state failed: %s", e)
+
+    def _load_paper_state(self) -> bool:
+        """从 Redis 恢复模拟盘状态。返回 True 表示已恢复。"""
+        try:
+            import redis as _redis
+            _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            raw = _r.get("shark:paper_state")
+            if not raw:
+                return False
+            state = json.loads(raw)
+            self.balance = float(state.get("balance", self._initial_capital))
+            self.equity = float(state.get("equity", self._initial_capital))
+            self.static_equity = float(state.get("static_equity", self._initial_capital))
+            self.peak_static_equity = float(state.get("peak_static_equity", self._initial_capital))
+            self._initial_capital = float(state.get("initial_capital", self._initial_capital))
+            self.realized_pnl = float(state.get("realized_pnl", 0))
+            self.gross_realized = float(state.get("gross_realized", 0))
+            self.total_fees = float(state.get("total_fees", 0))
+            self.total_slippage = float(state.get("total_slippage", 0))
+            self.trades = int(state.get("trades", 0))
+            self.closed_trades = int(state.get("closed_trades", 0))
+            self.wins = int(state.get("wins", 0))
+            return True
+        except Exception as e:
+            _log.warning("load paper state failed: %s", e)
+            return False
 
     def _clear_trading_session_state(self, *, clear_redis_history: bool = False) -> None:
         self.positions.clear()
@@ -1539,6 +1685,15 @@ class StrategyRunner:
         base["take_profit"] = base["long_take_profit"]
         return base
 
+    def _safe_float(self, val, default: float) -> float:
+        """Handle AI returning None/null for optional fields."""
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
     def _ai_to_alt_plan(self, sym: str, px: float, ai: dict,
                         change_abs: float, volume: float, funding: float) -> dict:
         """将AI返回的JSON转为标准RangePlan格式"""
@@ -1558,19 +1713,19 @@ class StrategyRunner:
             "fuse_threshold_pct": round(fuse_pct, 2), "evo_gen": evo["gen"],
         }
         lev = ai.get("leverage", 25)
-        plan["leverage"] = max(5, min(65, int(lev)))
+        plan["leverage"] = max(5, min(65, int(lev) if lev is not None else 25))
         plan["position_size_pct"] = 0.02
         plan["cut_loss_pct"] = 0.70
         # 长仓
-        plan["long_entry_low"] = float(ai.get("long_entry_low", px * 0.995))
-        plan["long_entry_high"] = float(ai.get("long_entry_high", px * 1.005))
-        plan["long_stop_loss"] = float(ai.get("long_sl", px * 0.98))
-        plan["long_take_profit"] = [float(ai.get("long_tp1", px * 1.02)), float(ai.get("long_tp2", px * 1.04))]
+        plan["long_entry_low"] = self._safe_float(ai.get("long_entry_low"), px * 0.995)
+        plan["long_entry_high"] = self._safe_float(ai.get("long_entry_high"), px * 1.005)
+        plan["long_stop_loss"] = self._safe_float(ai.get("long_sl"), px * 0.98)
+        plan["long_take_profit"] = [self._safe_float(ai.get("long_tp1"), px * 1.02), self._safe_float(ai.get("long_tp2"), px * 1.04)]
         # 空仓
-        plan["short_entry_low"] = float(ai.get("short_entry_low", px * 0.995))
-        plan["short_entry_high"] = float(ai.get("short_entry_high", px * 1.005))
-        plan["short_stop_loss"] = float(ai.get("short_sl", px * 1.02))
-        plan["short_take_profit"] = [float(ai.get("short_tp1", px * 0.98)), float(ai.get("short_tp2", px * 0.96))]
+        plan["short_entry_low"] = self._safe_float(ai.get("short_entry_low"), px * 0.995)
+        plan["short_entry_high"] = self._safe_float(ai.get("short_entry_high"), px * 1.005)
+        plan["short_stop_loss"] = self._safe_float(ai.get("short_sl"), px * 1.02)
+        plan["short_take_profit"] = [self._safe_float(ai.get("short_tp1"), px * 0.98), self._safe_float(ai.get("short_tp2"), px * 0.96)]
         # 区间
         plan["range_low"] = min(plan["long_entry_low"], plan["long_stop_loss"])
         plan["range_high"] = max(plan["short_entry_high"], plan["short_stop_loss"])
@@ -1961,6 +2116,11 @@ class StrategyRunner:
         switch_req = _state.pop("switch_mode_request", None)
         if switch_req:
             result = self.switch_mode(switch_req)
+
+        # 处理模拟盘重置请求
+        reset_req = _state.pop("paper_reset_request", None)
+        if reset_req:
+            self._reset_paper(reset_req["capital"])
             if "error" in result:
                 print(f"[模式切换] 失败: {result['error']}", flush=True)
 
@@ -2974,6 +3134,8 @@ class StrategyRunner:
                 save_snapshot(_state)
             except Exception:
                 pass
+            # 持久化模拟盘状态到 Redis
+            self._save_paper_state()
         _state["total_slippage"] = self.total_slippage
         _state["trade_history"] = _trade_history_for_state(self)
         _state["margin_locked"] = locked
@@ -3214,6 +3376,13 @@ async def main():
     port = int(os.environ.get("SHARK_HTTP_PORT", "80"))
     feed = MarketDataFeed()
     runner = StrategyRunner(initial_balance=500.0, persistence=_storage_bridge)
+    # ── 尝试从 Redis 恢复模拟盘状态 ──
+    paper_restored = runner._load_paper_state()
+    if paper_restored:
+        print(f"[启动] 已从 Redis 恢复模拟盘状态 (余额=${runner.balance:.2f})", flush=True)
+    else:
+        # 首次启动，初始化 Redis 状态
+        runner._save_paper_state()
     # FastLoop 门禁注入
     if redis_client:
         from execution.plan_gate import PlanGate

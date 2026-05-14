@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY ai_strategy.py .
 COPY dual_strategy.py .
+COPY license.py .
 COPY api/ ./api/
 COPY multi_exchange.py .
 COPY kline_cache.py .

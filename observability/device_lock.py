@@ -259,15 +259,9 @@ def http_request_check(request: Request) -> Tuple[bool, str]:
     method = str(request.method or "GET").upper()
     if method in ("GET", "HEAD", "OPTIONS"):
         return True, ""
-    if not _request_is_local_control(request):
-        return False, f"非本机禁止写操作 method={method} path={request.url.path!r}"
     ip = _client_ip(request)
-    if not _ip_allowed(ip):
-        return False, (
-            f"ip={ip!r} 未放行（allow_private={_ALLOW_PRIVATE}）。"
-            f"若在 Docker/Cloudflare Tunnel 下日志里出现 172.64.x.x 等，请把该 IP 写入 SHARK_ALLOWED_IPS "
-            f"或使用 SHARK_ALLOWED_CIDRS（见 .env.example）"
-        )
+    if not _request_is_local_control(request) and not _ip_allowed(ip):
+        return False, f"非本机禁止写操作 method={method} path={request.url.path!r}"
     # 服务器模式跳过 MAC 检查（远程浏览器 MAC 不可控），其余安全限制不变
     if not _SERVER_MODE and _ALLOWED_MAC_NORM and not _http_path_exempt_from_mac(request.url.path):
         got = _mac_from_request(request)
@@ -309,6 +303,7 @@ class DeviceLockMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         ok, reason = http_request_check(request)
         if not ok:
-            _log.warning("[device_lock] 拒绝 %s %s", request.url.path, reason)
+            ip = _client_ip(request)
+            _log.warning("[device_lock] 拒绝 %s client_ip=%s %s", request.url.path, ip, reason)
             return deny_image_response()
         return await call_next(request)

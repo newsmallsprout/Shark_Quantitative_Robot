@@ -140,18 +140,20 @@ function dashboardApiToken(): string {
   return import.meta.env.VITE_SHARK_API_TOKEN?.trim() ?? ''
 }
 
-function dashboardClientMac(): string {
-  const m = typeof window !== 'undefined' ? window.__SHARK_CLIENT_MAC__ : undefined
-  if (typeof m === 'string' && m.trim() !== '') return m.trim()
-  return import.meta.env.VITE_SHARK_CLIENT_MAC?.trim() ?? ''
+function dashboardLicense(): string {
+  try {
+    return localStorage.getItem('shark_license') || ''
+  } catch {
+    return ''
+  }
 }
 
 function dashboardAuthHeaders(init?: HeadersInit): Headers {
   const h = new Headers(init)
   const tok = dashboardApiToken()
   if (tok) h.set('Authorization', `Bearer ${tok}`)
-  const mac = dashboardClientMac()
-  if (mac) h.set('X-Shark-Client-Mac', mac)
+  const lic = dashboardLicense()
+  if (lic) h.set('X-Shark-License', lic)
   return h
 }
 
@@ -160,9 +162,12 @@ async function showImageDenyIfNeeded(r: Response): Promise<boolean> {
   if (r.status !== 403 || !ct.includes('image/')) return false
   const blob = await r.blob()
   const url = URL.createObjectURL(blob)
-  document.body.innerHTML = `<img src="${url}" style="display:block;max-width:100vw;max-height:100vh;margin:auto" />`
+  document.body.innerHTML = `<div style="background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0">
+    <img src="${url}" style="max-width:100vw;max-height:80vh" />
+    <p style="color:#f44;font-size:16px;margin-top:16px;font-family:sans-serif">🐱 无权限 — 请配置许可证</p>
+    <p style="color:#888;font-size:12px;margin-top:8px;font-family:monospace">localStorage.setItem('shark_license', '&lt;你的许可证&gt;')</p>
+  </div>`
   document.body.style.margin = '0'
-  document.body.style.background = '#000'
   return true
 }
 
@@ -171,7 +176,7 @@ async function postLiveToggle(): Promise<{ trading_enabled?: boolean; error?: st
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
-  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
   let j: { trading_enabled?: boolean; error?: string } = {}
   try {
     j = (await r.json()) as { trading_enabled?: boolean; error?: string }
@@ -189,7 +194,7 @@ async function postPaperToggle(): Promise<{ trading_enabled?: boolean; error?: s
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
-  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
   let j: { trading_enabled?: boolean; error?: string } = {}
   try {
     j = (await r.json()) as { trading_enabled?: boolean; error?: string }
@@ -202,12 +207,32 @@ async function postPaperToggle(): Promise<{ trading_enabled?: boolean; error?: s
   return j
 }
 
+async function postPaperReset(capital: number): Promise<{ ok?: boolean; error?: string }> {
+  const r = await fetch('/api/paper/reset', {
+    method: 'POST',
+    headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ capital }),
+  })
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
+  const j = await r.json() as { ok?: boolean; error?: string }
+  return j
+}
+
+async function postLicenseLogin(license: string): Promise<{ ok?: boolean; reason?: string }> {
+  const r = await fetch('/api/license/login', {
+    method: 'POST',
+    headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ license }),
+  })
+  return (await r.json()) as { ok?: boolean; reason?: string }
+}
+
 async function postEvoApprove(id: number): Promise<{ ok?: boolean; error?: string }> {
   const r = await fetch(`/api/evo/approve/${id}`, {
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
-  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
   const j = await r.json() as { ok?: boolean; error?: string }
   return j
 }
@@ -217,7 +242,7 @@ async function postEvoReject(id: number): Promise<{ ok?: boolean; error?: string
     method: 'POST',
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
   })
-  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
   const j = await r.json() as { ok?: boolean; error?: string }
   return j
 }
@@ -228,7 +253,7 @@ async function postSharkMode(mode: 'paper' | 'live'): Promise<{ error?: string }
     headers: dashboardAuthHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ mode }),
   })
-  if (await showImageDenyIfNeeded(r)) return { error: '设备锁拦截' }
+  if (await showImageDenyIfNeeded(r)) return { error: '无权限' }
   let raw: { detail?: unknown; error?: unknown } = {}
   try {
     raw = (await r.json()) as { detail?: unknown; error?: unknown }
@@ -338,6 +363,11 @@ export default function App() {
   const [pollLatencyMs, setPollLatencyMs] = useState<number | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<ConfirmPayload | null>(null)
   const [showEvoPanel, setShowEvoPanel] = useState(false)
+  const [showLicenseModal, setShowLicenseModal] = useState(false)
+  const [showResetModal, setShowResetModal] = useState(false)
+  const [licenseInput, setLicenseInput] = useState('')
+  const [resetCapital, setResetCapital] = useState('500')
+  const [licenseMsg, setLicenseMsg] = useState('')
   const lastDataAtRef = useRef(0)
 
   // ═══ Starfield animation ═══
@@ -426,10 +456,8 @@ export default function App() {
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const tok = dashboardApiToken()
-      const mac = dashboardClientMac()
       const qp = new URLSearchParams()
       if (tok) qp.set('token', tok)
-      if (mac) qp.set('device_mac', mac)
       const qs = qp.toString()
       const path = qs ? `/ws?${qs}` : '/ws'
       const ws = new WebSocket(`${proto}//${location.host}${path}`)
@@ -545,6 +573,32 @@ export default function App() {
     runTradeToggle(!tradingOn)
   }
 
+  const onLicenseLogin = async () => {
+    const lic = licenseInput.trim()
+    if (!lic) { setLicenseMsg('请输入许可证'); return }
+    setLicenseMsg('验证中...')
+    const r = await postLicenseLogin(lic)
+    if (r.ok) {
+      try { localStorage.setItem('shark_license', lic) } catch {}
+      setLicenseMsg('✅ 登录成功')
+      setShowLicenseModal(false)
+      setLicenseInput('')
+    } else {
+      setLicenseMsg(`❌ ${r.reason || '无效许可证'}`)
+    }
+  }
+
+  const onResetPaper = async () => {
+    const cap = parseFloat(resetCapital)
+    if (!isFinite(cap) || cap < 50) { window.alert('资金最低 50'); return }
+    const r = await postPaperReset(cap)
+    if (r.error) { window.alert(r.error); return }
+    if (r.ok) {
+      window.alert(`模拟盘已重置，初始资金 $${cap}`)
+      setShowResetModal(false)
+    }
+  }
+
   return (
     <>
     <ConfirmModal
@@ -601,6 +655,70 @@ export default function App() {
         </div>
       </div>
     )}
+    {/* 许可证登录弹窗 */}
+    {showLicenseModal && (
+      <div className="shark-confirm-overlay" role="presentation" onClick={(e) => { if (e.target === e.currentTarget) setShowLicenseModal(false) }}>
+        <div className="shark-confirm-panel" role="dialog" aria-modal="true" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+          <div className="shark-confirm-title">🔑 输入许可证</div>
+          <div className="shark-confirm-body">
+            <input
+              type="text"
+              value={licenseInput}
+              onChange={(e) => setLicenseInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && onLicenseLogin()}
+              placeholder="粘贴许可证 token..."
+              autoFocus
+              style={{
+                width: '100%', padding: '8px 12px', borderRadius: 6,
+                background: 'var(--bg-card)', border: '1px solid var(--border-glass)',
+                color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 12,
+                outline: 'none',
+              }}
+            />
+            {licenseMsg && (
+              <div style={{ marginTop: 8, fontSize: 12, color: licenseMsg.startsWith('✅') ? '#0f8' : '#f44' }}>
+                {licenseMsg}
+              </div>
+            )}
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 0 0' }}>
+            <button className="btn-modal-cancel" onClick={() => setShowLicenseModal(false)}>取消</button>
+            <button className="btn-live-trade btn-live-trade--start" onClick={onLicenseLogin}>验证</button>
+          </div>
+        </div>
+      </div>
+    )}
+    {/* 重置模拟盘弹窗 */}
+    {showResetModal && (
+      <div className="shark-confirm-overlay" role="presentation" onClick={(e) => { if (e.target === e.currentTarget) setShowResetModal(false) }}>
+        <div className="shark-confirm-panel" role="dialog" aria-modal="true" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+          <div className="shark-confirm-title">🔄 重置模拟盘</div>
+          <div className="shark-confirm-body">
+            <p style={{ color: 'var(--text-secondary)', fontSize: 12, margin: '0 0 12px' }}>
+              重置将清空所有持仓、交易历史和数据库记录。
+            </p>
+            <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>初始资金 ($)</label>
+            <input
+              type="number"
+              value={resetCapital}
+              onChange={(e) => setResetCapital(e.target.value)}
+              min="50"
+              max="1000000"
+              style={{
+                width: '100%', padding: '8px 12px', borderRadius: 6,
+                background: 'var(--bg-card)', border: '1px solid var(--border-glass)',
+                color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 14,
+                outline: 'none', marginTop: 4,
+              }}
+            />
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 0 0' }}>
+            <button className="btn-modal-cancel" onClick={() => setShowResetModal(false)}>取消</button>
+            <button className="btn-live-trade btn-live-trade--stop" onClick={onResetPaper}>重置</button>
+          </div>
+        </div>
+      </div>
+    )}
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       <PaymentQrRail />
       {/* 顶栏 */}
@@ -638,6 +756,26 @@ export default function App() {
                 {tradingOn ? '停止交易' : '开始交易'}
               </button>
             ) : null}
+            {isPaperMode && (
+              <button
+                type="button"
+                className="btn-live-trade btn-live-trade--stop"
+                onClick={() => setShowResetModal(true)}
+                title="重置模拟盘资金和记录"
+                style={{ fontSize: 11 }}
+              >
+                重置
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn-live-trade btn-live-trade--start"
+              onClick={() => { setLicenseInput(''); setLicenseMsg(''); setShowLicenseModal(true) }}
+              title="输入许可证"
+              style={{ fontSize: 11 }}
+            >
+              登录
+            </button>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             {(status.evo_pending?.length ?? 0) > 0 && (
