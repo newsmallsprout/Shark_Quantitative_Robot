@@ -38,7 +38,7 @@ class SessionMixin:
                 _state["equity"] = self.balance
             except Exception:
                 pass
-            print(f"🔥 已切换到实盘模式 (余额=${self.balance:.2f})", flush=True)
+            print(f"🔥 已切换到实盘模式 (余额=${self.balance:.2f})")
         else:
             self._live = None
             self._live_trading_enabled = False
@@ -53,7 +53,7 @@ class SessionMixin:
                 _state["equity"] = self.equity
                 _state["free_cash"] = self.balance
                 _state["initial_capital"] = self._paper_balance
-            print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})", flush=True)
+            print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})")
         return {"ok": True, "mode": mode, "balance": self.balance}
 
     def _reset_paper(self, capital: float) -> None:
@@ -85,7 +85,7 @@ class SessionMixin:
         self._clear_paper_db_records()
         self.balance = capital
         self.equity = capital
-        print(f"[模拟盘] 已重置，初始资金=${capital:.2f}", flush=True)
+        print(f"[模拟盘] 已重置，初始资金=${capital:.2f}")
 
     def _force_close_all_positions(self, prices: dict) -> None:
         from api.routes import get_state
@@ -112,7 +112,7 @@ class SessionMixin:
         _state.update(balance=self.balance, equity=self.balance, free_cash=self.balance,
                        margin_locked=0.0, positions=0, position_list=[])
         self._save_paper_state()
-        print(f"[关闭] 已强平 {count} 个持仓, 余额=${self.balance:.2f}", flush=True)
+        print(f"[关闭] 已强平 {count} 个持仓, 余额=${self.balance:.2f}")
 
     async def shutdown(self, prices: dict) -> None:
         self._force_close_all_positions(prices)
@@ -199,7 +199,7 @@ class SessionMixin:
             _state["total_slippage"] = self.total_slippage
             _state["trades"] = self.trades
             _state["wins"] = self.wins
-            print(f"[启动] 已恢复 {len(self._trade_history)} 条交易记录", flush=True)
+            print(f"[启动] 已恢复 {len(self._trade_history)} 条交易记录")
             return True
         except Exception as e:
             _log.warning("load paper state failed: %s", e)

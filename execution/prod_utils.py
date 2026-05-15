@@ -14,12 +14,12 @@ def wait_for_redis(redis_url: str, timeout: int = 60) -> bool:
             r = sync_redis.from_url(redis_url, decode_responses=True,
                                      socket_connect_timeout=3, socket_timeout=3)
             if r.ping():
-                print(f"[启动] Redis 就绪 ({redis_url})", flush=True)
+                print(f"[启动] Redis 就绪 ({redis_url})")
                 return True
         except Exception:
             pass
         time.sleep(2)
-    print(f"[启动] Redis 连接超时 ({timeout}s)", flush=True)
+    print(f"[启动] Redis 连接超时 ({timeout}s)")
     return False
 
 
@@ -31,12 +31,12 @@ def wait_for_postgres(pg_url: str, timeout: int = 30) -> bool:
             import psycopg2
             conn = psycopg2.connect(pg_url, connect_timeout=3)
             conn.close()
-            print("[启动] Postgres 就绪", flush=True)
+            print("[启动] Postgres 就绪")
             return True
         except Exception:
             pass
         time.sleep(2)
-    print(f"[启动] Postgres 连接超时 ({timeout}s)，继续无 DB 模式", flush=True)
+    print(f"[启动] Postgres 连接超时 ({timeout}s)，继续无 DB 模式")
     return False
 
 

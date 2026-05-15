@@ -398,10 +398,10 @@ async def refill_once() -> bool:
     async with aiohttp.ClientSession() as session:
         obj = await _fetch_batch(session)
     if not obj:
-        print("[台词弹夹] 进货失败：API 无有效 JSON", flush=True)
+        print("[台词弹夹] 进货失败：API 无有效 JSON")
         return False
     n = _ingest_batch(obj)
-    print(f"[台词弹夹] 进货完成，写入 {n} 条；库存 {pool_counts()}", flush=True)
+    print(f"[台词弹夹] 进货完成，写入 {n} 条；库存 {pool_counts()}")
     return n > 0
 
 

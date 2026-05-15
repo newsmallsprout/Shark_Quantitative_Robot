@@ -117,7 +117,7 @@ class CloseMixin:
                         evo["tp_mult"] = min(1.5, evo["tp_mult"] + 0.1)
                     evo["gen"] += 1
                     print(f"[山寨进化] {sym} gen={evo['gen']} trades={total} wr={wr:.1%} sr={sr:.1%} "
-                          f"atr×{evo['atr_mult']:.2f} stop×{evo['stop_mult']:.2f} tp×{evo['tp_mult']:.2f}", flush=True)
+                          f"atr×{evo['atr_mult']:.2f} stop×{evo['stop_mult']:.2f} tp×{evo['tp_mult']:.2f}")
         # 发布到 Redis 供 Go 进化引擎消费
         try:
             import redis as _redis2
@@ -156,17 +156,12 @@ class CloseMixin:
             f"余额={self.balance:.2f} static_equity={self.static_equity:.2f} 累计手续费={self.total_fees:.4f}"
         )
         self._log.append(msg)
-        print(msg, flush=True)
+        print(msg)
 
         # ── 止损反思：多维分析亏损原因 → 立即调整下笔交易参数 ──
-        if self._reflector and realized < 0:
-            local_tags = self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
-                                    self._regime_cache, None)
-            # 本地快速调整（只统计，不实时改参数 — Go SlowLoop 统一进化）
-            adj = self._reflector.maybe_adjust()
-            if adj:
-                print(f"[反思统计] {adj}", flush=True)
-            # AI深度诊断已移除 — 调整统一由Go侧SlowLoop计划轮次驱动
+        if hasattr(self, "_reflector") and self._reflector:
+            self._reflector.record_trade(sym, "profit" if pnl_pct > 0 else "loss", pnl_pct)
+            print(f"[反思记录] {sym} {'盈利' if pnl_pct > 0 else '亏损'} pnl={pnl_pct:.2f}%")
 
         # ── 在线学习：Q-Learning + ES更新 ──
         if self._learner:

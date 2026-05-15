@@ -94,7 +94,8 @@ class Reflector:
             f"[反思] {sym} {side} 亏{realized:.4f}({pnl_pct:.1f}%) "
             f"原因: {tag_str} | 行情={regime_entry} RSI={rsi_entry:.0f} "
             f"区间位={pos_in_range:.0f} 持{held:.0f}s",
-            flush=True,
+            # flush=True,
+
         )
         return tags
 

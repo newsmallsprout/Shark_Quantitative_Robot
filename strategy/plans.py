@@ -183,7 +183,7 @@ class PlanMixin:
         if self._warmup_done:
             return True
         self._warmup_done = True
-        print(f"🔥 计划优先：跳过K线预热，立即允许开仓 (tick={self._warmup_ticks})", flush=True)
+        print(f"🔥 计划优先：跳过K线预热，立即允许开仓 (tick={self._warmup_ticks})")
         return True
 
     def _gross_pnl_usd(self, sym: str, pos: dict, px: float) -> float:
@@ -317,7 +317,7 @@ class PlanMixin:
                     self._plan_gate._plan_cache.pop(sym, None)
                     self._plan_gate._last_fetch.pop(sym, None)
                 self._price_replan_last.pop(sym, None)
-                print(f"[山寨重规划] {sym} {reason} → 清旧计划，下个tick本地重做进攻计划", flush=True)
+                print(f"[山寨重规划] {sym} {reason} → 清旧计划，下个tick本地重做进攻计划")
             except Exception:
                 pass
             return

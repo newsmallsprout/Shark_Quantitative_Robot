@@ -85,7 +85,7 @@ async def _call_llm(url, key, model, system, prompt, max_tokens, json_mode=True,
                             await s.post(wh, json={"text":"Qwen全部模型额度耗尽"})
                 except: pass
             if _ai_committee_verbose():
-                print(f"[AI委] {label} Qwen全部耗尽", flush=True)
+                print(f"[AI委] {label} Qwen全部耗尽")
             return None, 0, 0
 
     payload = {"model":actual_model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":temperature,"max_tokens":max_tokens}
@@ -122,7 +122,7 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
     ds_dir = (ds_result.get("direction") or "").upper()
     ds_conf = ds_result.get("confidence", 0)
     if _ai_committee_verbose():
-        print(f"[AI委] {symbol} DeepSeek dir={ds_dir} conf={ds_conf}", flush=True)
+        print(f"[AI委] {symbol} DeepSeek dir={ds_dir} conf={ds_conf}")
     
     if ds_dir == "HOLD" or ds_conf < 35:
         return None, ds_in+ds_out, "hold", {}
@@ -133,13 +133,13 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
         if qw_result and qw_result.get("approved"):
             vote_score += 1.0
             if _ai_committee_verbose():
-                print(f"[AI委] {symbol} Qwen approved", flush=True)
+                print(f"[AI委] {symbol} Qwen approved")
     
     if VOLC_KEY:
         db_result, db_in, db_out = await _call_llm(VOLC_URL, VOLC_KEY, "doubao-1-5-lite-32k-250115", SYSTEM_SENTIMENT, f"{symbol} {analysis_prompt}", TOK_DOUBAO, json_mode=False, label=f"{symbol} DB", timeout=15)
         if db_result:
             if _ai_committee_verbose():
-                print(f"[AI委] {symbol} 豆包 sentiment={db_result.get('sentiment')}", flush=True)
+                print(f"[AI委] {symbol} 豆包 sentiment={db_result.get('sentiment')}")
     
     return ds_result, ds_in+ds_out, "ai_committee", {"vote": vote_score, "conf": ds_conf}
 

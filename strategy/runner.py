@@ -88,8 +88,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self._block_log_ts: Dict[str, float] = {}
         if _plan_authority_enabled():
             _log.info(
-                "📌 SHARK_PLAN_AUTHORITY 已启用：RangePlan 开仓后 Python 不覆盖 SL/TP/仓位/杠杆（不含 alt_dynamic）",
-                flush=True,
+                "📌 SHARK_PLAN_AUTHORITY 已启用：RangePlan 开仓后 Python 不覆盖 SL/TP/仓位/杠杆（不含 alt_dynamic）"
             )
 
     def _get_maker_fee(self, sym: str) -> float:
@@ -300,8 +299,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             if "max_drawdown_limit" in params:
                 pass  # 记录但不自动应用（需人工确认）
             _log.info(
-                f"[进化] GA最优参数已应用 (fitness={params.get('fitness', '?')})",
-                flush=True,
+                f"[进化] GA最优参数已应用 (fitness={params.get('fitness', '?')})"
             )
         else:
             _log.info(f"[进化] 未知类型 {ct}，跳过")
@@ -1171,8 +1169,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         )
                         if refreshed:
                             _log.info(
-                                f"[山寨计划] {sym} {replan_reason} → 本地进攻计划已刷新",
-                                flush=True,
+                                f"[山寨计划] {sym} {replan_reason} → 本地进攻计划已刷新"
                             )
                     else:
                         replan_now, replan_reason = self._should_replan_for_price_drift(
@@ -1469,8 +1466,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             _rej_str = " ".join(f"{k}={v}" for k, v in _rej.items() if v > 0)
             if _rej_str:
                 _log.info(
-                    f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str}",
-                    flush=True,
+                    f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str}"
                 )
 
         self._update_state(prices)
