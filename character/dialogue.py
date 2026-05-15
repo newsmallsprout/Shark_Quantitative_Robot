@@ -9,11 +9,11 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import aiohttp
 
-from character_voice import _extract_json_obj, _truncate_speech, character_llm_config
+from character.voice import _extract_json_obj, _truncate_speech, character_llm_config
 from persistence.dialogue_store import DialogueStore
 
 # ── 配置 ─────────────────────────────────────────────────────────────

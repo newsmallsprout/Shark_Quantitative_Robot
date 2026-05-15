@@ -21,20 +21,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY main.py .
-COPY ai_strategy.py .
-COPY dual_strategy.py .
-COPY license.py .
+COPY core/ ./core/
 COPY api/ ./api/
-COPY multi_exchange.py .
-COPY kline_cache.py .
-COPY market_regime.py .
-COPY trade_reflector.py .
-COPY online_learner.py .
-COPY live_engine.py .
+COPY market/ ./market/
+COPY strategy/ ./strategy/
+COPY character/ ./character/
+COPY learning/ ./learning/
+COPY utils/ ./utils/
 COPY execution/ ./execution/
-COPY tests/ ./tests/
-COPY dialogue_ammo.py .
-COPY character_voice.py .
 COPY observability/ ./observability/
 COPY persistence/ ./persistence/
 COPY alembic/ ./alembic/
@@ -47,12 +41,13 @@ COPY --from=web-builder /app/web/dist ./web/dist
 
 # Static assets (background images etc)
 COPY web/public ./web/public
+COPY web/video ./web/video
 
 # 密钥与本地配置通过运行时注入（Compose env_file、K8s Secret、-e 等），禁止打入镜像层。
 
 EXPOSE 80
 
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:80/api/health || exit 1
+    CMD curl -f http://localhost:80/health || exit 1
 
 CMD ["python", "main.py"]

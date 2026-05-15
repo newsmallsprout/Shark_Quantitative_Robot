@@ -2,7 +2,6 @@
 import time
 import os
 import json
-import asyncio
 from typing import Optional
 
 
@@ -32,7 +31,7 @@ def wait_for_postgres(pg_url: str, timeout: int = 30) -> bool:
             import psycopg2
             conn = psycopg2.connect(pg_url, connect_timeout=3)
             conn.close()
-            print(f"[启动] Postgres 就绪", flush=True)
+            print("[启动] Postgres 就绪", flush=True)
             return True
         except Exception:
             pass
@@ -41,7 +40,7 @@ def wait_for_postgres(pg_url: str, timeout: int = 30) -> bool:
     return False
 
 
-def build_health_check(plan_gate=None, redis_mgr=None, positions=None) -> dict:
+def build_health_check(plan_gate=None, positions=None) -> dict:
     """构建健康检查响应"""
     health = {
         "status": "ok",

@@ -30,3 +30,12 @@ tests/*
 !tests/*.py
 # 浅克隆的 Cursor 参考库（~260MB+），新环境请运行: bash scripts/setup_cursor_refs.sh
 third_party/cursor-references/
+
+# Cache and temp files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+logs/

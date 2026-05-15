@@ -5,9 +5,11 @@
 解决单交易所信号偏差问题
 """
 
-import asyncio, aiohttp, time, json
+import asyncio
+import aiohttp
+import time
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 from dataclasses import dataclass, field
 from collections import defaultdict
 

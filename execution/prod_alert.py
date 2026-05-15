@@ -1,10 +1,8 @@
 """生产告警：Slack 推送 + API 重试"""
 import os
 import time
-import json
 import asyncio
 import logging
-from typing import Optional
 
 _log = logging.getLogger(__name__)
 
@@ -74,7 +72,7 @@ async def alert_balance_low(balance: float, threshold: float):
 
 
 async def alert_system_start():
-    await _send_slack(f"🟢 [Shark] 系统启动 paper模式 初始资金$500")
+    await _send_slack("🟢 [Shark] 系统启动 paper模式 初始资金$500")
 
 
 # ── API 重试 ──

@@ -4,9 +4,15 @@ Gate.io USDT Perpetual Futures 实盘执行
 通过 SHARK_MODE=live + GATE_API_KEY/SECRET 激活
 """
 
-import os, json, time, hmac, hashlib, uuid, logging
+import os
+import json
+import time
+import hmac
+import hashlib
+import uuid
+import logging
 from typing import Optional, Dict, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 _log = logging.getLogger(__name__)
 
@@ -36,7 +42,8 @@ def _gate_headers(method: str, path: str, query: str = "", body: str = "") -> di
 def _api(method: str, path: str, body: dict = None, query: str = "", timeout: int = 10,
         retries: int = 3) -> dict:
     """调用 Gate.io API，带指数退避重试"""
-    import urllib.request, urllib.error
+    import urllib.request
+    import urllib.error
     url = f"{GATE_BASE}{path}"
     if query:
         url += f"?{query}"
@@ -292,7 +299,7 @@ class LiveEngine:
         """获取 USDT 可用余额"""
         try:
             # 用合约账户接口
-            result = _api("GET", "/accounts", query=f"currency=USDT")
+            result = _api("GET", "/accounts", query="currency=USDT")
             if isinstance(result, dict) and "available" in result:
                 return float(result["available"])
             if isinstance(result, list) and result:

@@ -17,7 +17,6 @@ License 鉴权中间件（Redis 验证版）。
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import secrets
@@ -83,8 +82,8 @@ def store_license(token: str, user: str, expiry: str) -> bool:
         r = _get_redis()
         import json as _json
         payload = _json.dumps({"user": user, "exp": expiry, "created_at": int(time.time())})
-        r.set(f"shark:license:active", token)
-        r.set(f"shark:license:meta", payload)
+        r.set("shark:license:active", token)
+        r.set("shark:license:meta", payload)
         return True
     except Exception as e:
         _log.error("store license failed: %s", e)
@@ -124,7 +123,7 @@ def _verify_license_redis(token: str) -> Tuple[bool, str]:
         return True, ""
     except Exception as e:
         _log.warning("license redis verify failed: %s", e)
-        return False, f"Redis 验证失败"
+        return False, "Redis 验证失败"
 
 
 def cat_response() -> Response:

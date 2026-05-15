@@ -4,7 +4,9 @@ Shark K线数据缓存 — 为技术指标提供OHLCV数据
 支持1m/5m/15m/1h周期，供进化策略使用
 """
 
-import time, asyncio, aiohttp
+import time
+import asyncio
+import aiohttp
 from typing import Dict, List
 
 GATE_KLINE = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
@@ -59,7 +61,7 @@ class KlineCache:
                 "close": closes, "high": highs, "low": lows,
                 "open": opens, "volume": volumes, "ts": timestamps,
             }
-        except Exception as e:
+        except Exception:
             pass  # 单币种失败不影响其他
     
     async def update(self, symbol: str):

@@ -55,7 +55,7 @@ def main():
 
     print()
     print(f"# Shark License — {args.user} (expires {args.expiry})")
-    print(f"# 复制下面这行在前端登录弹窗中输入：")
+    print("# 复制下面这行在前端登录弹窗中输入：")
     print(token)
     print()
     print("# 前端 js console 直接设置（跳过登录）：")

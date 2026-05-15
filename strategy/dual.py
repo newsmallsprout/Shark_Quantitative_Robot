@@ -54,7 +54,7 @@ STABLE_CONFIG = {
     "min_plan_margin_pct": 0.10, # RangePlan 保证金地板：重仓不能开成蚊子仓
     "max_plan_margin_pct": 0.24,
     "min_leverage": 20,
-    "max_leverage": 35,
+    "max_leverage": 30,
     "max_positions": 3,        # BTC + ETH + SOL 三仓都允许，靠 60% 资金桶分配
     "min_volume": 500000,      # 最低成交量 50万（确保流动性）
     # Gate 24h 涨跌幅为百分数；0 表示不因波动过小拒单（避免 BTC/ETH 横盘不入池）
@@ -82,12 +82,12 @@ VOLATILE_CONFIG = {
     "disable_aggressive_entry": False,
     "margin_pct": 0.02,         # 保证金 2% 余额（山寨起步）
     "min_plan_margin_pct": 0.02, # 山寨也保持有效仓位，不做无意义小单
-    "min_leverage": 15,
-    "max_leverage": 70,
+    "min_leverage": 20,
+    "max_leverage": 50,
     "leverage": 30,
     "max_positions": 0,        # 不限制山寨数量，完全由资金池控制
-    "min_volume": 1000000,     # 最低成交量 100万（放宽，更多机会）
-    "min_change": 1.5,         # 涨跌幅至少 1.5%（放宽，不卡太死）
+    "min_volume": 500000,      # 最低成交量 50万（放宽，更多机会）
+    "min_change": 1.0,         # 涨跌幅至少 1.0%（放宽）
     "max_change": 25,          # 最大涨跌幅 25%
     
     # 止损/止盈全部由行情+ATR实时计算
@@ -102,7 +102,7 @@ VOLATILE_CONFIG = {
     "tp1_target": 5.0,         # +5% 平 50%
     
     # 冷却
-    "cooldown": 15,            # 冷却 15s
+    "cooldown": 10,            # 冷却 10s
 }
 
 # ═══════════════════════════════════════════════

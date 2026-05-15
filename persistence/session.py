@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional, Tuple
 
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 
 def resolve_database_url(raw: Optional[str] = None) -> Optional[str]:
