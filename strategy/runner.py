@@ -1008,12 +1008,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         # ── 开关检查：实盘/模拟盘都需手动开启 ──
         _is_live_mode = self._live and self._live.active
+        _trade_enabled = True
         if _is_live_mode and not self._live_trading_enabled:
-            self._update_state(prices)
-            return  # 实盘模式但开关关闭，不交易
+            _trade_enabled = False  # 实盘模式但开关关闭，不开新仓
         if not _is_live_mode and not self._paper_trading_enabled:
+            _trade_enabled = False  # 模拟盘模式但开关关闭，不开新仓
+
+        if not _trade_enabled:
             self._update_state(prices)
-            return  # 模拟盘模式但开关关闭，不交易
+            return  # 如果不开新仓，直接跳过后面的开仓逻辑（不影响前面已经执行的持仓管理和平仓逻辑）
 
         # ── Fuse 熔断检查（单币对独立：触发→请求重规划→30秒冷却，不阻塞其他币对）──
         if self._plan_gate:
