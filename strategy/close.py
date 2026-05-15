@@ -158,8 +158,20 @@ class CloseMixin:
 
         # ── 止损反思：多维分析亏损原因 → 立即调整下笔交易参数 ──
         if hasattr(self, "_reflector") and self._reflector:
-            self._reflector.record_trade(sym, "profit" if pnl_pct > 0 else "loss", pnl_pct)
-            print(f"[反思记录] {sym} {'盈利' if pnl_pct > 0 else '亏损'} pnl={pnl_pct:.2f}%")
+            try:
+                # 兼容旧版 Reflector，如果它没有 record_trade 方法，就调用 analyze
+                if hasattr(self._reflector, "record_trade"):
+                    self._reflector.record_trade(sym, "profit" if pnl_pct > 0 else "loss", pnl_pct)
+                elif realized < 0:
+                    local_tags = self._reflector.analyze(sym, pos, realized, pnl_pct, reason, px,
+                                            self._regime_cache, None)
+                    adj = self._reflector.maybe_adjust()
+                    if adj:
+                        print(f"[反思统计] {adj}")
+                print(f"[反思记录] {sym} {'盈利' if pnl_pct > 0 else '亏损'} pnl={pnl_pct:.2f}%")
+            except Exception as e:
+                import traceback
+                self._log.append(f"[Reflector Error] {e}\n{traceback.format_exc()}")
 
         # ── 在线学习：Q-Learning + ES更新 ──
         if self._learner:
