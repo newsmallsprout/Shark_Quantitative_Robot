@@ -604,25 +604,6 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             cfg = get_config(sym)
             is_st = is_stable(sym)
 
-            # ── 计划方向反转检查 (Plan Reversal Check) ──
-            if self._plan_gate:
-                latest_plan = self._plan_gate.get_plan(sym)
-                if latest_plan:
-                    new_side, _, _, _ = self._side_from_plan(latest_plan, px)
-                    if new_side and new_side != pos["side"]:
-                        current_sig = pos.get("plan_signature")
-                        latest_gen = latest_plan.get("generated_at")
-                        is_new_plan = True
-                        if current_sig and isinstance(current_sig, tuple) and len(current_sig) > 0:
-                            if current_sig[0] == latest_gen:
-                                is_new_plan = False
-                        
-                        if is_new_plan:
-                            self._close_position(
-                                sym, px, f"计划方向反转(持{pos['side']}新{new_side})", pnl_pct, prices
-                            )
-                            continue
-
             # 行情止损覆盖（开仓时判定的行情类型）
             _rc = self._regime_cache.get(sym, {}).get("cfg", {})
             _stop_mult = _rc.get("stop_atr_mult", 2.0)
