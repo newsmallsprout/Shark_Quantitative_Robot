@@ -1294,7 +1294,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 bucket_used = sum(
                     p["margin"]
                     for s, p in self.positions.items()
-                    if is_stable(s) == st_bucket
+                    if is_stable(s) == is_stable(sym)
                 )
                 
                 if bucket_used + margin > bucket_cap:
