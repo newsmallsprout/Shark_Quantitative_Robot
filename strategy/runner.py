@@ -960,15 +960,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         self._close_position(sym, px, "移动止盈", pnl_pct, prices)
                         continue
 
-            # ── 山寨微利止盈：盈利>5倍手续费 + 保证金比例门槛 ──
-            if not pos.get("plan_stick") and not is_stable(sym):
-                gross_usd = self._gross_pnl_usd(sym, pos, px)
-                est_fee = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
-                margin = pos.get("margin", 4)
-                min_profit = max(0.30, margin * 0.075)  # 保证金越大门槛越高
-                if gross_usd > max(est_fee * 5, min_profit):
-                    self._close_position(sym, px, "山寨微利止盈", pnl_pct, prices)
-                    continue
+            # ── 山寨微利止盈 (已移除，交由 AI 和移动止盈处理) ──
+            # if not pos.get("plan_stick") and not is_stable(sym):
+            #     gross_usd = self._gross_pnl_usd(sym, pos, px)
+            #     est_fee = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
+            #     margin = pos.get("margin", 4)
+            #     min_profit = max(0.30, margin * 0.075)
+            #     if gross_usd > max(est_fee * 5, min_profit):
+            #         self._close_position(sym, px, "山寨微利止盈", pnl_pct, prices)
+            #         continue
 
             # ── ATR动态止盈（无固定值）──
             if pnl_pct >= dyn_tp and self._take_profit_net_ok(sym, pos, px):
