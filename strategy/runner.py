@@ -839,6 +839,18 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         add_margin = min(
                             net_harvest * 2, pos["margin"] * 0.5, self.balance * 0.05
                         )
+                        
+                        # ── 加仓前：检查该加仓操作是否会突破所在币种类型的资金桶上限 ──
+                        total_account_equity = self.balance + sum(p["margin"] for p in self.positions.values())
+                        bucket_cap = get_capital_limit(total_account_equity, sym)
+                        bucket_used = sum(
+                            p["margin"] for s, p in self.positions.items() if is_stable(s) == is_stable(sym)
+                        )
+                        
+                        if bucket_used + add_margin > bucket_cap:
+                            # 将加仓金额砍到只剩桶里剩余的额度，如果不剩了就设为 0
+                            add_margin = max(0.0, bucket_cap - bucket_used)
+                            
                         if add_margin >= 0.3 and self.balance > add_margin:
                             add_size = (add_margin * pos["leverage"]) / max(
                                 qh * px, 1e-9
@@ -942,6 +954,18 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 )
                 if signal_valid and self.balance > pos["margin"] * 1.2:
                     add_margin = pos["margin"] * 0.5
+                    
+                    # ── 加仓前：检查资金费率重叠加仓是否会突破所在币种类型的资金桶上限 ──
+                    total_account_equity = self.balance + sum(p["margin"] for p in self.positions.values())
+                    bucket_cap = get_capital_limit(total_account_equity, sym)
+                    bucket_used = sum(
+                        p["margin"] for s, p in self.positions.items() if is_stable(s) == is_stable(sym)
+                    )
+                    
+                    if bucket_used + add_margin > bucket_cap:
+                        # 超过上限，强制截断加仓金额，避免吸血
+                        add_margin = max(0.0, bucket_cap - bucket_used)
+                        
                     if add_margin >= 0.5 and self.balance > add_margin:
                         q_py = self._quanto_for(sym)
                         add_size = (add_margin * pos["leverage"]) / max(q_py * px, 1e-9)
@@ -1302,6 +1326,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 )
                 
                 if bucket_used + margin > bucket_cap:
+                    # 如果超出了该类别的资金池上限，则拒绝开仓
                     _rej["cap_full"] += 1
                     continue
 
