@@ -63,10 +63,7 @@ class CloseMixin:
             self.balance += pos["margin"] + gross - fee_close
         print(
             f"[DEBUG费用] 毛利={gross:.6f} 平仓费={fee_close:.6f} 净利={realized:.6f} "
-            f"balance={self.balance:.2f} total_fees={self.total_fees:.4f}",
-            flush=True,
-        )
-
+            f"balance={self.balance:.2f} total_fees={self.total_fees:.4f}"
         self.realized_pnl += realized
         self.gross_realized += gross  # 毛利累计（不含手续费），用于余额展示
         self.closed_trades += 1
