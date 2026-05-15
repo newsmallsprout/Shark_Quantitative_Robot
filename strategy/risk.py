@@ -155,7 +155,7 @@ class RiskMixin:
             float(getattr(self, "static_equity", 0) or 0),
             float(getattr(self, "equity", 0) or 0),
             float(getattr(self, "_initial_capital", 0) or 0),
-            float(self.balance or 0),
+            float(self.balance or 0) + sum(p.get("margin", 0) for p in getattr(self, "positions", {}).values()),
         )
         margin = sizing_base * pct
         try:

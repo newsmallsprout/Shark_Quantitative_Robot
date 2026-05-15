@@ -983,7 +983,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         # 计算当前总风险敞口
         total_margin = sum(p["margin"] for p in self.positions.values())
-        # self.balance 已是扣除锁定保证金后的可支配资金，不再减 total_margin
+        # The total account equity (available balance + margin used by positions)
+        total_account_equity = self.balance + total_margin
+        
         available = self.balance
         if available <= 5.0:  # Allow a small buffer for dust instead of strict 0
             self._note_tick_block(
@@ -1194,11 +1196,14 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             margin = self._margin_from_plan(
                 plan_cache, cfg, _regime_cfg, chg_abs, strict_plan=plan_stick
             )
+            
+            # Use the correct total equity base for bucket capital limit, 
+            # NOT just remaining balance, to prevent buckets from shrinking each other.
+            cap = get_capital_limit(total_account_equity, sym)
+            
             if margin <= 0:
                 _rej["no_margin"] += 1
                 continue
-
-            cap = get_capital_limit(self.balance, sym)
             st_bucket = is_stable(sym)
 
             entry_price = px  # 默认市价，策略入场在方向确定后调整
@@ -1288,8 +1293,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     
                 # Check bucket-specific capital limits (Stable vs Volatile)
                 # Ensure we use total initial capital for the bucket calculation, not just remaining balance
-                total_account_value = self.balance + sum(p["margin"] for p in self.positions.values())
-                bucket_cap = get_capital_limit(total_account_value, sym)
+                bucket_cap = get_capital_limit(total_account_equity, sym)
                 
                 bucket_used = sum(
                     p["margin"]
