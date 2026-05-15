@@ -10,8 +10,8 @@ __pycache__/
 .env
 venv/
 env/
-logs/
-data/
+/logs/
+/data/
 license/*
 !license/public.pem
 !license/fingerprint_override.example
@@ -38,4 +38,4 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
-logs/
+/logs/
