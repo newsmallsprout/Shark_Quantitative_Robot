@@ -6,7 +6,10 @@ import json
 import os
 import time
 import uuid
+import logging
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
 from fastapi.responses import HTMLResponse, Response
@@ -34,6 +37,8 @@ def _default_paper_trading_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+import asyncio
+
 _state = {
     "equity": 500.0, "balance": 500.0, "free_cash": 500.0, "initial_capital": 500.0,
     "unrealized_pnl": 0.0, "realized_pnl": 0.0, "win_rate": 0.0,
@@ -53,6 +58,7 @@ _state = {
     },
 }
 
+state_lock = asyncio.Lock()
 
 def get_state() -> dict:
     return _state
@@ -156,10 +162,11 @@ async def paper_status(_: None = Depends(require_api_token)):
 
 @app.post("/api/paper/toggle")
 async def paper_toggle(_: None = Depends(require_api_token)):
-    new_val = not _state.get("paper_trading", False)
-    _state["paper_trading"] = new_val
-    if not new_val:
-        _state["paper_close_all"] = True
+    async with state_lock:
+        new_val = not _state.get("paper_trading", False)
+        _state["paper_trading"] = new_val
+        if not new_val:
+            _state["paper_close_all"] = True
     return {"trading_enabled": new_val}
 
 
@@ -171,7 +178,8 @@ async def paper_reset(request: Request, _: None = Depends(require_api_token)):
     except Exception:
         capital = 500.0
     capital = max(50.0, min(1000000.0, capital))
-    _state["paper_reset_request"] = {"capital": capital}
+    async with state_lock:
+        _state["paper_reset_request"] = {"capital": capital}
     return {"ok": True, "capital": capital}
 
 
@@ -208,18 +216,19 @@ async def set_shark_mode(request: Request, _: None = Depends(require_api_token))
         return {"error": '请提供 {"mode": "paper"|"live"}'}
     if new_mode not in ("paper", "live"):
         return {"error": "mode 必须是 paper 或 live"}
-    _state["shark_mode"] = new_mode
-    _state["switch_mode_request"] = new_mode
-    if new_mode == "live":
-        if "live" not in _state:
-            _state["live"] = {"active": False, "trading_enabled": False}
-        _state["live"]["active"] = True
-        _state["paper_trading"] = False
-    else:
-        _state["paper_trading"] = _default_paper_trading_enabled()
-        _state["live_trading"] = False
-        if "live" in _state:
-            _state["live"]["active"] = False
+    async with state_lock:
+        _state["shark_mode"] = new_mode
+        _state["switch_mode_request"] = new_mode
+        if new_mode == "live":
+            if "live" not in _state:
+                _state["live"] = {"active": False, "trading_enabled": False}
+            _state["live"]["active"] = True
+            _state["paper_trading"] = False
+        else:
+            _state["paper_trading"] = _default_paper_trading_enabled()
+            _state["live_trading"] = False
+            if "live" in _state:
+                _state["live"]["active"] = False
     return {"ok": True, "mode": new_mode}
 
 
@@ -266,34 +275,36 @@ async def evo_pending(_: None = Depends(require_api_token)):
 
 @app.post("/api/evo/approve/{change_id}")
 async def evo_approve(change_id: int, _: None = Depends(require_api_token)):
-    pending = _state.get("evo_pending", [])
-    target = None
-    for c in pending:
-        if c.get("id") == change_id:
-            target = c
-            break
-    if not target:
-        return {"error": f"修改 #{change_id} 不存在"}
-    _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
-    _state["evo_apply"] = target
+    async with state_lock:
+        pending = _state.get("evo_pending", [])
+        target = None
+        for c in pending:
+            if c.get("id") == change_id:
+                target = c
+                break
+        if not target:
+            return {"error": f"修改 #{change_id} 不存在"}
+        _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
+        _state["evo_apply"] = target
     return {"ok": True}
 
 
 @app.post("/api/evo/reject/{change_id}")
 async def evo_reject(change_id: int, _: None = Depends(require_api_token)):
-    pending = _state.get("evo_pending", [])
-    target = None
-    for c in pending:
-        if c.get("id") == change_id:
-            target = c
-            break
-    if not target:
-        return {"error": f"修改 #{change_id} 不存在"}
-    _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
-    _state.setdefault("evo_cooldown_queue", []).append({
-        "type": target.get("type", ""),
-        "until": time.time() + 300,
-    })
+    async with state_lock:
+        pending = _state.get("evo_pending", [])
+        target = None
+        for c in pending:
+            if c.get("id") == change_id:
+                target = c
+                break
+        if not target:
+            return {"error": f"修改 #{change_id} 不存在"}
+        _state["evo_pending"] = [c for c in pending if c.get("id") != change_id]
+        _state.setdefault("evo_cooldown_queue", []).append({
+            "type": target.get("type", ""),
+            "until": time.time() + 300,
+        })
     return {"ok": True}
 
 
@@ -310,11 +321,12 @@ async def live_status(_: None = Depends(require_api_token)):
 
 @app.post("/api/live/toggle")
 async def live_toggle(_: None = Depends(require_api_token)):
-    live = _state.setdefault("live", {"active": False, "trading_enabled": False})
-    live["trading_enabled"] = not live.get("trading_enabled", False)
-    if not live["trading_enabled"]:
-        _state["live_close_all"] = True
-    _state["live_trading"] = live["trading_enabled"]
+    async with state_lock:
+        live = _state.setdefault("live", {"active": False, "trading_enabled": False})
+        live["trading_enabled"] = not live.get("trading_enabled", False)
+        if not live["trading_enabled"]:
+            _state["live_close_all"] = True
+        _state["live_trading"] = live["trading_enabled"]
     return {"trading_enabled": live["trading_enabled"]}
 
 

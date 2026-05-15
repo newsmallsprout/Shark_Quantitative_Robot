@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import uuid
+import json
 from collections.abc import Awaitable, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -23,7 +24,6 @@ REQUEST_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="-",
 )
 
-
 class RequestIdLogFilter(logging.Filter):
     """为每条日志补上 `request_id` 属性供 Formatter 使用。"""
 
@@ -32,18 +32,26 @@ class RequestIdLogFilter(logging.Filter):
             record.request_id = REQUEST_ID_CTX.get()
         return True
 
+class JsonFormatter(logging.Formatter):
+    """标准的结构化 JSON 日志 Formatter"""
+    def format(self, record: logging.LogRecord) -> str:
+        log_obj = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "rid": getattr(record, "request_id", "-"),
+            "logger": record.name,
+            "message": record.getMessage()
+        }
+        if record.exc_info:
+            log_obj["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_obj, ensure_ascii=False)
 
 def configure_logging() -> None:
-    """配置根 logger：单行、含 rid。进程入口调用一次即可。"""
+    """配置根 logger：单行 JSON 格式，含 rid。进程入口调用一次即可。"""
     level_name = os.environ.get("SHARK_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s %(levelname)s [rid=%(request_id)s] %(name)s %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
-    )
+    handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
     handler.addFilter(RequestIdLogFilter())
     root = logging.getLogger()
     root.handlers.clear()

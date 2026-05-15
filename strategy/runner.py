@@ -7,6 +7,7 @@ from character.dialogue import pop_line, trade_category_for_open
 import random
 
 import os, time, json, math, logging, uuid
+_log = logging.getLogger(__name__)
 from api.routes import get_state
 from typing import Dict, List, Optional, Any
 from strategy.session import SessionMixin
@@ -19,13 +20,6 @@ from execution.plan_gate import PlanGate
 from execution.order_command import build_rl_order_command, build_order_command
 from market.data import ContractSpec, TAKER_FEE, MAKER_FEE, MAX_TOTAL_EXPOSURE
 from strategy.dual import get_config, is_stable, is_high_vol_alt, get_capital_limit, trading_track_allows_open
-
-# 开仓质量过滤常量
-MIN_VOLUME = 2000000
-MIN_CHANGE = 1.0
-MAX_CHANGE = 35.0
-MIN_PRICE = 0.01
-MAX_POSITIONS = 0
 
 try:
     from market.kline import KlineCache, init_kline_cache, get_kline_cache
@@ -93,7 +87,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self._last_tick_block: Optional[dict] = None
         self._block_log_ts: Dict[str, float] = {}
         if _plan_authority_enabled():
-            print(
+            _log.info(
                 "📌 SHARK_PLAN_AUTHORITY 已启用：RangePlan 开仓后 Python 不覆盖 SL/TP/仓位/杠杆（不含 alt_dynamic）",
                 flush=True,
             )
@@ -154,7 +148,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 if adj:
                     msg = self._reflector.apply_ai_adjustments(adj)
                     if msg:
-                        print(f"[AI调整] {msg}", flush=True)
+                        _log.info(f"[AI调整] {msg}")
                     self._reflector.ai_insights.append(
                         {
                             "sym": sym,
@@ -165,7 +159,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         }
                     )
         except Exception as e:
-            print(f"[AI反思] 调用失败: {e}", flush=True)
+            _log.info(f"[AI反思] 调用失败: {e}")
 
     async def _fetch_ai_plan(
         self, sym: str, px: float, funding: float, change: float, vol: float
@@ -189,7 +183,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     pos["ai_entry"] = plan.get("entry_price", px)
                     conf = plan.get("confidence", 0)
                     rr = plan.get("risk_reward", 0)
-                    print(
+                    _log.info(
                         f"[AI] {sym} 置信{conf} 盈亏比{rr:.1f} "
                         f"支撑{plan.get('supports', [])} 阻力{plan.get('resistances', [])}"
                     )
@@ -285,18 +279,18 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         params = change.get("params", {})
         if ct == "margin_mult":
             self._evo_margin_mult = params.get("value", self._evo_margin_mult)
-            print(f"[进化] 保证金倍率 → {self._evo_margin_mult}", flush=True)
+            _log.info(f"[进化] 保证金倍率 → {self._evo_margin_mult}")
         elif ct == "skip_alts":
             self._evo_skip_alts = params.get("value", self._evo_skip_alts)
-            print(f"[进化] 暂停山寨 → {self._evo_skip_alts}", flush=True)
+            _log.info(f"[进化] 暂停山寨 → {self._evo_skip_alts}")
         elif ct == "cooldown_bonus":
             self._evo_cooldown_bonus = params.get("value", self._evo_cooldown_bonus)
-            print(f"[进化] 额外冷却 → {self._evo_cooldown_bonus}", flush=True)
+            _log.info(f"[进化] 额外冷却 → {self._evo_cooldown_bonus}")
         elif ct == "ai_threshold":
             # 更新 Reflector 的 AI 阈值
             if self._reflector:
                 self._reflector.ai_boost = params.get("value", self._reflector.ai_boost)
-            print(f"[进化] AI阈值 → {params.get('value')}", flush=True)
+            _log.info(f"[进化] AI阈值 → {params.get('value')}")
         elif ct == "ga_best_params":
             # Go RL 引擎 GA 最优参数
             if "margin_pct" in params:
@@ -305,12 +299,12 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 self._reflector.stop_boost = params["stop_atr_mult"]
             if "max_drawdown_limit" in params:
                 pass  # 记录但不自动应用（需人工确认）
-            print(
+            _log.info(
                 f"[进化] GA最优参数已应用 (fitness={params.get('fitness', '?')})",
                 flush=True,
             )
         else:
-            print(f"[进化] 未知类型 {ct}，跳过", flush=True)
+            _log.info(f"[进化] 未知类型 {ct}，跳过")
 
     def _strategic_entry(
         self, sym: str, side: str, px: float, regime_value: str
@@ -453,12 +447,14 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self, sym: str, reason: str, pos: Optional[dict] = None
     ) -> None:
         """单币对连续止损只告警，不阻止下一单立即开。"""
+        cfg = get_config(sym)
+        fuse_limit = cfg.get("fuse_sl_streak_limit", 3)
         r = str(reason)
         is_sl = "止损" in r and "止盈" not in r
         if is_sl:
             st = self._fuse_sl_streak.get(sym, 0) + 1
             self._fuse_sl_streak[sym] = st
-            if st >= _FUSE_SL_STREAK_LIMIT:
+            if st >= fuse_limit:
                 signature = (pos or {}).get("plan_signature")
                 if signature:
                     self._loss_replay_guard[sym] = {
@@ -466,7 +462,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         "ts": time.time(),
                     }
                 self._fuse_sl_streak[sym] = 0
-                self._request_symbol_replan(sym, f"连续止损{_FUSE_SL_STREAK_LIMIT}次")
+                self._request_symbol_replan(sym, f"连续止损{fuse_limit}次")
         else:
             self._fuse_sl_streak[sym] = 0
             self._loss_replay_guard.pop(sym, None)
@@ -481,7 +477,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         if now - last >= log_every_sec:
             self._block_log_ts[code] = now
             line = f"[交易暂停] {code}: {detail}"
-            print(line, flush=True)
+            _log.info(line)
             _log.warning("%s", line)
 
     async def tick(
@@ -494,29 +490,40 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
     ):
         now = time.time()
 
-        # 同步实盘/模拟盘开关
-        self._live_trading_enabled = get_state().get("live_trading", False)
-        self._paper_trading_enabled = get_state().get("paper_trading", False)
-        self._last_tick_block = None
+        from api.routes import state_lock
+        async with state_lock:
+            # 同步实盘/模拟盘开关
+            self._live_trading_enabled = get_state().get("live_trading", False)
+            self._paper_trading_enabled = get_state().get("paper_trading", False)
+            self._last_tick_block = None
+    
+            # 处理审批通过的进化修改
+            evo_apply = get_state().pop("evo_apply", None)
+            
+            # 处理进化冷却队列（审批/拒绝后5分钟不重复推送同类型）
+            cooldowns = list(get_state().pop("evo_cooldown_queue", []))
+            
+            # 处理模式切换请求（前端点击切换 paper/live）
+            switch_req = get_state().pop("switch_mode_request", None)
+            
+            # 处理模拟盘重置请求
+            reset_req = get_state().pop("paper_reset_request", None)
+            
+            # 停止交易 → 平掉所有持仓
+            live_close_all = get_state().pop("live_close_all", False)
+            paper_close_all = get_state().pop("paper_close_all", False)
 
-        # 处理审批通过的进化修改
-        evo_apply = get_state().pop("evo_apply", None)
         if evo_apply:
             self._apply_evo_change(evo_apply)
 
-        # 处理进化冷却队列（审批/拒绝后5分钟不重复推送同类型）
-        for item in list(get_state().pop("evo_cooldown_queue", [])):
+        for item in cooldowns:
             self._evo_cooldown_types[item["type"]] = item["until"]
 
-        # 处理模式切换请求（前端点击切换 paper/live）
-        switch_req = get_state().pop("switch_mode_request", None)
         if switch_req:
             result = self.switch_mode(switch_req)
             if "error" in result:
-                print(f"[模式切换] 失败: {result['error']}", flush=True)
+                _log.info(f"[模式切换] 失败: {result['error']}")
 
-        # 处理模拟盘重置请求
-        reset_req = get_state().pop("paper_reset_request", None)
         if reset_req:
             self._reset_paper(reset_req["capital"])
 
@@ -539,29 +546,31 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 pass
 
         # 停止交易 → 平掉所有持仓
-        if get_state().pop("live_close_all", False):
+        if live_close_all:
             for sym in list(self.positions):
                 px = prices.get(sym, 0)
                 if px > 0:
                     self._close_position(sym, px, "手动停止", 0, prices)
-            print("[实盘] 已平掉所有持仓", flush=True)
-        if get_state().pop("paper_close_all", False):
+            _log.info("[实盘] 已平掉所有持仓")
+        if paper_close_all:
             for sym in list(self.positions):
                 px = prices.get(sym, 0)
                 if px > 0:
                     self._close_position(sym, px, "手动停止(模拟)", 0, prices)
-            print("[模拟] 已平掉所有持仓", flush=True)
+            _log.info("[模拟] 已平掉所有持仓")
 
         # 偶尔飙句骚话调节气氛（5%概率/tick，不在交易时触发）
         if len(self.positions) == 0 and random.random() < 0.05:
             speech = pop_line("boring")
             if speech:
-                get_state()["character_event"] = {
-                    "Event_Type": "闲聊",
-                    "Speech_Text": speech,
-                    "Facial_Expression": "idle",
-                    "Emotion_Index": 5,
-                }
+                from api.routes import state_lock
+                async with state_lock:
+                    get_state()["character_event"] = {
+                        "Event_Type": "闲聊",
+                        "Speech_Text": speech,
+                        "Facial_Expression": "idle",
+                        "Emotion_Index": 5,
+                    }
 
         # ── 实盘：定期同步 + 对账（不因 API 熔断整段跳过；止盈止损仍按行情跑）──
         if self._live and self._live.active:
@@ -673,6 +682,27 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
             best_pnl = pos.get("best_pnl", pnl_pct)
 
+            # ── 平仓风控集中管理 ──
+            from strategy.risk import RiskValidator
+            should_close, close_reason = RiskValidator.check_close_conditions(
+                sym=sym,
+                pos=pos,
+                px=px,
+                pnl_pct=pnl_pct,
+                best_pnl=best_pnl,
+                dyn_tp=dyn_tp,
+                dyn_sl=dyn_sl,
+                cfg=cfg,
+                gross_usd=self._gross_pnl_usd(sym, pos, px),
+                est_fee=self._est_fee_usd(sym, pos, px, fee_rounds=3.0),
+                is_stable=is_stable(sym),
+                take_profit_net_ok=self._take_profit_net_ok(sym, pos, px)
+            )
+            
+            if should_close:
+                self._close_position(sym, px, close_reason, pnl_pct, prices)
+                continue
+
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
             if ai_plan and not pos.get("plan_stick"):
@@ -731,7 +761,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                                 ) / pos["size"]
                                 pos["defense_used"] = True
                                 self.trades += 1
-                                print(f"[AI防守] {sym} 缩量补仓 {add_m:.2f}@ {px:.4f}")
+                                _log.info(f"[AI防守] {sym} 缩量补仓 {add_m:.2f}@ {px:.4f}")
                                 self._persist_margin_delta(
                                     prices,
                                     sym,
@@ -746,7 +776,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             pos["size"] -= reduce_s
                             pos["margin"] *= 1 - reduce_ratio
                             pos["defense_used"] = True
-                            print(f"[AI防守] {sym} 放量减仓 {reduce_ratio * 100:.0f}%")
+                            _log.info(f"[AI防守] {sym} 放量减仓 {reduce_ratio * 100:.0f}%")
 
                 # 3. AI 目标层（按价格排序）
                 targets = sorted(
@@ -803,7 +833,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             "ai_harvest_30pct",
                         )
 
-                        print(
+                        _log.info(
                             f"[AI收割] {sym} 平{harvest_ratio * 100:.0f}%落袋 ${net_harvest:+.4f}"
                         )
 
@@ -830,7 +860,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             # 全局止损移至初始开仓价（保本）
                             pos["trailing_stop"] = pos.get("ai_entry", pos["entry"])
                             pos[layer_key] = True
-                            print(
+                            _log.info(
                                 f"[AI加仓] {sym} 用利润${net_harvest:.4f} 加仓${add_margin:.2f} @{px:.4f} 止损→保本"
                             )
                             self._persist_margin_delta(
@@ -860,7 +890,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             pos["trailing_stop"] = (
                                 px * 0.99 if pside == "long" else px * 1.01
                             )
-                            print(
+                            _log.info(
                                 f"[AI止盈] {sym} 部分{ratio * 100:.0f}% @{px:.4f} 余{pos['size']:.4f}"
                             )
 
@@ -951,35 +981,6 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 else:
                     pos["plan_sl"] = pos["entry"] * 0.9995
 
-            # 移动止盈：从最高点回撤（计划锁定时仅用计划 TP / ATR 目标，不用回撤强平）
-            trail_bar = trail_trigger
-            if not pos.get("plan_stick") and best_pnl > trail_bar:
-                trail_pct = abs(dyn_sl) * trail_ratio
-                if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
-                    if self._take_profit_net_ok(sym, pos, px):
-                        self._close_position(sym, px, "移动止盈", pnl_pct, prices)
-                        continue
-
-            # ── 山寨微利止盈：盈利>5倍手续费 + 保证金比例门槛 ──
-            if not pos.get("plan_stick") and not is_stable(sym):
-                gross_usd = self._gross_pnl_usd(sym, pos, px)
-                est_fee = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
-                margin = pos.get("margin", 4)
-                min_profit = max(0.30, margin * 0.075)  # 保证金越大门槛越高
-                if gross_usd > max(est_fee * 5, min_profit):
-                    self._close_position(sym, px, "山寨微利止盈", pnl_pct, prices)
-                    continue
-
-            # ── ATR动态止盈（无固定值）──
-            if pnl_pct >= dyn_tp and self._take_profit_net_ok(sym, pos, px):
-                self._close_position(sym, px, "ATR止盈", pnl_pct, prices)
-                continue
-
-            # 动态止损
-            if pnl_pct <= dyn_sl:
-                self._close_position(sym, px, "止损", pnl_pct, prices)
-                continue
-
             # 超时平仓已禁用
 
         # 计算当前总风险敞口
@@ -1038,30 +1039,31 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             _can_open = self._warmup_allows_open(
                 has_kline=bool(kc), has_detector=bool(detector)
             )
+        
+        from strategy.risk import RiskValidator
         scored = []
         for sym in prices:
             if sym in self.positions:
                 continue
 
-            vol = volumes.get(sym, 0)
-            chg_abs = abs(changes.get(sym, 0))
-
-            # 用策略配置过滤（不是全局常量）
             cfg = get_config(sym)
-            min_vol = cfg.get("min_volume", MIN_VOLUME)
-            min_chg = cfg.get("min_change", MIN_CHANGE)
-            max_chg = cfg.get("max_change", MAX_CHANGE)
-
-            if vol < min_vol:
-                continue
-            if chg_abs < min_chg:
-                continue
-            if chg_abs > max_chg:
-                continue
-            if prices.get(sym, 0) < MIN_PRICE:
+            can_open, _ = RiskValidator.can_open_position(
+                sym=sym,
+                cfg=cfg,
+                prices=prices,
+                volumes=volumes,
+                changes=changes,
+                total_margin=total_margin,
+                balance=self.balance,
+                positions=self.positions,
+                max_total_exposure=MAX_TOTAL_EXPOSURE
+            )
+            if not can_open:
                 continue
 
             # 评分 = 成交量 * 资金费率极端度（信号越强分越高）
+            vol = volumes.get(sym, 0)
+            chg_abs = abs(changes.get(sym, 0))
             fr_strength = abs(funding_rates.get(sym, 0)) * 10000
             score = vol * (1 + chg_abs / 100) * (1 + fr_strength)
             scored.append((sym, score, vol, chg_abs))
@@ -1171,7 +1173,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             now,
                         )
                         if refreshed:
-                            print(
+                            _log.info(
                                 f"[山寨计划] {sym} {replan_reason} → 本地进攻计划已刷新",
                                 flush=True,
                             )
@@ -1438,12 +1440,14 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 )
 
             self._log.append(msg)
-            print(msg, flush=True)
+            _log.info(msg)
 
             # Alpha角色事件：开仓（短台词 + 可选 LLM 暴走润色）
             side_cn = "多" if side == "long" else "空"
-            seq = get_state().get("character_event_seq", 0) + 1
-            get_state()["character_event_seq"] = seq
+            from api.routes import state_lock
+            async with state_lock:
+                seq = get_state().get("character_event_seq", 0) + 1
+                get_state()["character_event_seq"] = seq
             speech0 = pop_line(trade_category_for_open())
             ev_open = {
                 "Event_Type": f"开仓_{sym}_{side_cn}",
@@ -1457,7 +1461,8 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 "side": side,
                 "_seq": seq,
             }
-            get_state()["character_event"] = ev_open
+            async with state_lock:
+                get_state()["character_event"] = ev_open
             try: _schedule_loli_speech(ev_open)
             except NameError: pass
 
@@ -1466,7 +1471,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         if opened == 0 and len(scored) > 0:
             _rej_str = " ".join(f"{k}={v}" for k, v in _rej.items() if v > 0)
             if _rej_str:
-                print(
+                _log.info(
                     f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str}",
                     flush=True,
                 )

@@ -2,7 +2,92 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Dict, Any
+import logging
+
+_log = logging.getLogger(__name__)
+
+class RiskValidator:
+    """独立的风控验证器，负责判断是否可以开平仓，解耦 runner 的条件堆砌"""
+    
+    @staticmethod
+    def can_open_position(
+        sym: str, 
+        cfg: dict, 
+        prices: dict, 
+        volumes: dict, 
+        changes: dict, 
+        total_margin: float, 
+        balance: float, 
+        positions: dict,
+        max_total_exposure: float
+    ) -> Tuple[bool, str]:
+        """检查开仓前置条件"""
+        # 总敞口限制
+        if total_margin >= balance * max_total_exposure:
+            return False, "总敞口超限"
+            
+        vol = volumes.get(sym, 0)
+        chg_abs = abs(changes.get(sym, 0))
+        
+        min_vol = cfg.get("min_volume", 2000000)
+        min_chg = cfg.get("min_change", 1.0)
+        max_chg = cfg.get("max_change", 35.0)
+        
+        if vol < min_vol:
+            return False, "成交量不足"
+        if chg_abs < min_chg:
+            return False, "波动率不足"
+        if chg_abs > max_chg:
+            return False, "波动率过大"
+        if prices.get(sym, 0) < 0.01:
+            return False, "价格过低"
+            
+        return True, ""
+
+    @staticmethod
+    def check_close_conditions(
+        sym: str, 
+        pos: dict, 
+        px: float, 
+        pnl_pct: float, 
+        best_pnl: float, 
+        dyn_tp: float, 
+        dyn_sl: float,
+        cfg: dict,
+        gross_usd: float,
+        est_fee: float,
+        is_stable: bool,
+        take_profit_net_ok: bool
+    ) -> Tuple[bool, str]:
+        """
+        检查平仓条件，返回 (是否平仓, 平仓原因)
+        消除隐形截胡：将所有平仓条件集中管理，按优先级返回
+        """
+        # 1. 动态止损 (最高优先级)
+        if pnl_pct <= dyn_sl:
+            return True, "止损"
+            
+        # 2. 移动止盈 (从最高点回撤)
+        trail_trigger = max(cfg.get("trail_trigger", 2.0), 2.0)
+        if not pos.get("plan_stick") and best_pnl > trail_trigger:
+            trail_pct = abs(dyn_sl) * cfg.get("trail_pct", 0.3)
+            if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
+                if take_profit_net_ok:
+                    return True, "移动止盈"
+                    
+        # 3. ATR动态止盈
+        if pnl_pct >= dyn_tp and take_profit_net_ok:
+            return True, "ATR止盈"
+            
+        # 4. 山寨微利止盈 (用户设计的逻辑，从 runner 解耦到这里显式管理)
+        if not pos.get("plan_stick") and not is_stable:
+            margin = pos.get("margin", 4)
+            min_profit = max(0.30, margin * 0.075)
+            if gross_usd > max(est_fee * 5, min_profit):
+                return True, "山寨微利止盈"
+                
+        return False, ""
 
 
 class RiskMixin:

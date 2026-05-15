@@ -6,7 +6,11 @@
   SHARK_TRADING_TRACK=volatile 仅动态高波动山寨池，不订阅主流行情（已有主流仓仍可按持仓逻辑管理）
 """
 import os
+import json
+import logging
 from core.config import settings
+
+_log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════
 # 币种分类
@@ -35,8 +39,6 @@ def trading_track_allows_open(symbol: str) -> bool:
 HIGH_VOL_ALTS = set()
 _DYNAMIC_HIGH_VOL_ALTS = set()
 
-import json
-
 def set_dynamic_high_vol_alts(symbols, redis_client=None):
     """Refresh runtime alt pool from exchange discovery and sync to Redis."""
     global _DYNAMIC_HIGH_VOL_ALTS
@@ -51,7 +53,7 @@ def set_dynamic_high_vol_alts(symbols, redis_client=None):
             alts_list = list(_DYNAMIC_HIGH_VOL_ALTS)
             redis_client.set("shark:high_vol_alts", json.dumps(alts_list))
         except Exception as e:
-            print(f"[配置] 同步山寨池到 Redis 失败: {e}", flush=True)
+                _log.info(f"[配置] 同步山寨池到 Redis 失败: {e}")
             
     return set(_DYNAMIC_HIGH_VOL_ALTS)
 
@@ -81,6 +83,7 @@ STABLE_CONFIG = {
     "trail_pct": 0.45,         # 回撤更宽，避免趋势中途洗掉
     "tp_atr_mult": 8.0,
     "breakeven_trigger": 12.0,
+    "fuse_sl_streak_limit": 3,
     
     "cooldown": 10,
 }
@@ -112,6 +115,8 @@ VOLATILE_CONFIG = {
     
     # 第一目标止盈 50%
     "tp1_target": 5.0,         # +5% 平 50%
+    
+    "fuse_sl_streak_limit": 3,
     
     # 冷却
     "cooldown": 10,            # 冷却 10s

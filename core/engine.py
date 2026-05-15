@@ -424,7 +424,7 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
             }
         except Exception as e:
             detail = str(e).strip() or repr(e)
-            print(f"[价格推送错误] {type(e).__name__}: {detail}", flush=True)
+            _log.info(f"[价格推送错误] {type(e).__name__}: {detail}")
         await asyncio.sleep(interval)
 
 
@@ -434,13 +434,13 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
 async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                        interval: int = TRADE_INTERVAL):
     # 启动时获取合约规格
-    print("📡 获取合约规格...")
+    _log.info("📡 获取合约规格...")
     try:
         specs = await fetch_contract_specs()
         runner.update_contracts(specs)
-        print(f"📡 合约规格加载完成: {len(specs)} 个合约", flush=True)
+        _log.info(f"📡 合约规格加载完成: {len(specs)} 个合约")
     except Exception as e:
-        print(f"[警告] 合约规格获取失败: {e}，使用默认值", flush=True)
+        _log.info(f"[警告] 合约规格获取失败: {e}，使用默认值")
 
     _kline_inited = False
     _tick = 0
@@ -462,9 +462,9 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                     _cached_hot_alts = list(hot_alts)
                     _last_alt_refresh = now
                     if hot_alts:
-                        print(f"[山寨池] 10分钟刷新: {len(hot_alts)}个高波币 {hot_alts[:3]}...", flush=True)
+                        _log.info(f"[山寨池] 10分钟刷新: {len(hot_alts)}个高波币 {hot_alts[:3]}...")
                 except Exception as e:
-                    print(f"[山寨池] 刷新失败: {e}，沿用旧池", flush=True)
+                    _log.info(f"[山寨池] 刷新失败: {e}，沿用旧池")
 
             if _trk == "stable":
                 set_dynamic_high_vol_alts([], runner._plan_gate._redis if runner._plan_gate else None)
@@ -474,7 +474,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                 symbols = list(_cached_hot_alts)
                 if not symbols:
                     if _tick % 60 == 1:
-                        print("[volatile] 山寨池暂空，等待刷新...", flush=True)
+                        _log.info("[volatile] 山寨池暂空，等待刷新...")
                     await asyncio.sleep(interval)
                     continue
             else:
@@ -487,7 +487,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                 _trk_label = {"dual": "双轨(主流+山寨)", "stable": "单线·仅主流", "volatile": "单线·仅山寨池"}.get(
                     _trk, _trk
                 )
-                print(f"🛤️ SHARK_TRADING_TRACK={_trk} → {_trk_label}", flush=True)
+                _log.info(f"🛤️ SHARK_TRADING_TRACK={_trk} → {_trk_label}")
             # 价格由 price_feed_loop 维护，trading_loop 只读缓存
             # 移到最后获取 prices，避免 await 阻塞导致价格滞后
 
@@ -495,15 +495,15 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             if not _kline_inited:
                 try:
                     await init_kline_cache(symbols)
-                    print(f"📊 K线缓存初始化完成: {len(symbols)} 个币对", flush=True)
+                    _log.info(f"📊 K线缓存初始化完成: {len(symbols)} 个币对")
                     # 初始化行情检测器（依赖K线缓存）
                     kc = get_kline_cache()
                     if kc:
                         init_detector(kc)
-                        print("🔍 行情检测器就绪", flush=True)
+                        _log.info("🔍 行情检测器就绪")
                     _kline_inited = True
                 except Exception as e:
-                    print(f"[警告] K线缓存初始化失败: {e}", flush=True)
+                    _log.info(f"[警告] K线缓存初始化失败: {e}")
             
             # 定期刷新K线（每60s更新一次，保持RSI/ADX新鲜）
             if _kline_inited and _tick % 10 == 0:
@@ -564,7 +564,7 @@ async def main():
     # ── 尝试从 Redis 恢复模拟盘状态 ──
     paper_restored = runner._load_paper_state()
     if paper_restored:
-        print(f"[启动] 已从 Redis 恢复模拟盘状态 (余额=${runner.balance:.2f})", flush=True)
+        _log.info(f"[启动] 已从 Redis 恢复模拟盘状态 (余额=${runner.balance:.2f})")
     else:
         # 首次启动，初始化 Redis 状态
         runner._save_paper_state()
@@ -579,12 +579,12 @@ async def main():
             old_keys = list(sync_rdb.scan_iter(match="shark:plan:*", count=100))
             if old_keys:
                 sync_rdb.delete(*old_keys)
-                print(f"[启动] 已清除 {len(old_keys)} 个旧计划", flush=True)
+                _log.info(f"[启动] 已清除 {len(old_keys)} 个旧计划")
             # 通知 Go planner 立即重新 Bootstrap
             for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
                 sync_rdb.publish("shark:plan:replan", json.dumps({"symbol": sym}))
         except Exception as e:
-            print(f"[启动] 计划清理失败: {e}", flush=True)
+            _log.info(f"[启动] 计划清理失败: {e}")
 
         runner._plan_gate = PlanGate(sync_rdb)
         get_state()["_plan_gate"] = runner._plan_gate
@@ -603,7 +603,7 @@ async def main():
     )
     server = uvicorn.Server(config)
 
-    print(f"🦈 Shark 2.0 启动成功 :{port}", flush=True)
+    _log.info(f"🦈 Shark 2.0 启动成功 :{port}")
     # 启动告警
     try:
         from execution.prod_alert import _send_slack
@@ -615,8 +615,8 @@ async def main():
     _shark_mode = os.environ.get("SHARK_MODE", "paper").lower()
     _paper_state = "关闭" if not get_state().get("paper_trading") else "开启"
     _live_state = "关闭" if not get_state().get("live_trading") else "开启"
-    print(f"📋 当前模式: {_shark_mode} | 模拟盘: {_paper_state} | 实盘: {_live_state}", flush=True)
-    print("💡 提示: 前端点击「开始交易」后才开仓", flush=True)
+    _log.info(f"📋 当前模式: {_shark_mode} | 模拟盘: {_paper_state} | 实盘: {_live_state}")
+    _log.info("💡 提示: 前端点击「开始交易」后才开仓")
     
     async def hydrate_evo_pending_from_redis() -> None:
         """进程重启后从 LPUSH 列表恢复待审批项（missed pub/sub）。LRANGE 0.. 为最新优先，反向合并使同 type 保留最新。"""
@@ -641,7 +641,7 @@ async def main():
             return
         pubsub = redis_client.pubsub()
         await pubsub.subscribe("shark:evo:pending")
-        print("[进化订阅] 已订阅 shark:evo:pending", flush=True)
+        _log.info("[进化订阅] 已订阅 shark:evo:pending")
         async for msg in pubsub.listen():
             if msg["type"] != "message":
                 continue
@@ -651,7 +651,7 @@ async def main():
                     raw = raw.decode("utf-8", errors="replace")
                 change = json.loads(raw)
                 runner.merge_evo_suggestion(change)
-                print(f"[进化订阅] 收到建议 #{change.get('id')}: {change.get('type')}", flush=True)
+                _log.info(f"[进化订阅] 收到建议 #{change.get('id')}: {change.get('type')}")
             except Exception as e:
                 _log.debug("evo_subscriber parse: %s", e)
 
@@ -665,7 +665,7 @@ async def main():
             return
         pubsub = redis_client.pubsub()
         await pubsub.subscribe("shark:rl:action")
-        print("[RL订阅] 已订阅 shark:rl:action", flush=True)
+        _log.info("[RL订阅] 已订阅 shark:rl:action")
         async for msg in pubsub.listen():
             if msg["type"] != "message":
                 continue
@@ -709,12 +709,12 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
-        print("\n[关闭] 正在强平持仓...", flush=True)
+        _log.info("\n[关闭] 正在强平持仓...")
         runner._force_close_all_positions(_last_prices)
         runner._save_paper_state()
         # 等待异步持久化完成
         await asyncio.sleep(0.5)
-        print("[关闭] 完成", flush=True)
+        _log.info("[关闭] 完成")
 
 
 if __name__ == "__main__":
