@@ -4,10 +4,14 @@ from execution.order_command import build_order_command
 from api.routes import get_state
 from strategy.dual import is_stable, is_high_vol_alt
 import time
+from api.routes import get_state
 import uuid
 import json
 import os
 import logging
+from character.voice import _schedule_loli_speech
+
+# character sequence state removed
 _log = logging.getLogger(__name__)
 
 class CloseMixin:
@@ -190,9 +194,8 @@ class CloseMixin:
         is_tp = "止盈" in reason
         is_big_win = realized > 1.0
         pnl_abs = abs(realized)
-        global _character_event_seq
-        _character_event_seq += 1
-        seq = _character_event_seq
+        seq = get_state().get("character_event_seq", 0) + 1
+        get_state()["character_event_seq"] = seq
         if is_tp:
             speech0 = pop_line("profit")
         else:

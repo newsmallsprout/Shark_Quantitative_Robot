@@ -1,7 +1,8 @@
 
 import os
-SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
-AI_ENABLED = os.environ.get("AI_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+from core.config import settings
+SHARK_SIGNAL_SOURCE = settings.SHARK_SIGNAL_SOURCE
+AI_ENABLED = settings.AI_ENABLED
 from character.dialogue import pop_line, trade_category_for_open
 import random
 
@@ -42,7 +43,7 @@ def _plan_authority_enabled() -> bool:
     return v in ("1", "true", "yes", "on", "strict")
 
 # 看板娘事件序号
-_character_event_seq = 0
+# character sequence state removed
 
 class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin):
     def __init__(
@@ -1084,7 +1085,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             for psym, _, _, _ in scored[:35]:
                 if not trading_track_allows_open(psym):
                     continue
-                if len(prefetch_tasks) >= 4:
+                if len(prefetch_tasks) >= 15:
                     break
                 prefetch_tasks.append(
                     self._fetch_ai_plan(
@@ -1442,9 +1443,8 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
             # Alpha角色事件：开仓（短台词 + 可选 LLM 暴走润色）
             side_cn = "多" if side == "long" else "空"
-            global _character_event_seq
-            _character_event_seq += 1
-            seq = _character_event_seq
+            seq = get_state().get("character_event_seq", 0) + 1
+            get_state()["character_event_seq"] = seq
             speech0 = pop_line(trade_category_for_open())
             ev_open = {
                 "Event_Type": f"开仓_{sym}_{side_cn}",
@@ -1466,10 +1466,11 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         if opened == 0 and len(scored) > 0:
             _rej_str = " ".join(f"{k}={v}" for k, v in _rej.items() if v > 0)
-            print(
-                f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str or '无拒绝'}",
-                flush=True,
-            )
+            if _rej_str:
+                print(
+                    f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str}",
+                    flush=True,
+                )
 
         self._update_state(prices)
 

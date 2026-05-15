@@ -1,8 +1,5 @@
 """Shark 2.0 AI 策略引擎 v6 — 动态模型池 + 三模型委员会"""
-import json
-import os
-import re
-import time
+import asyncio, json, os, re, time
 import aiohttp
 
 # ── API endpoints ──
@@ -142,29 +139,3 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
                 print(f"[AI委] {symbol} 豆包 sentiment={db_result.get('sentiment')}", flush=True)
     
     return ds_result, ds_in+ds_out, "ai_committee", {"vote": vote_score, "conf": ds_conf}
-
-def apply_ai_targets(pos, px, ai_targets, sym, runner):
-    """
-    检查AI目标价，生成对应的交易动作 (take_profit, add_position 等)。
-    """
-    actions = []
-    if not isinstance(ai_targets, list):
-        return actions
-        
-    side = pos.get("side")
-    entry = float(pos.get("entry", 0))
-    if entry <= 0: return actions
-    
-    for t in ai_targets:
-        if not isinstance(t, dict): continue
-        t_px = float(t.get("price", 0))
-        t_action = t.get("action", "")
-        if t_px <= 0 or not t_action: continue
-        
-        # 简单判断是否触及目标价
-        if side == "long" and px >= t_px and t_action == "take_profit":
-            actions.append({"type": "take_profit", "price": t_px})
-        elif side == "short" and px <= t_px and t_action == "take_profit":
-            actions.append({"type": "take_profit", "price": t_px})
-            
-    return actions

@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+from core.config import settings
 import sys
 import time
 import json
@@ -19,9 +20,8 @@ from observability.context import configure_logging
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 _log = logging.getLogger(__name__)
-try:
-    from dotenv import load_dotenv; load_dotenv(ROOT / ".env")
-except ImportError: pass
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env")
 
 from persistence.dialogue_store import DialogueStore, resolve_sync_psycopg_url
 from persistence.bridge import PersistenceBridge, create_redis
@@ -52,45 +52,29 @@ from character.dialogue import (
 from character.voice import character_llm_config, fetch_loli_dialogue
 
 # 导入AI策略
-try:
-    from ai_strategy import get_ai_targets, apply_ai_targets
-    AI_ENABLED = True
-except ImportError:
-    AI_ENABLED = False
+from strategy.ai import get_ai_targets, apply_ai_targets
+AI_ENABLED = True
 
 # 开仓方向：plan = 仅 Redis RangePlan（默认，与 SlowLoop 一致）；ai = DeepSeek 预取缓存
-SHARK_SIGNAL_SOURCE = os.environ.get("SHARK_SIGNAL_SOURCE", "plan").strip().lower()
+SHARK_SIGNAL_SOURCE = settings.SHARK_SIGNAL_SOURCE
 
 
 
 
 # 导入双轨策略
-try:
-    from strategy.dual import (
-        get_config, is_stable, get_capital_limit, is_high_vol_alt,
-        set_dynamic_high_vol_alts, trading_track, trading_track_allows_open,
-    )
-    DUAL_STRATEGY = True
-except ImportError:
-    DUAL_STRATEGY = False
-    def get_config(s): return {}
-    def is_stable(s): return False
-    def get_capital_limit(b, s): return b
-    def is_high_vol_alt(s): return True
-    def set_dynamic_high_vol_alts(symbols): return set(symbols)
-    def trading_track(): return "dual"
-    def trading_track_allows_open(_s): return True
+from strategy.dual import (
+    get_config, is_stable, get_capital_limit, is_high_vol_alt,
+    set_dynamic_high_vol_alts, trading_track, trading_track_allows_open,
+)
+DUAL_STRATEGY = True
 
 # K线缓存（自进化引擎依赖）
-try:
-    from market.kline import KlineCache, init_kline_cache, get_kline_cache
-    from market.regime import RegimeDetector, REGIME_CONFIG, init_detector, get_detector
-    from learning.reflector import Reflector, LossReason
-    from learning.online import OnlineLearner
-    from core.live import LiveEngine, create_live_engine
-    KLINE_ENABLED = True
-except ImportError:
-    KLINE_ENABLED = False
+from market.kline import KlineCache, init_kline_cache, get_kline_cache
+from market.regime import RegimeDetector, REGIME_CONFIG, init_detector, get_detector
+from learning.reflector import Reflector, LossReason
+from learning.online import OnlineLearner
+from core.live import LiveEngine, create_live_engine
+KLINE_ENABLED = True
 
 # 多交易所价格聚合
 # ═══════════════════════════════════════════════════════════════════════
@@ -408,41 +392,7 @@ MARGIN_PCT = 0.005        # 每仓保证金占权益 0.5%
 MAX_MARGIN_PER_POS = 5.0  # 单仓最大保证金
 
 # 看板娘事件序号（前端可对齐最新一条）
-_character_event_seq = 0
-
-
-async def _apply_loli_speech(ev: Dict[str, Any]) -> None:
-    """开/平仓后异步拉一句 LLM 台词，覆盖 pop_line 兜底；CHARACTER_LLM=0 或无密钥则跳过。"""
-    if os.environ.get("CHARACTER_LLM", "").strip() == "0":
-        return
-    url, key, model = character_llm_config()
-    if not url or not key:
-        return
-    seq = ev.get("_seq")
-    try:
-        async with aiohttp.ClientSession() as session:
-            out = await fetch_loli_dialogue(session, url, key, model, ev)
-    except Exception as e:
-        _log.debug("fetch_loli_dialogue failed: %s", e)
-        return
-    if not out:
-        return
-    cur = get_state().get("character_event")
-    if not isinstance(cur, dict) or cur.get("_seq") != seq:
-        return
-    merged = dict(cur)
-    merged["Speech_Text"] = out["Speech"]
-    ac = out.get("Action") or ""
-    if ac:
-        merged["Action_Code"] = ac
-    get_state()["character_event"] = merged
-
-
-def _schedule_loli_speech(ev: Dict[str, Any]) -> None:
-    try:
-        asyncio.get_running_loop().create_task(_apply_loli_speech(dict(ev)))
-    except RuntimeError:
-        pass
+# character sequence state removed
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -453,6 +403,12 @@ async def price_feed_loop(feed: MarketDataFeed, runner: StrategyRunner, interval
             symbols = get_state().get("symbols", [])
             if isinstance(symbols, int):
                 symbols = []
+            
+            # P1 FIX: Ensure all holding symbols are always refreshed
+            for psym in runner.positions.keys():
+                if psym not in symbols:
+                    symbols.append(psym)
+
             if symbols:
                 await feed.refresh(symbols)
             prices = dict(feed.get_prices())

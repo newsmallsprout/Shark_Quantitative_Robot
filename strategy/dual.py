@@ -6,13 +6,14 @@
   SHARK_TRADING_TRACK=volatile 仅动态高波动山寨池，不订阅主流行情（已有主流仓仍可按持仓逻辑管理）
 """
 import os
+from core.config import settings
 
 # ═══════════════════════════════════════════════
 # 币种分类
 # ═══════════════════════════════════════════════
 STABLE_COINS = {"BTC/USDT", "ETH/USDT", "SOL/USDT"}  # 主流币：日线波段
 
-_RAW_TRACK = os.environ.get("SHARK_TRADING_TRACK", "dual").strip().lower()
+_RAW_TRACK = settings.SHARK_TRADING_TRACK
 TRADING_TRACK = _RAW_TRACK if _RAW_TRACK in ("dual", "stable", "volatile") else "dual"
 # 单线时该桶可用上限与主进程 MAX_TOTAL_EXPOSURE 对齐（避免 dual_strategy 依赖 main）
 _CAPITAL_SINGLE = 0.95

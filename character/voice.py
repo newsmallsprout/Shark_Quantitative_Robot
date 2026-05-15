@@ -9,6 +9,11 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 
+from api.routes import get_state
+import logging
+
+_vlog = logging.getLogger("character.voice")
+
 LOLI_SYSTEM_PROMPT = """你被关在交易软件界面左侧的一座玻璃舱（窝）里出不去。你是暴躁、嘴毒、略带傲娇的白发双马尾萝莉，手里抱着一只鲨鱼玩偶。
 【环境认知】：
 - 你知道自己待在屏幕左边这个小盒子里，主人在右边看盘、下单。
@@ -148,3 +153,37 @@ def character_llm_config() -> tuple[str, str, str]:
     )
     model = os.environ.get("CHARACTER_LLM_MODEL", "deepseek-chat")
     return url, key, model
+
+
+async def _apply_loli_speech(ev: Dict[str, Any]) -> None:
+    """开/平仓后异步拉一句 LLM 台词，覆盖 pop_line 兜底；CHARACTER_LLM=0 或无密钥则跳过。"""
+    if os.environ.get("CHARACTER_LLM", "").strip() == "0":
+        return
+    url, key, model = character_llm_config()
+    if not url or not key:
+        return
+    seq = ev.get("_seq")
+    try:
+        async with aiohttp.ClientSession() as session:
+            out = await fetch_loli_dialogue(session, url, key, model, ev)
+    except Exception as e:
+        _vlog.debug("fetch_loli_dialogue failed: %s", e)
+        return
+    if not out:
+        return
+    cur = get_state().get("character_event")
+    if not isinstance(cur, dict) or cur.get("_seq") != seq:
+        return
+    merged = dict(cur)
+    merged["Speech_Text"] = out["Speech"]
+    ac = out.get("Action") or ""
+    if ac:
+        merged["Action_Code"] = ac
+    get_state()["character_event"] = merged
+
+
+def _schedule_loli_speech(ev: Dict[str, Any]) -> None:
+    try:
+        asyncio.get_running_loop().create_task(_apply_loli_speech(dict(ev)))
+    except RuntimeError:
+        pass
