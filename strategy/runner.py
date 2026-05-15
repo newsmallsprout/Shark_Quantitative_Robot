@@ -837,7 +837,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
                         # 步骤B：用利润作最大回撤额度加仓
                         add_margin = min(
-                            net_harvest * 2, pos["margin"] * 0.5, self.balance * 0.05
+                            net_harvest * 2, pos["margin"] * 0.5, total_account_equity * 0.05
                         )
                         
                         # ── 加仓前：检查该加仓操作是否会突破所在币种类型的资金桶上限 ──
@@ -1080,7 +1080,8 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 total_margin=total_margin,
                 balance=self.balance,
                 positions=self.positions,
-                max_total_exposure=MAX_TOTAL_EXPOSURE
+                max_total_exposure=MAX_TOTAL_EXPOSURE,
+                total_account_equity=total_account_equity
             )
             if not can_open:
                 continue
@@ -1135,8 +1136,8 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             # 进化引擎：连亏时暂停山寨
             if self._evo_skip_alts and not is_stable(sym):
                 continue
-            # 总敞口限制（余额 * 95%）
-            if total_margin >= self.balance * MAX_TOTAL_EXPOSURE:
+            # 总敞口限制（总权益 * 95%）
+            if total_margin >= total_account_equity * MAX_TOTAL_EXPOSURE:
                 break
 
             px = prices[sym]
@@ -1224,11 +1225,21 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             # Use the correct total equity base for bucket capital limit, 
             # NOT just remaining balance, to prevent buckets from shrinking each other.
             cap = get_capital_limit(total_account_equity, sym)
+            st_bucket = is_stable(sym)
             
+            # Check bucket-specific capital limits BEFORE calculating final size
+            # (Early rejection saves computation and avoids partial allocations)
+            bucket_used = sum(
+                p["margin"] for s, p in self.positions.items() if is_stable(s) == st_bucket
+            )
+            if bucket_used + margin > cap:
+                # 提前拦截：如果初步计算的 margin 已经突破了该币种类型的资金池上限，拒绝开仓
+                _rej["cap_full"] += 1
+                continue
+                
             if margin <= 0:
                 _rej["no_margin"] += 1
                 continue
-            st_bucket = is_stable(sym)
 
             entry_price = px  # 默认市价，策略入场在方向确定后调整
 
@@ -1305,7 +1316,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     margin = (size * quanto * entry_price) / lev
                     bumped_for_min = True
                 if bumped_for_min and not is_stable(sym):
-                    alt_ceiling = max(5.0, self.balance * 0.06)
+                    alt_ceiling = max(5.0, total_account_equity * 0.06)
                     if margin > alt_ceiling:
                         continue
                 fee = size * quanto * entry_price * fee_rate_maker

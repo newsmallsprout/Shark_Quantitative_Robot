@@ -20,11 +20,13 @@ class RiskValidator:
         total_margin: float, 
         balance: float, 
         positions: dict,
-        max_total_exposure: float
+        max_total_exposure: float,
+        total_account_equity: float = 0.0
     ) -> Tuple[bool, str]:
         """检查开仓前置条件"""
-        # 总敞口限制
-        if total_margin >= balance * max_total_exposure:
+        # 总敞口限制 (以总权益为基数)
+        equity_base = total_account_equity if total_account_equity > 0 else (balance + total_margin)
+        if total_margin >= equity_base * max_total_exposure:
             return False, "总敞口超限"
             
         vol = volumes.get(sym, 0)
