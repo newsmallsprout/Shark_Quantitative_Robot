@@ -986,9 +986,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         total_margin = sum(p["margin"] for p in self.positions.values())
         # self.balance 已是扣除锁定保证金后的可支配资金，不再减 total_margin
         available = self.balance
-        if available <= 0:
+        if available <= 5.0:  # Allow a small buffer for dust instead of strict 0
             self._note_tick_block(
-                "no_cash", "可用余额≤0，暂停新开仓（持仓仍管理）", log_every_sec=45.0
+                "no_cash", "可用余额极低，暂停新开仓（持仓仍管理）", log_every_sec=45.0
             )
             self._update_state(prices)
             return
@@ -1284,15 +1284,24 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     if margin > alt_ceiling:
                         continue
                 fee = size * quanto * entry_price * fee_rate_maker
+                
+                # Check absolute available cash across the entire account
                 if margin + fee > self.balance:
                     _rej["no_cash"] += 1
                     continue
+                    
+                # Check bucket-specific capital limits (Stable vs Volatile)
+                # Ensure we use total initial capital for the bucket calculation, not just remaining balance
+                total_account_value = self.balance + sum(p["margin"] for p in self.positions.values())
+                bucket_cap = get_capital_limit(total_account_value, sym)
+                
                 bucket_used = sum(
                     p["margin"]
                     for s, p in self.positions.items()
                     if is_stable(s) == st_bucket
                 )
-                if bucket_used + margin > cap:
+                
+                if bucket_used + margin > bucket_cap:
                     _rej["cap_full"] += 1
                     continue
 
