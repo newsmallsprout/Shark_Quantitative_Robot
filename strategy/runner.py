@@ -1038,10 +1038,29 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             return
 
         # 开仓：对所有符合条件的币对尽可能开单
-        # ── 预生成山寨计划（不管交易开关，让计划看板可见）──
+        # ── 预生成山寨计划（仅针对可开仓或已持仓的币对，清理无关过期计划）──
         for sym in list(get_state().get("dynamic_high_vol_alts", [])):
             if sym not in prices or prices[sym] <= 0:
                 continue
+                
+            if sym not in self.positions:
+                cfg = get_config(sym)
+                from strategy.risk import RiskValidator
+                can_open, _ = RiskValidator.can_open_position(
+                    sym=sym,
+                    cfg=cfg,
+                    prices=prices,
+                    volumes=volumes,
+                    changes=changes,
+                    total_margin=total_margin,
+                    balance=self.balance,
+                    positions=self.positions,
+                    max_total_exposure=MAX_TOTAL_EXPOSURE,
+                    total_account_equity=total_account_equity
+                )
+                if not can_open:
+                    continue
+
             await self._ensure_alt_attack_plan(
                 sym,
                 prices[sym],

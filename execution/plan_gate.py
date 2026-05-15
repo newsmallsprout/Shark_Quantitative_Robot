@@ -18,16 +18,32 @@ class PlanGate:
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}
         self._last_all_fetch = 0.0
 
-    # ── 计划读取 ──
+    # ── 计划读取与清理 ──
+
+    def clear_plan(self, symbol: str) -> None:
+        """清除过期或无效的计划"""
+        self._plan_cache.pop(symbol, None)
+        self._last_fetch.pop(symbol, None)
+        try:
+            self._redis.delete(f"shark:plan:{symbol}")
+        except Exception:
+            pass
 
     def get_plan(self, symbol: str) -> Optional[dict]:
         now = time.time()
         if symbol in self._plan_cache and now - self._last_fetch.get(symbol, 0) < 5:
-            return self._plan_cache[symbol]
+            plan = self._plan_cache[symbol]
+            if plan.get("valid_until", 0) and plan.get("valid_until", 0) < now:
+                self.clear_plan(symbol)
+                return None
+            return plan
         try:
             raw = self._redis.get(f"shark:plan:{symbol}")
             if raw:
                 plan = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
+                if plan.get("valid_until", 0) and plan.get("valid_until", 0) < now:
+                    self.clear_plan(symbol)
+                    return None
                 self._plan_cache[symbol] = plan
                 self._last_fetch[symbol] = now
                 return plan
@@ -37,6 +53,10 @@ class PlanGate:
 
     def get_all_plans(self) -> Dict[str, dict]:
         now = time.time()
+        for sym, plan in list(self._plan_cache.items()):
+            if plan.get("valid_until", 0) and plan.get("valid_until", 0) < now:
+                self.clear_plan(sym)
+
         if self._plan_cache and now - self._last_all_fetch < 5:
             return dict(self._plan_cache)
         try:
@@ -47,7 +67,11 @@ class PlanGate:
                 raw = self._redis.get(key)
                 if raw:
                     plan = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode())
-                    self._plan_cache[sym] = plan
+                    if plan.get("valid_until", 0) and plan.get("valid_until", 0) < now:
+                        self.clear_plan(sym)
+                    else:
+                        self._plan_cache[sym] = plan
+                        self._last_fetch[sym] = now
             self._last_all_fetch = now
         except Exception:
             pass
