@@ -489,11 +489,8 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                 )
                 print(f"🛤️ SHARK_TRADING_TRACK={_trk} → {_trk_label}", flush=True)
             # 价格由 price_feed_loop 维护，trading_loop 只读缓存
-            prices = dict(feed.get_prices())
-            for psym, pos in runner.positions.items():
-                if psym not in prices or prices.get(psym, 0) <= 0:
-                    prices[psym] = float(pos.get("entry", 0) or 0)
-            
+            # 移到最后获取 prices，避免 await 阻塞导致价格滞后
+
             # 初始化K线缓存（首次）
             if not _kline_inited:
                 try:
@@ -513,10 +510,18 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                 try:
                     kc = get_kline_cache()
                     if kc:
-                        for s in symbols:
-                            await kc.update(s)
+                        update_tasks = [kc.update(s) for s in symbols]
+                        if update_tasks:
+                            await asyncio.gather(*update_tasks, return_exceptions=True)
                 except Exception:
                     pass
+                    
+            # 确保获取的是等待完K线等各种IO操作后，最新鲜的价格
+            prices = dict(feed.get_prices())
+            for psym, pos in runner.positions.items():
+                if psym not in prices or prices.get(psym, 0) <= 0:
+                    prices[psym] = float(pos.get("entry", 0) or 0)
+                    
             volumes = {s: t.volume_24h for s, t in feed._cache.items()}
             changes = feed.get_changes()
             funding_rates = feed.get_funding_rates()
