@@ -35,13 +35,24 @@ def trading_track_allows_open(symbol: str) -> bool:
 HIGH_VOL_ALTS = set()
 _DYNAMIC_HIGH_VOL_ALTS = set()
 
-def set_dynamic_high_vol_alts(symbols):
-    """Refresh runtime alt pool from exchange discovery."""
+import json
+
+def set_dynamic_high_vol_alts(symbols, redis_client=None):
+    """Refresh runtime alt pool from exchange discovery and sync to Redis."""
     global _DYNAMIC_HIGH_VOL_ALTS
     _DYNAMIC_HIGH_VOL_ALTS = {
         str(s) for s in symbols
         if str(s).endswith("/USDT") and str(s) not in STABLE_COINS
     }
+    
+    if redis_client:
+        try:
+            # Sync to Redis for Go evolver to pick up
+            alts_list = list(_DYNAMIC_HIGH_VOL_ALTS)
+            redis_client.set("shark:high_vol_alts", json.dumps(alts_list))
+        except Exception as e:
+            print(f"[配置] 同步山寨池到 Redis 失败: {e}", flush=True)
+            
     return set(_DYNAMIC_HIGH_VOL_ALTS)
 
 # ═══════════════════════════════════════════════

@@ -245,7 +245,7 @@ async def plans_dashboard():
     fuse_info = None
     if pg:
         try:
-            plans = dict(pg.dump_all())
+            plans = dict(pg.get_all_plans())
             raw = getattr(pg, "fuse_reason", "") or ""
             if raw:
                 fuse_info = str(raw)

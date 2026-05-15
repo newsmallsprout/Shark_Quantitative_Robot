@@ -91,7 +91,8 @@ func (p *Planner) publishPlanningStatus(ctx context.Context, phase, symbol, mess
 
 // Bootstrap → 全量数据拉取 → 生成所有币对计划
 func (p *Planner) Bootstrap(ctx context.Context) error {
-	log.Printf("[Planning] BOOTSTRAP — 拉取全量数据，覆盖%d个币对...", len(p.symbols))
+    p.refreshSymbolsFromRedis(ctx)
+    log.Printf("[Planning] BOOTSTRAP — 拉取全量数据，覆盖%d个币对...", len(p.symbols))
 	p.publishPlanningStatus(ctx, "bootstrap", "", "启动全量计划生成，开仓会等新计划落地", 0, len(p.symbols), true)
 
 	p.fetchPrices(ctx)
@@ -204,8 +205,35 @@ func (p *Planner) Plan(ctx context.Context, symbol string, digest *NewsDigest) e
 }
 
 // PlanAll — 批量为所有币对生成计划；完成后评估并自进化
+func (p *Planner) refreshSymbolsFromRedis(ctx context.Context) {
+    if p.rdb == nil {
+        return
+    }
+    raw, err := p.rdb.Get(ctx, "shark:high_vol_alts").Result()
+    if err == nil && raw != "" {
+        var alts []string
+        if err := json.Unmarshal([]byte(raw), &alts); err == nil {
+            // Merge FocusSymbols (stable coins) and alts
+            newSymbols := make([]string, 0)
+            seen := make(map[string]bool)
+            for _, s := range FocusSymbols {
+                newSymbols = append(newSymbols, s)
+                seen[s] = true
+            }
+            for _, s := range alts {
+                if !seen[s] {
+                    newSymbols = append(newSymbols, s)
+                    seen[s] = true
+                }
+            }
+            p.symbols = newSymbols
+        }
+    }
+}
+
 func (p *Planner) PlanAll(ctx context.Context) {
-	log.Printf("[Planning] 开始全量计划更新 (%d个币对)...", len(p.symbols))
+    p.refreshSymbolsFromRedis(ctx)
+    log.Printf("[Planning] 开始全量计划更新 (%d个币对)...", len(p.symbols))
 	p.publishPlanningStatus(ctx, "full_replan", "", "正在全量重做计划，开仓会等新计划落地", 0, len(p.symbols), true)
 
 	p.fetchPrices(ctx)

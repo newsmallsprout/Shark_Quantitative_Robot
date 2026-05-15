@@ -458,7 +458,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
             if _trk in ("dual", "volatile") and now - _last_alt_refresh >= ALT_REFRESH_SEC:
                 try:
                     hot_alts = await fetch_hot_volatile_symbols(n=18)
-                    set_dynamic_high_vol_alts(hot_alts)
+                    set_dynamic_high_vol_alts(hot_alts, runner._plan_gate._redis if runner._plan_gate else None)
                     _cached_hot_alts = list(hot_alts)
                     _last_alt_refresh = now
                     if hot_alts:
@@ -467,7 +467,7 @@ async def trading_loop(feed: MarketDataFeed, runner: StrategyRunner,
                     print(f"[山寨池] 刷新失败: {e}，沿用旧池", flush=True)
 
             if _trk == "stable":
-                set_dynamic_high_vol_alts([])
+                set_dynamic_high_vol_alts([], runner._plan_gate._redis if runner._plan_gate else None)
                 _cached_hot_alts = []
                 symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
             elif _trk == "volatile":

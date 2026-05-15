@@ -237,8 +237,16 @@ func publishActions(rdb *redis.Client, agent *rl.DQNAgent, kb *rl.KnowledgeBase,
 	ctx := context.Background()
 
 	// Read current prices from Redis
-	symbols := []string{"BTC/USDT", "ETH/USDT", "SUI/USDT", "TON/USDT", "SOL/USDT"}
-	for _, sym := range symbols {
+        var symbols []string
+        rawAlts, err := rdb.Get(ctx, "shark:high_vol_alts").Result()
+        if err == nil && rawAlts != "" {
+            json.Unmarshal([]byte(rawAlts), &symbols)
+        }
+        for _, s := range planning.FocusSymbols {
+            symbols = append(symbols, s)
+        }
+
+        for _, sym := range symbols {
 		pxStr, err := rdb.Get(ctx, "shark:price:"+sym).Result()
 		if err != nil {
 			continue
