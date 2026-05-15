@@ -673,19 +673,6 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
             best_pnl = pos.get("best_pnl", pnl_pct)
 
-            if (
-                not pos.get("plan_stick")
-                and (not is_st)
-                and pos.get("entry_risk_tag") not in ("标准", "入场带")
-            ):
-                gross_now = self._gross_pnl_usd(sym, pos, px)
-                fee_bar = self._est_fee_usd(sym, pos, px, fee_rounds=3.0)
-                if gross_now > fee_bar:
-                    self._close_position(
-                        sym, px, "激进单手续费3倍止盈", pnl_pct, prices
-                    )
-                    continue
-
             # ── AI 多层仓位管理（主逻辑） ──
             ai_plan = pos.get("ai_plan")
             if ai_plan and not pos.get("plan_stick"):

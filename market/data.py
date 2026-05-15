@@ -176,7 +176,11 @@ class MarketDataFeed:
                     funding_rate=float(t.get("funding_rate", 0) or 0),
                     mark_price=float(t.get("mark_price", 0) or 0),
                 )
-        self._cache = tickers
+        for sym in symbols:
+            if sym in tickers:
+                self._cache[sym] = tickers[sym]
+            else:
+                _log.error(f"MarketDataFeed: 无法获取 {sym} 的最新价格 (可能已下架或改名，或者API临时异常)")
 
     def get_prices(self) -> Dict[str, float]:
         return {s: t.price for s, t in self._cache.items()}

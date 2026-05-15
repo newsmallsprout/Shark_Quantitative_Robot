@@ -55,12 +55,12 @@ def _safe_json_parse(content):
     return {}
 
 def _local_fallback_plan(symbol, price, change_24h, funding_rate):
-    direction, confidence = "HOLD", 25
-    if funding_rate > 0.0005 and change_24h > 1: direction, confidence = "SHORT", 35
-    elif funding_rate < -0.0005 and change_24h < -1: direction, confidence = "LONG", 35
-    elif change_24h > 3: direction, confidence = "LONG", 30
-    elif change_24h < -3: direction, confidence = "SHORT", 30
-    return {"direction":direction,"confidence":confidence,"entry_price":price,"targets":[],"stop_loss":price*0.97,"supports":[],"resistances":[],"risk_reward":1.5}
+        direction, confidence = "HOLD", 25
+        if funding_rate > 0.0005 and change_24h > 1: direction, confidence = "SHORT", 35
+        elif funding_rate < -0.0005 and change_24h < -1: direction, confidence = "LONG", 35
+        elif change_24h > 3: direction, confidence = "LONG", 35
+        elif change_24h < -3: direction, confidence = "SHORT", 35
+        return {"direction":direction,"confidence":confidence,"entry_price":price,"targets":[],"stop_loss":price*0.97,"supports":[],"resistances":[],"risk_reward":1.5}
 
 async def _call_llm(url, key, model, system, prompt, max_tokens, json_mode=True, temperature=0.25, timeout=25, label=""):
     global _qwen_idx, _qwen_exhausted, _last_slack_alert
