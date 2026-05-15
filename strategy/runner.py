@@ -1114,9 +1114,6 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             # 总敞口限制（余额 * 95%）
             if total_margin >= self.balance * MAX_TOTAL_EXPOSURE:
                 break
-            # 持仓数限制（0=不限制）
-            if MAX_POSITIONS > 0 and len(self.positions) >= MAX_POSITIONS:
-                break
 
             px = prices[sym]
             change = changes.get(sym, 0)
