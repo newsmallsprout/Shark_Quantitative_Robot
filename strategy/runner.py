@@ -192,6 +192,63 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         except Exception:
             pass
 
+    async def _ai_review_candidates(
+        self, candidates: List[tuple], prices: Dict[str, float], changes: Dict[str, float],
+        volumes: Dict[str, float], funding_rates: Dict[str, float], alts_quota: int
+    ) -> List[tuple]:
+        """对初筛后的候选币对进行一轮AI宏观评审，选出最优开仓标的"""
+        if not candidates:
+            return []
+            
+        import aiohttp, os, json
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("QWEN_KEY") or os.environ.get("VOLC_KEY")
+        if not api_key:
+            return candidates
+            
+        cand_info = []
+        # 取前25个初筛标的，防止Token超限
+        for sym, score, vol, chg in candidates[:25]:
+            st = "主流" if is_stable(sym) else "山寨"
+            cand_info.append(f"{sym} ({st}): 价={prices.get(sym,0):.4f}, 波动={chg:.2f}%, 额={vol:.0f}, 资金费={funding_rates.get(sym,0)*100:.4f}%")
+            
+        prompt = (
+            "你是量化选币AI。以下是经过基础风控筛选的候选币对：\n"
+            + "\n".join(cand_info) +
+            f"\n\n请选出当前最值得开仓的标的。注意：山寨币最多只能再选 {alts_quota} 个，主流币不限。"
+            "要求：优先选择高成交量、波动率适中且资金费率有套利空间的标的。"
+            "输出JSON格式，包含 'selected' 列表，按推荐优先级排序。示例: {\"selected\": [\"BTCUSDT\", \"SOLUSDT\"]}"
+        )
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.3
+                    },
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data["choices"][0]["message"]["content"]
+                        res = json.loads(text)
+                        selected = res.get("selected", [])
+                        if selected:
+                            sel_set = set(selected)
+                            ai_scored = [c for c in candidates if c[0] in sel_set]
+                            # 按照AI给出的优先级顺序重新排序
+                            ai_scored.sort(key=lambda x: selected.index(x[0]) if x[0] in selected else 999)
+                            _log.info(f"[AI选币] 候选{len(candidates)}个，选中{len(ai_scored)}个: {selected}")
+                            return ai_scored
+        except Exception as e:
+            _log.info(f"[AI选币] 调用失败，回退默认排序: {e}")
+            
+        return candidates
+
     def update_contracts(self, specs: Dict[str, ContractSpec]):
         self._contract_specs = specs
 
@@ -1019,36 +1076,74 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             return
 
         # 开仓：对所有符合条件的币对尽可能开单
-        # ── 预生成山寨计划（仅针对可开仓或已持仓的币对，清理无关过期计划）──
-        for sym in list(get_state().get("dynamic_high_vol_alts", [])):
-            if sym not in prices or prices[sym] <= 0:
-                continue
-                
-            if sym not in self.positions:
-                cfg = get_config(sym)
-                from strategy.risk import RiskValidator
-                can_open, _ = RiskValidator.can_open_position(
-                    sym=sym,
-                    cfg=cfg,
-                    prices=prices,
-                    volumes=volumes,
-                    changes=changes,
-                    total_margin=total_margin,
-                    balance=self.balance,
-                    positions=self.positions,
-                    max_total_exposure=MAX_TOTAL_EXPOSURE,
-                    total_account_equity=total_account_equity
-                )
-                if not can_open:
-                    continue
+        # ── 宏观 10 分钟周期：获取列表 -> AI评审选7个 -> 清空旧计划 -> 生成新计划 ──
+        if not hasattr(self, "_last_macro_review_ts"):
+            self._last_macro_review_ts = 0.0
+            self._macro_selected_alts = []
 
-            await self._ensure_alt_attack_plan(
-                sym,
-                prices[sym],
-                abs(changes.get(sym, 0)),
-                volumes.get(sym, 0),
-                funding_rates.get(sym, 0),
-            )
+        if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
+            if now - self._last_macro_review_ts >= 600:
+                self._last_macro_review_ts = now
+                
+                # 1. 获取热门波动山寨列表 (仅筛选可以开仓的)
+                alt_candidates = []
+                for sym in get_state().get("dynamic_high_vol_alts", []):
+                    if sym in prices and prices[sym] > 0 and not is_stable(sym):
+                        cfg = get_config(sym)
+                        from strategy.risk import RiskValidator
+                        can_open, _ = RiskValidator.can_open_position(
+                            sym=sym,
+                            cfg=cfg,
+                            prices=prices,
+                            volumes=volumes,
+                            changes=changes,
+                            total_margin=total_margin,
+                            balance=self.balance,
+                            positions=self.positions,
+                            max_total_exposure=MAX_TOTAL_EXPOSURE,
+                            total_account_equity=total_account_equity
+                        )
+                        if can_open:
+                            vol = volumes.get(sym, 0)
+                            chg_abs = abs(changes.get(sym, 0))
+                            fr_strength = abs(funding_rates.get(sym, 0)) * 10000
+                            score = vol * (1 + chg_abs / 100) * (1 + fr_strength)
+                            alt_candidates.append((sym, score, vol, chg_abs))
+                
+                alt_candidates.sort(key=lambda x: x[1], reverse=True)
+                
+                # 2. AI 评选出最多 7 个 (扣除当前持仓配额)
+                current_alt_count = sum(1 for s in self.positions if not is_stable(s))
+                alts_quota = max(0, 7 - current_alt_count)
+                if alts_quota > 0 and alt_candidates:
+                    reviewed = await self._ai_review_candidates(alt_candidates, prices, changes, volumes, funding_rates, alts_quota)
+                    self._macro_selected_alts = [x[0] for x in reviewed][:alts_quota]
+                    _log.info(f"[宏观选币] 10分钟周期换仓，AI评选出: {self._macro_selected_alts}")
+                else:
+                    self._macro_selected_alts = []
+                    
+                # 3. 清空 Redis 中旧的山寨币计划
+                if self._plan_gate:
+                    for sym in list(self._plan_gate._plan_cache.keys()):
+                        if not is_stable(sym):
+                            self._plan_gate.clear_plan(sym)
+                try:
+                    import redis
+                    _r = redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                    for key in _r.scan_iter(match="shark:plan:*"):
+                        sym = key.decode().replace("shark:plan:", "") if isinstance(key, bytes) else key.replace("shark:plan:", "")
+                        if not is_stable(sym):
+                            _r.delete(key)
+                except Exception as e:
+                    pass
+                
+                # 4. 仅对选中的币对生成新计划
+                for sym in self._macro_selected_alts:
+                    if sym in prices:
+                        await self._ensure_alt_attack_plan(
+                            sym, prices[sym], abs(changes.get(sym, 0)),
+                            volumes.get(sym, 0), funding_rates.get(sym, 0), force=True
+                        )
 
         # ── 开关检查：实盘/模拟盘都需手动开启 ──
         _is_live_mode = self._live and self._live.active
@@ -1114,11 +1209,19 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
+        # ── 1. 山寨币开仓数量硬限制 ──
+        current_alt_count = sum(1 for s in self.positions if not is_stable(s))
+        alts_quota = max(0, 7 - current_alt_count)
+        
+        # ── 2. 过滤非 AI 选中的山寨币 ──
+        if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
+            scored = [x for x in scored if is_stable(x[0]) or x[0] in getattr(self, "_macro_selected_alts", [])]
+
         # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
         # 方向判定已内联（读 RangePlan 区间中点判定），无需外部引擎
         if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
             prefetch_tasks = []
-            for psym, _, _, _ in scored[:35]:
+            for psym, _, _, _ in scored[:15]:
                 if not trading_track_allows_open(psym):
                     continue
                 if len(prefetch_tasks) >= 15:
@@ -1145,6 +1248,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             "gate_block": 0,
             "no_cash": 0,
             "cap_full": 0,
+            "alt_limit": 0,
         }
         for sym, score, vol, chg_abs in scored:
             # 启动预热中 → 不开新仓
@@ -1152,6 +1256,14 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 break
             if not trading_track_allows_open(sym):
                 continue
+                
+            # 山寨币数量硬拦截
+            if not is_stable(sym):
+                current_alts = sum(1 for s in self.positions if not is_stable(s))
+                if current_alts >= 7:
+                    _rej["alt_limit"] += 1
+                    continue
+                    
             # 进化引擎：连亏时暂停山寨
             if self._evo_skip_alts and not is_stable(sym):
                 continue
