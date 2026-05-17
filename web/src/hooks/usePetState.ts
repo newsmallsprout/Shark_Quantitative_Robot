@@ -30,8 +30,9 @@ function mapCharacterEventToState(ev: CharacterEvent): PetPlaybackState {
   if (t.includes('止损')) return 'stoploss'
   if (t.includes('止盈') || /fist|coin/i.test(code)) return 'profit'
   if (/shield|glasses/i.test(code)) return 'loss'
-  if (t.includes('横盘')) return 'boring'
+  if (t.includes('横盘') || t.includes('闲聊')) return 'boring'
   if (t.includes('开仓') || /sword|hammer|net/i.test(code)) return 'profit'
+  if (t.includes('平仓') && (t.includes('亏') || ev.pnl != null && Number(ev.pnl) < 0)) return 'loss'
   return 'profit'
 }
 

@@ -343,6 +343,8 @@ async def ws(
     hdr = hdr.strip() if hdr else ""
     rid = (hdr if hdr else str(uuid.uuid4()))[:128]
     REQUEST_ID_CTX.set(rid)
+    
+    # 跟踪当前连接的客户端，如果在发送数据时连接关闭，我们直接退出循环
     try:
         while True:
             await asyncio.sleep(1)
@@ -350,12 +352,28 @@ async def ws(
                 payload = json.dumps(_state_for_websocket(), default=str, ensure_ascii=False)
             except Exception:
                 continue
+            
+            # 使用更安全的发送机制
             try:
+                from websockets.exceptions import ConnectionClosed
                 await websocket.send_text(payload)
-            except Exception:
+            except (ConnectionClosed, RuntimeError):
+                # 客户端断开连接或协议处于不正确状态
                 break
-    except Exception:
+            except Exception as e:
+                # 只在非正常的断开时才打印日志，并且使用 debug 级别避免刷屏
+                if "write_close_frame" not in str(e):
+                    _log.debug(f"WebSocket send warning: {e}")
+                break
+    except asyncio.CancelledError:
         pass
+    except Exception as e:
+        _log.debug(f"WebSocket closed with exception: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 import asyncio

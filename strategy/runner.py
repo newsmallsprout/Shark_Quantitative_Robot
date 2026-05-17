@@ -1636,7 +1636,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         if opened == 0 and len(scored) > 0:
             _rej_str = " ".join(f"{k}={v}" for k, v in _rej.items() if v > 0)
             if _rej_str:
-                _log.info(
+                _log.debug(
                     f"[跳过] {len(scored)}币对 开仓=0 持仓={len(self.positions)} | {_rej_str}"
                 )
 

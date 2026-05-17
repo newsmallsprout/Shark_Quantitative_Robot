@@ -30,9 +30,14 @@ function webVideoDirPlugin(): Plugin {
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
         const raw = req.url?.split('?')[0] ?? ''
         if (!raw.startsWith('/video/')) return next()
-        const seg = raw.slice('/video/'.length)
-        if (!seg || seg.includes('/') || seg.includes('..')) return next()
-        if (!/^[a-zA-Z0-9._-]+\.mp4$/i.test(seg)) return next()
+        let seg = raw.slice('/video/'.length)
+        try {
+          seg = decodeURIComponent(seg)
+        } catch {
+          return next()
+        }
+        if (!seg || seg.includes('..') || /[/\\]/.test(seg)) return next()
+        if (!seg.toLowerCase().endsWith('.mp4')) return next()
 
         let absPath: string | null = null
         for (const dir of dirs.length > 0 ? dirs : [primary]) {
