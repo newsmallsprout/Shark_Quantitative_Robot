@@ -691,14 +691,21 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             # pnl_pct 是「杠杆盈亏百分比」，二者必须先换算再比较，否则会 -2% 杠杆就平仓
             lev_f = max(float(pos.get("leverage") or 1), 1.0)
             sl_raw = atr_pct * _stop_mult
-            sl_floor = 2.0  # 最低 2% 价格波动（再乘杠杆得到杠杆侧止损）
+            sl_floor = 1.0 if is_stable(sym) else 1.5  # 降低硬扛底线
             sl_raw = max(sl_raw, sl_floor)
             _sl_boost = self._reflector.stop_boost if self._reflector else 0
             dyn_sl = -((sl_raw + _sl_boost) * lev_f)
-            dyn_sl = max(dyn_sl, -95.0)
+            
+            # 强制硬顶止损：主流币最多亏 25%，山寨币最多亏 15% (避免死扛和盈亏比失衡)
+            max_sl_pct = -25.0 if is_stable(sym) else -15.0
+            dyn_sl = max(dyn_sl, max_sl_pct)
 
-            tp_raw = max(atr_pct * _tp_mult, 3.0)
+            tp_raw = max(atr_pct * _tp_mult, 2.0)
             dyn_tp = tp_raw * lev_f
+            
+            # 满足用户严格要求：止盈和止损的比例关系 (如果没达到微利止盈)
+            # 强制限制最大止损不超过止盈的一半 (TP = 2 * SL)，防止赚 1 块亏 10 块
+            dyn_sl = max(dyn_sl, -(dyn_tp / 2.0))
 
             # ── 计划精确 SL/TP 优先 ──
             _psl = pos.get("plan_sl")
@@ -1122,17 +1129,19 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 else:
                     self._macro_selected_alts = []
                     
-                # 3. 清空 Redis 中旧的山寨币计划
+                # 3. 清理不需要的山寨币计划（保留当前持仓和刚选中的）
                 if self._plan_gate:
+                    keep_syms = set(self._macro_selected_alts) | set(self.positions.keys())
                     for sym in list(self._plan_gate._plan_cache.keys()):
-                        if not is_stable(sym):
+                        if not is_stable(sym) and sym not in keep_syms:
                             self._plan_gate.clear_plan(sym)
                 try:
                     import redis
                     _r = redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                    keep_syms = set(self._macro_selected_alts) | set(self.positions.keys())
                     for key in _r.scan_iter(match="shark:plan:*"):
                         sym = key.decode().replace("shark:plan:", "") if isinstance(key, bytes) else key.replace("shark:plan:", "")
-                        if not is_stable(sym):
+                        if not is_stable(sym) and sym not in keep_syms:
                             _r.delete(key)
                 except Exception as e:
                     pass
