@@ -12,51 +12,15 @@ export default function LoliRoom() {
         width: '100%',
         flex: 1,
         minHeight: 400,
+        display: 'flex',
+        flexDirection: 'column',
         overflow: 'hidden',
         borderRadius: 'inherit',
-        background: 'var(--bg-color)',
+        background: 'rgba(11, 14, 20, 0.75)',
+        backdropFilter: 'blur(8px)',
       }}
     >
-      <TradingReportChart data={status.position_list} />
-
-      <div
-        style={{
-          position: 'absolute',
-          bottom: 8,
-          left: 8,
-          right: 8,
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: 4,
-          justifyContent: 'center',
-          pointerEvents: 'none',
-          zIndex: 5,
-        }}
-      >
-        {status.position_list.length === 0 ? (
-          <span style={{ fontSize: 10, color: '#8899BB' }}>空仓</span>
-        ) : (
-          status.position_list.map((p) => {
-            const up = p.unrealized_pnl >= 0
-            return (
-              <span
-                key={p.symbol}
-                style={{
-                  fontSize: 9,
-                  fontFamily: 'var(--font-mono)',
-                  color: up ? '#00FF88' : '#FF4444',
-                  background: 'rgba(0,0,0,0.5)',
-                  padding: '1px 4px',
-                  borderRadius: 3,
-                }}
-              >
-                {p.symbol.split('/')[0]} {up ? '+' : ''}
-                {p.unrealized_pnl.toFixed(2)}
-              </span>
-            )
-          })
-        )}
-      </div>
+      <TradingReportChart trades={status.trade_history || []} />
     </div>
   )
 }
