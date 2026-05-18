@@ -90,15 +90,55 @@ export default function TradingReportChart({ trades }: Props) {
     return result
   }, [trades, timeframe])
 
-  if (!trades || trades.length === 0) {
+  if (!chartData || chartData.length === 0) {
     return (
-      <div style={{
-        width: '100%', height: '100%', display: 'flex', alignItems: 'center',
-        justifyContent: 'center', color: '#8899BB', fontFamily: 'var(--font-mono)'
-      }}>
-        <div style={{ textAlign: 'center' }}>
-          <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.8 }}>📊</div>
-          <div style={{ letterSpacing: '1px' }}>暂无历史交易数据，等待产出战报...</div>
+      <div style={{ width: '100%', height: '100%', padding: '20px 20px 40px 10px', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ 
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          paddingLeft: '10px',
+          marginBottom: '20px'
+        }}>
+          <div style={{ 
+            color: '#E0E6F0',
+            fontSize: 15,
+            fontFamily: 'var(--font-mono)',
+            fontWeight: 'bold',
+            letterSpacing: '1px'
+          }}>
+            历史盈亏战报 (Historical PnL)
+          </div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            {(['hour', 'day', 'week'] as TimeFrame[]).map(tf => (
+              <button
+                key={tf}
+                onClick={() => setTimeframe(tf)}
+                style={{
+                  background: timeframe === tf ? 'rgba(0, 255, 136, 0.15)' : 'rgba(255, 255, 255, 0.05)',
+                  color: timeframe === tf ? '#00FF88' : '#8899BB',
+                  border: `1px solid ${timeframe === tf ? 'rgba(0, 255, 136, 0.3)' : 'transparent'}`,
+                  padding: '4px 12px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                  fontFamily: 'var(--font-mono)',
+                  transition: 'all 0.2s'
+                }}
+              >
+                {tf === 'hour' ? '小时' : tf === 'day' ? '日报' : '周报'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{
+          flex: 1, display: 'flex', alignItems: 'center',
+          justifyContent: 'center', color: '#8899BB', fontFamily: 'var(--font-mono)'
+        }}>
+          <div style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: 32, marginBottom: 12, opacity: 0.8 }}>📊</div>
+            <div style={{ letterSpacing: '1px' }}>暂无有效历史交易数据，等待产出战报...</div>
+          </div>
         </div>
       </div>
     )
