@@ -1146,8 +1146,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 except Exception as e:
                     pass
                 
-                # 4. 仅对选中的币对生成新计划
-                for sym in self._macro_selected_alts:
+                # 4. 仅对选中的币对以及当前持有的山寨币生成新计划
+                plan_targets = set(self._macro_selected_alts) | {s for s in self.positions.keys() if not is_stable(s)}
+                for sym in plan_targets:
                     if sym in prices:
                         await self._ensure_alt_attack_plan(
                             sym, prices[sym], abs(changes.get(sym, 0)),
@@ -1227,14 +1228,24 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             scored = [x for x in scored if is_stable(x[0]) or x[0] in getattr(self, "_macro_selected_alts", [])]
 
         # 预取AI计划：对前N个币对并行拉取AI信号（开仓前缓存就位）
-        # 方向判定已内联（读 RangePlan 区间中点判定），无需外部引擎
+        # 强制包含所有当前持仓的币对，防止其跌出热门榜后失去计划护航
         if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
             prefetch_tasks = []
-            for psym, _, _, _ in scored[:15]:
-                if not trading_track_allows_open(psym):
-                    continue
-                if len(prefetch_tasks) >= 15:
+            
+            # 1. 强制提取当前持仓的币对
+            held_syms = set(self.positions.keys())
+            prefetch_syms = list(held_syms)
+            
+            # 2. 补充热门榜单上的币对，直到达到 15 个上限
+            for psym, _, _, _ in scored:
+                if psym not in held_syms:
+                    prefetch_syms.append(psym)
+                if len(prefetch_syms) >= 15:
                     break
+                    
+            for psym in prefetch_syms:
+                if not trading_track_allows_open(psym) or psym not in prices:
+                    continue
                 prefetch_tasks.append(
                     self._fetch_ai_plan(
                         psym,

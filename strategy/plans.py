@@ -121,7 +121,8 @@ class PlanMixin:
     async def _ensure_alt_attack_plan(self, sym: str, px: float, change_abs: float,
                                        volume: float, funding: float, *,
                                        force: bool = False, reason: str = "") -> Optional[dict]:
-        if is_stable(sym) or not is_high_vol_alt(sym) or px <= 0:
+        has_pos = hasattr(self, "positions") and sym in self.positions
+        if is_stable(sym) or (not is_high_vol_alt(sym) and not has_pos) or px <= 0:
             return None
         if trading_track() == "stable":
             return None

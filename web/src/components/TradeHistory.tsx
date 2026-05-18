@@ -124,7 +124,7 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
               <td style={{ textAlign: 'right' }} className={t.realized_pnl >= 0 ? 'pnl-up' : 'pnl-down'}>
                 {t.realized_pnl >= 0 ? '+' : ''}{t.realized_pnl?.toFixed(4)}
                 <div style={{ fontSize: '10px', opacity: 0.8, marginTop: '2px' }}>
-                  {t.pnl_pct > 0 ? '+' : ''}{(t.pnl_pct * 100).toFixed(2)}%
+                  {t.pnl_pct > 0 ? '+' : ''}{t.pnl_pct?.toFixed(2)}%
                 </div>
               </td>
               <td style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{t.reason}</td>
