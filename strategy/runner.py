@@ -1119,9 +1119,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 
                 alt_candidates.sort(key=lambda x: x[1], reverse=True)
                 
-                # 2. AI 评选出最多 7 个 (扣除当前持仓配额)
+                # 2. AI 评选出最多 10 个 (扣除当前持仓配额)
                 current_alt_count = sum(1 for s in self.positions if not is_stable(s))
-                alts_quota = max(0, 7 - current_alt_count)
+                alts_quota = max(0, 10 - current_alt_count)
                 if alts_quota > 0 and alt_candidates:
                     reviewed = await self._ai_review_candidates(alt_candidates, prices, changes, volumes, funding_rates, alts_quota)
                     self._macro_selected_alts = [x[0] for x in reviewed][:alts_quota]
@@ -1220,7 +1220,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         # ── 1. 山寨币开仓数量硬限制 ──
         current_alt_count = sum(1 for s in self.positions if not is_stable(s))
-        alts_quota = max(0, 7 - current_alt_count)
+        alts_quota = max(0, 10 - current_alt_count)
         
         # ── 2. 过滤非 AI 选中的山寨币 ──
         if SHARK_SIGNAL_SOURCE == "ai" and AI_ENABLED:
@@ -1269,7 +1269,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             # 山寨币数量硬拦截
             if not is_stable(sym):
                 current_alts = sum(1 for s in self.positions if not is_stable(s))
-                if current_alts >= 7:
+                if current_alts >= 10:
                     _rej["alt_limit"] += 1
                     continue
                     
@@ -1408,6 +1408,12 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 side, signal_src, _plan_sl, _plan_tp = self._side_from_plan(
                     plan_cache, px
                 )
+                
+                # ── 主流币严格方向卡死 ──
+                # 如果是主流币，且计划给出的偏好是双向（模糊不清），宁可不开仓
+                if is_stable(sym) and plan_cache.get("bias") not in ("long", "short"):
+                    side = ""
+                    
                 ai_confidence = int(plan_cache.get("ai_confidence", 0))
                 if ai_confidence > 0:
                     ai_use = True

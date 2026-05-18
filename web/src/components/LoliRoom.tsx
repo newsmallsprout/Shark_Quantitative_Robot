@@ -1,5 +1,5 @@
 import { useStore } from '../store/useStore'
-import PetVideoPlayer from './PetVideoPlayer'
+import TradingReportChart from './TradingReportChart'
 
 export default function LoliRoom() {
   const status = useStore((s) => s.status)
@@ -14,9 +14,10 @@ export default function LoliRoom() {
         minHeight: 400,
         overflow: 'hidden',
         borderRadius: 'inherit',
+        background: 'var(--bg-color)',
       }}
     >
-      <PetVideoPlayer characterEvent={status.character_event} volatility={status.volatility} />
+      <TradingReportChart data={status.position_list} />
 
       <div
         style={{
