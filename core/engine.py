@@ -600,6 +600,8 @@ async def main():
         port=port,
         log_level="warning",
         access_log=False,
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )
     server = uvicorn.Server(config)
 
