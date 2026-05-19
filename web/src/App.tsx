@@ -15,29 +15,117 @@ function Clock() {
   return <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-muted)' }}>{time}</span>
 }
 
-export function TopbarSectionLinks() {
+type AppView = 'dashboard' | 'support' | 'risk'
+
+function hashToView(hash: string): AppView {
+  if (hash === '#/support') return 'support'
+  if (hash === '#/risk') return 'risk'
+  return 'dashboard'
+}
+
+export function TopbarSectionLinks({ currentView }: { currentView: AppView }) {
+  if (currentView === 'support') {
+    return (
+      <nav className="topbar-section-links" aria-label="页面与段落跳转">
+        <a href="#">总览</a>
+        <a href="#/risk">风控页</a>
+        <a className="topbar-section-links__plans" href="/plans">Plans</a>
+      </nav>
+    )
+  }
+  if (currentView === 'risk') {
+    return (
+      <nav className="topbar-section-links" aria-label="页面与段落跳转">
+        <a href="#">总览</a>
+        <a href="#/support">支持页</a>
+        <a className="topbar-section-links__plans" href="/plans">Plans</a>
+      </nav>
+    )
+  }
   return (
     <nav className="topbar-section-links" aria-label="页面与段落跳转">
       <a href="#section-kpi">KPI</a>
       <a href="#section-room">舱室</a>
       <a href="#section-positions">持仓</a>
       <a href="#section-history">历史</a>
+      <a href="#/risk">风控页</a>
+      <a href="#/support">支持页</a>
       <a className="topbar-section-links__plans" href="/plans">Plans</a>
     </nav>
   )
 }
 
-function PaymentQrRail() {
+function SupportPage() {
   return (
-    <aside className="payment-qr-rail" aria-label="收款码">
-      <div className="payment-qr-rail__title">支持 Shark</div>
-      <div className="payment-qr-rail__item">
-        <img src="/static/IMG_2372.jpg" alt="收款码 1" />
+    <div className="subpage-layout">
+      <div className="subpage-header">
+        <div>
+          <div className="subpage-title">支持 Shark</div>
+          <div className="subpage-subtitle">收款码已从 dashboard 拆出，避免遮挡主视图。</div>
+        </div>
+        <a className="subpage-backlink" href="#">
+          返回总览
+        </a>
       </div>
-      <div className="payment-qr-rail__item">
-        <img src="/static/IMG_2373.jpg" alt="收款码 2" />
+      <div className="support-grid">
+        <div className="card support-card">
+          <div className="card-header">微信支付</div>
+          <div className="card-body">
+            <div className="support-qr-frame">
+              <img src="/static/IMG_2372.jpg" alt="微信收款码" />
+            </div>
+          </div>
+        </div>
+        <div className="card support-card">
+          <div className="card-header">支付宝</div>
+          <div className="card-body">
+            <div className="support-qr-frame">
+              <img src="/static/IMG_2373.jpg" alt="支付宝收款码" />
+            </div>
+          </div>
+        </div>
       </div>
-    </aside>
+    </div>
+  )
+}
+
+function RiskPage({
+  status,
+  riskHalt,
+  connected,
+  pollLatencyMs,
+  fmtUptime,
+}: {
+  status: Status
+  riskHalt: boolean
+  connected: boolean
+  pollLatencyMs: number | null
+  fmtUptime: string
+}) {
+  return (
+    <div className="subpage-layout">
+      <div className="subpage-header">
+        <div>
+          <div className="subpage-title">风控与计划状态</div>
+          <div className="subpage-subtitle">计划状态、Plan API 异常和风控闸门已从 dashboard 拆出单独查看。</div>
+        </div>
+        <a className="subpage-backlink" href="#">
+          返回总览
+        </a>
+      </div>
+      <div className="card">
+        <div className="card-header">运行面板</div>
+        <div className="card-body">
+          <SafetyPanel
+            status={status}
+            blocked={riskHalt}
+            connected={connected}
+            latencyMs={pollLatencyMs}
+            uptimeLabel={fmtUptime}
+          />
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -360,6 +448,7 @@ export default function App() {
   const { status, connected, setStatus, setConnected } = useStore()
   const wsRef = useRef<WebSocket>()
   const [uptime, setUptime] = useState(0)
+  const [currentView, setCurrentView] = useState<AppView>(() => hashToView(window.location.hash))
   const [pollLatencyMs, setPollLatencyMs] = useState<number | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<ConfirmPayload | null>(null)
   const [showEvoPanel, setShowEvoPanel] = useState(false)
@@ -417,6 +506,12 @@ export default function App() {
     draw()
 
     return () => { cancelAnimationFrame(animId); window.removeEventListener('resize', resize) }
+  }, [])
+
+  useEffect(() => {
+    const syncView = () => setCurrentView(hashToView(window.location.hash))
+    window.addEventListener('hashchange', syncView)
+    return () => window.removeEventListener('hashchange', syncView)
   }, [])
 
   useEffect(() => {
@@ -720,14 +815,13 @@ export default function App() {
       </div>
     )}
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <PaymentQrRail />
       {/* 顶栏 */}
       <div className="topbar">
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4 }}>
           <div className="topbar-brand">
             <span className="accent">Shark 2.0</span>
           </div>
-          <TopbarSectionLinks />
+          <TopbarSectionLinks currentView={currentView} />
         </div>
         <div className="topbar-right">
           <div className="topbar-controls-trading">
@@ -802,69 +896,68 @@ export default function App() {
 
       {/* 主内容 */}
       <div style={{ flex: 1, padding: '16px 20px', maxWidth: '1440px', margin: '0 auto', width: '100%' }}>
-        <div id="section-kpi">
-          <Dashboard
-            equity={status.equity}
-            balance={status.balance}
-            freeCash={status.free_cash}
-            realizedPnl={status.realized_pnl}
-            winRate={status.win_rate}
-            positions={status.positions}
-            equityChange={equityChange}
-            safetyBlocked={riskHalt}
-            totalFees={status.total_fees}
-            marginLocked={status.margin_locked}
+        {currentView === 'support' ? (
+          <SupportPage />
+        ) : currentView === 'risk' ? (
+          <RiskPage
+            status={status}
+            riskHalt={riskHalt}
+            connected={connected}
+            pollLatencyMs={pollLatencyMs}
+            fmtUptime={fmtUptime}
           />
-        </div>
-
-        <div className="layout-room-risk" id="section-room">
-          <div className="layout-room-risk__room card">
-            <div className="card-header">shark 领域</div>
-            <div
-              className="card-body"
-              style={{
-                padding: '8px 0 0',
-                minHeight: 400,
-                position: 'relative',
-                display: 'flex',
-                flexDirection: 'column',
-                flex: 1,
-              }}
-            >
-              <LoliRoom />
-            </div>
-          </div>
-          <div className="layout-room-risk__risk card" style={{ display: 'flex', flexDirection: 'column' }}>
-            <div className="card-header">风控状态</div>
-            <div className="card-body" style={{ flex: 1 }}>
-              <SafetyPanel
-                status={status}
-                blocked={riskHalt}
-                connected={connected}
-                latencyMs={pollLatencyMs}
-                uptimeLabel={fmtUptime}
+        ) : (
+          <>
+            <div id="section-kpi">
+              <Dashboard
+                equity={status.equity}
+                balance={status.balance}
+                freeCash={status.free_cash}
+                realizedPnl={status.realized_pnl}
+                winRate={status.win_rate}
+                positions={status.positions}
+                equityChange={equityChange}
+                safetyBlocked={riskHalt}
+                totalFees={status.total_fees}
+                marginLocked={status.margin_locked}
               />
             </div>
-          </div>
-        </div>
 
-        <div className="card" style={{ marginTop: '10px' }} id="section-positions">
-          <div className="card-header">
-            <span>当前持仓 ({status.position_list?.length || 0})</span>
-          </div>
-          <div className="card-body" style={{ padding: '0' }}>
-            <PositionsTable positions={status.position_list || []} />
-          </div>
-        </div>
+            <div className="card" style={{ marginTop: '10px' }} id="section-room">
+              <div className="card-header">shark 领域</div>
+              <div
+                className="card-body"
+                style={{
+                  padding: '8px 0 0',
+                  minHeight: 400,
+                  position: 'relative',
+                  display: 'flex',
+                  flexDirection: 'column',
+                }}
+              >
+                <LoliRoom />
+              </div>
+            </div>
 
-        <div className="card" style={{ marginTop: '10px' }} id="section-history">
-          <div className="card-header">
-            <span>交易记录 ({status.trade_history?.length || 0})</span>
-          </div>
-          <div className="card-body" style={{ padding: '0' }}>
-            <TradeHistory trades={status.trade_history || []} />
-          </div>
-        </div>
+            <div className="card" style={{ marginTop: '10px' }} id="section-positions">
+              <div className="card-header">
+                <span>当前持仓 ({status.position_list?.length || 0})</span>
+              </div>
+              <div className="card-body" style={{ padding: '0' }}>
+                <PositionsTable positions={status.position_list || []} />
+              </div>
+            </div>
+
+            <div className="card" style={{ marginTop: '10px' }} id="section-history">
+              <div className="card-header">
+                <span>交易记录 ({status.trade_history?.length || 0})</span>
+              </div>
+              <div className="card-body" style={{ padding: '0' }}>
+                <TradeHistory trades={status.trade_history || []} />
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {/* 底栏 */}

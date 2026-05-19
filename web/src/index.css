@@ -241,6 +241,12 @@ body::before {
   .kpi-table-desk {
     min-width: 640px;
   }
+  .support-grid {
+    grid-template-columns: 1fr;
+  }
+  .subpage-header {
+    flex-direction: column;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -346,6 +352,63 @@ body::before {
 .topbar-section-links__plans {
   color: #00ff88 !important;
   text-shadow: 0 0 8px rgba(0, 255, 136, 0.35);
+}
+.subpage-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.subpage-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius);
+  background: rgba(15, 22, 40, 0.48);
+}
+.subpage-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent-cyan);
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+}
+.subpage-subtitle {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.subpage-backlink {
+  color: var(--accent-cyan);
+  text-decoration: none;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.subpage-backlink:hover {
+  color: #7ff7ff;
+}
+.support-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.support-card .card-body {
+  padding-top: 10px;
+}
+.support-qr-frame {
+  border: 1px solid rgba(0, 240, 255, 0.14);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.95);
+  max-width: 420px;
+  margin: 0 auto;
+}
+.support-qr-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 .payment-qr-rail {
   position: fixed;
