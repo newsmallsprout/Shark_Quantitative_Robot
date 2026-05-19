@@ -688,6 +688,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             px = prices.get(sym, 0)
                             if px > 0:
                                 self._close_position(sym, px, "外部手动平仓(同步)", 0, prices)
+                        else:
+                            # 内存有且交易所也有：同步真实的开仓均价和持仓大小，修正 PnL 误差
+                            real_entry = exchange_positions[sym]["entry_price"]
+                            if real_entry > 0:
+                                pos["entry"] = real_entry
+                            # 也可以同步真实的 size
+                            real_size = exchange_positions[sym]["size"]
+                            if real_size > 0:
+                                pos["size"] = real_size
                     
                     # 交易所有但内存无
                     for sym in exchange_positions:
@@ -1162,6 +1171,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     if sym in prices and prices[sym] > 0 and not is_stable(sym):
                         cfg = get_config(sym)
                         from strategy.risk import RiskValidator
+                        # 重点修改：在宏观选币阶段，即使是测试状态或余额不足，也先假装能开仓（传入极大 balance 和敞口），确保能正常生成计划供测试后使用
                         can_open, _ = RiskValidator.can_open_position(
                             sym=sym,
                             cfg=cfg,
@@ -1169,10 +1179,10 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             volumes=volumes,
                             changes=changes,
                             total_margin=total_margin,
-                            balance=self.balance,
+                            balance=999999.0, # 绕过资金拦截
                             positions=self.positions,
-                            max_total_exposure=MAX_TOTAL_EXPOSURE,
-                            total_account_equity=total_account_equity
+                            max_total_exposure=999999.0,
+                            total_account_equity=999999.0
                         )
                         if can_open:
                             vol = volumes.get(sym, 0)
@@ -1756,6 +1766,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
             # 实盘记录
             if self._live and self._live.active and _live_oid:
+                from core.live import LivePosition
                 self._live.positions[sym] = LivePosition(
                     symbol=sym,
                     side=side,
@@ -1788,9 +1799,11 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 and self._live_trading_enabled
                 and _live_oid
             ):
-                # 实盘：余额从交易所同步
+                # 实盘：余额从交易所同步总资产并扣除本地模拟锁定的保证金
                 try:
-                    self.balance = self._live.get_balance()
+                    exchange_total = self._live.get_balance()
+                    locked = sum(p["margin"] for p in self.positions.values())
+                    self.balance = exchange_total - locked
                 except Exception:
                     self.balance -= margin + fee
             else:

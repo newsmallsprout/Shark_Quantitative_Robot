@@ -56,7 +56,9 @@ class SessionMixin:
             self._clear_trading_session_state(clear_redis_history=False)
             self._live = engine
             try:
-                self.balance = engine.get_balance()
+                exchange_total = engine.get_balance()
+                locked = sum(p.get("margin", 0) for p in self.positions.values())
+                self.balance = exchange_total - locked
                 self._initial_capital = self.balance
                 _state["initial_capital"] = self.balance
                 _state["balance"] = self.balance

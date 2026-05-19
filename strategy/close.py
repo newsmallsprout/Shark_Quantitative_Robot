@@ -56,10 +56,12 @@ class CloseMixin:
         realized = gross - fee_open - fee_close  # 含全部手续费的净利
 
         self.total_fees += fee_close
-        # 余额更新：实盘从交易所同步，纸盘本地计算
+        # 余额更新：实盘从交易所同步总资产并扣除本地模拟锁定的保证金，纸盘本地计算
         if _live_close_ok and self._live and self._live.active and self._live_trading_enabled:
             try:
-                self.balance = self._live.get_balance()
+                exchange_total = self._live.get_balance()
+                locked = sum(p["margin"] for p in self.positions.values())
+                self.balance = exchange_total - locked
             except Exception:
                 self.balance += pos["margin"] + gross - fee_close
         else:

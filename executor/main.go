@@ -162,19 +162,22 @@ func executeOpen(cmd TradeCmd) {
             "contract": contract, "size": size, "price": "0", "tif": "ioc",
             "text": fmt.Sprintf("t-op-%d", time.Now().UnixMilli()),
     })
-	if err != nil {
-		log.Printf("❌ 开仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
-		rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "failed", 0)
-		return
-	}
-	log.Printf("✅ 开仓 %s %s size=%d status=%v", cmd.Symbol, cmd.Side, cmd.Size, r["status"])
+    if err != nil {
+            log.Printf("❌ 开仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
+            rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "failed", 0)
+            return
+    }
+    log.Printf("✅ 开仓 %s %s size=%d status=%v", cmd.Symbol, cmd.Side, cmd.Size, r["status"])
 
-	// ── 挂止盈止损条件单 ──
+    // ── 清理该合约旧的条件单，防止积累 ──
+    gateAPI("DELETE", "/price_orders?contract="+contract, nil)
+
+    // ── 挂止盈止损条件单 ──
 	if cmd.StopLoss > 0 {
-		slSize := size
-		if slSize < 0 {
-			slSize = -slSize
-		}
+		slSize := size // 这里是开仓的size，带符号的（做多为正，做空为负）
+		// 平仓必须是相反的size
+		slReduceSize := -slSize
+
 		// 止损：stop-market
 		slRule := 2 // long: price<=trigger, short: price>=trigger
 		if cmd.Side == "short" {
@@ -183,14 +186,14 @@ func executeOpen(cmd TradeCmd) {
 		slR, slErr := gateAPI("POST", "/price_orders", map[string]interface{}{
 			"initial": map[string]interface{}{
 				"contract":    contract,
-				"size":        -size,  // 平仓必须是相反的size
+				"size":        slReduceSize,  // 平仓必须是相反的size
 				"price":       "0",
 				"tif":         "ioc",
 				"reduce_only": true,
 				"text":        fmt.Sprintf("t-sl-%d", time.Now().UnixMilli()),
 			},
 			"trigger": map[string]interface{}{
-				"price":         strconv.FormatFloat(cmd.StopLoss, 'f', 1, 64),
+				"price":         strconv.FormatFloat(cmd.StopLoss, 'f', -1, 64),
 				"rule":          slRule,
 				"expiration":    86400 * 7, // 必须是 86400 的倍数
 				"strategy_type": 0,
@@ -208,30 +211,39 @@ func executeOpen(cmd TradeCmd) {
 	}
 	if len(tpLevels) > 0 {
 		tpSize := size
-		if tpSize < 0 {
-			tpSize = -tpSize
-		}
-		splits := splitReduceSizes(tpSize, len(tpLevels))
-		// 止盈：limit
+		// 止盈：stop-market
 		tpRule := 1 // long: price>=trigger, short: price<=trigger
 		if cmd.Side == "short" {
 			tpRule = 2
 		}
+
+		// 将平仓总仓位切分为多份止盈 (取绝对值进行切分)
+		absTpSize := tpSize
+		if absTpSize < 0 {
+			absTpSize = -absTpSize
+		}
+		splits := splitReduceSizes(absTpSize, len(tpLevels))
 		for i, target := range tpLevels {
 			if target <= 0 || i >= len(splits) {
 				continue
 			}
+
+			// 确定正确的反向 size
+			reduceSize := -splits[i]
+			if cmd.Side == "short" {
+				reduceSize = splits[i]
+			}
 			tpR, tpErr := gateAPI("POST", "/price_orders", map[string]interface{}{
 				"initial": map[string]interface{}{
 					"contract":    contract,
-					"size":        -splits[i], // 平仓必须反向
+					"size":        reduceSize, // 已经处理过反向的正确 size
 					"price":       "0",
 					"tif":         "ioc",
 					"reduce_only": true,
 					"text":        fmt.Sprintf("t-tp-%d", time.Now().UnixMilli()),
 				},
 				"trigger": map[string]interface{}{
-					"price":         strconv.FormatFloat(target, 'f', 1, 64),
+					"price":         strconv.FormatFloat(target, 'f', -1, 64),
 					"rule":          tpRule,
 					"expiration":    86400 * 7, // 必须是 86400 的倍数
 					"strategy_type": 0,
@@ -280,12 +292,16 @@ func executeClose(cmd TradeCmd) {
             "text":        fmt.Sprintf("t-cl-%d", time.Now().UnixMilli()),
     })
 	if err != nil {
-		log.Printf("❌ 平仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
-		rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "close_failed", 0)
-		return
-	}
-	log.Printf("✅ 平仓 %s %s status=%v", cmd.Symbol, cmd.Side, r["status"])
-	rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "close_ok", 0)
+            log.Printf("❌ 平仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
+            rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "close_failed", 0)
+            return
+    }
+    log.Printf("✅ 平仓 %s %s status=%v", cmd.Symbol, cmd.Side, r["status"])
+    
+    // ── 平仓后清理所有条件单 ──
+    gateAPI("DELETE", "/price_orders?contract="+contract, nil)
+    
+    rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "close_ok", 0)
 }
 
 // ═══════════════════════════════════════════════

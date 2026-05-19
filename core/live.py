@@ -323,17 +323,18 @@ class LiveEngine:
     # ── 账户余额及划转 ──
 
     def get_balance(self) -> float:
-        """获取 USDT 可用余额"""
+        """获取 USDT 账户总资产(剔除未实现盈亏)"""
         try:
             # 用合约账户接口
             result = _api("GET", "/accounts", query="currency=USDT")
-            if isinstance(result, dict) and "available" in result:
-                return float(result["available"])
+            if isinstance(result, dict) and "total" in result:
+                return float(result["total"])
             if isinstance(result, list) and result:
-                return float(result[0].get("available", 0))
+                return float(result[0].get("total", 0))
+            raise ValueError(f"无法解析账户余额响应: {result}")
         except Exception as e:
-            _log.error("获取余额失败: %s", e)
-        return 0.0
+            _log.error("获取总资产失败: %s", e)
+            raise e
 
     def transfer_to_spot(self, amount: float) -> bool:
         """将资金从合约账户划转至现货（统一）账户"""
