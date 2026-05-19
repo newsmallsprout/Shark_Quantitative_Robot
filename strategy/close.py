@@ -20,7 +20,10 @@ class CloseMixin:
         _live_close_ok = True
         _live_close_px = px
         lp = self.positions.get(sym)
-        close_mode = "live" if (self._live and self._live.active and self._live_trading_enabled) else "paper"
+        # 注意：这里不能检查 self._live_trading_enabled。因为当用户点击"停止交易"时，
+        # 该开关会被立刻置为 False，随后触发 live_close_all，如果这里检查了开关，
+        # 就会把实盘的平仓单错误地标记为 "paper" 导致执行器忽略，从而形成幽灵仓位。
+        close_mode = "live" if (self._live and self._live.active) else "paper"
         if lp:
             cmd = build_order_command(
                 symbol=sym,
