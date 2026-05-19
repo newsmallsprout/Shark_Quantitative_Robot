@@ -677,18 +677,35 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         # ── 实盘：定期同步 + 对账（不因 API 熔断整段跳过；止盈止损仍按行情跑）──
         if self._live and self._live.active:
             if now - self._live._last_sync > 60:
-                mismatches = self._live.reconcile(self.positions)
-                if mismatches:
-                    try:
-                        from execution.prod_alert import _send_slack
-
-                        asyncio.create_task(
-                            _send_slack(
-                                f"🔴 [Shark] 持仓对账不一致: {'; '.join(mismatches[:3])}"
+                try:
+                    exchange_positions = self._live.sync_positions()
+                    mismatches = []
+                    # 内存有但交易所无
+                    for sym, pos in self.positions.items():
+                        if sym not in exchange_positions:
+                            mismatches.append(f"{sym}: 内存有({pos.get('side','?')}) 交易所无")
+                            _log.warning(f"对账修正: {sym} 在APP端已平仓，系统自动同步平仓")
+                            px = prices.get(sym, 0)
+                            if px > 0:
+                                self._close_position(sym, px, "外部手动平仓(同步)", 0, prices)
+                    
+                    # 交易所有但内存无
+                    for sym in exchange_positions:
+                        if sym not in self.positions:
+                            mismatches.append(f"{sym}: 交易所有({exchange_positions[sym]['side']}) 内存无")
+                    
+                    if mismatches:
+                        try:
+                            from execution.prod_alert import _send_slack
+                            asyncio.create_task(
+                                _send_slack(
+                                    f"🔴 [Shark] 持仓对账不一致: {'; '.join(mismatches[:3])}"
+                                )
                             )
-                        )
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
         # 检查持仓：动态止损 / 移动止盈 / 浮盈加仓
         for sym in list(self.positions):
@@ -1267,7 +1284,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     min_size = spec.order_size_min if spec else 1.0
                     
                     side = "long"
-                    lev = 5
+                    lev = min(5, int(max_lev))
                     margin = (min_size * quanto * px) / lev
                     # 极小止盈止损以便快速结束测试流程
                     _plan_sl = px * 0.999
@@ -1292,19 +1309,21 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         _r.publish("shark:orders:new", cmd)
                         _log.info(f"🚀 发送实盘测试订单 {test_sym} size={_ct_size}...")
                         
+                        _test_oid = uuid.uuid4()
+                        _now = time.time()
                         self.positions[test_sym] = {
                             "side": side,
                             "entry": px,
                             "size": _ct_size,
                             "leverage": lev,
                             "margin": margin,
-                            "opened": time.time(),
+                            "opened": _now,
                             "fee_open": 0,
                             "vol_chg": 0,
                             "best_pnl": -999,
                             "pyramid_count": 0,
                             "ai_targets": None,
-                            "order_id": uuid.uuid4(),
+                            "order_id": _test_oid,
                             "signal_src": "live_test",
                             "ai_confidence": 100,
                             "_learner_feat": [],
@@ -1313,10 +1332,25 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             "plan_signature": None,
                             "defense_used": False,
                         }
-                        self._open_timestamps[test_sym] = time.time()
+                        self._open_timestamps[test_sym] = _now
                         self._live_test_status = "running"
                         self._live_test_symbol = test_sym
                         _can_open = False
+
+                        if self._persistence and self._persistence.enabled_db():
+                            self._persistence.on_position_open(
+                                self,
+                                prices,
+                                order_id=_test_oid,
+                                sym=test_sym,
+                                side=side,
+                                entry_price=px,
+                                size=_ct_size,
+                                margin=margin,
+                                lev=float(lev),
+                                fee=0.0,
+                                opened_ts=_now,
+                            )
                     except Exception as e:
                         _log.error("Redis publish failed: %s", e)
 
