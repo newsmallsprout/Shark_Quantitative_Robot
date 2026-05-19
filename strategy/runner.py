@@ -697,14 +697,19 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                                     send_order=False,
                                 )
                         else:
-                            # 内存有且交易所也有：同步真实的开仓均价和持仓大小，修正 PnL 误差
+                            # 内存有且交易所也有：同步真实的开仓均价/大小/杠杆/保证金，修正展示与PnL误差
                             real_entry = exchange_positions[sym]["entry_price"]
                             if real_entry > 0:
                                 pos["entry"] = real_entry
-                            # 也可以同步真实的 size
                             real_size = exchange_positions[sym]["size"]
                             if real_size > 0:
                                 pos["size"] = real_size
+                            real_lev = exchange_positions[sym].get("leverage", 0)
+                            if real_lev > 0:
+                                pos["leverage"] = real_lev
+                            real_margin = exchange_positions[sym].get("margin", 0)
+                            if real_margin > 0:
+                                pos["margin"] = real_margin
                     
                     # 交易所有但内存无
                     for sym in exchange_positions:
