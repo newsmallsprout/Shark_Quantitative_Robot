@@ -29,6 +29,7 @@ class ContractSpec:
     symbol: str
     leverage_max: int = 100
     order_size_min: float = 1
+    order_size_max: float = 0
     quanto_multiplier: float = 1
     mark_price: float = 0
     funding_rate: float = 0
@@ -72,6 +73,7 @@ async def fetch_contract_specs() -> Dict[str, ContractSpec]:
             symbol=sym,
             leverage_max=min(int(c.get("leverage_max", 100) or 100), 125),
             order_size_min=float(c.get("order_size_min", 1) or 1),
+            order_size_max=float(c.get("order_size_max", 0) or 0),
             quanto_multiplier=float(c.get("quanto_multiplier", 1) or 1),
             mark_price=float(c.get("mark_price", 0) or 0),
             funding_rate=float(c.get("funding_rate", 0) or 0),
