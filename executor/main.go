@@ -181,16 +181,20 @@ func executeOpen(cmd TradeCmd) {
 			slRule = 1
 		}
 		slR, slErr := gateAPI("POST", "/price_orders", map[string]interface{}{
-			"contract": contract,
-			"size":     slSize,
-			"price":    "0",
-			"trigger": map[string]interface{}{
-				"price":      strconv.FormatFloat(cmd.StopLoss, 'f', 1, 64),
-				"rule":       slRule,
-				"expiration": 3600,
+			"initial": map[string]interface{}{
+				"contract":    contract,
+				"size":        -size,  // 平仓必须是相反的size
+				"price":       "0",
+				"tif":         "ioc",
+				"reduce_only": true,
+				"text":        fmt.Sprintf("t-shark-sl-%d", time.Now().UnixNano()),
 			},
-			"reduce_only": true,
-			"text":        fmt.Sprintf("t-shark-sl-%d", time.Now().UnixNano()),
+			"trigger": map[string]interface{}{
+				"price":         strconv.FormatFloat(cmd.StopLoss, 'f', 1, 64),
+				"rule":          slRule,
+				"expiration":    3600,
+				"strategy_type": 0,
+			},
 		})
 		if slErr != nil {
 			log.Printf("⚠ 止损单挂失败 %s: %v", cmd.Symbol, slErr)
@@ -218,16 +222,20 @@ func executeOpen(cmd TradeCmd) {
 				continue
 			}
 			tpR, tpErr := gateAPI("POST", "/price_orders", map[string]interface{}{
-				"contract": contract,
-				"size":     splits[i],
-				"price":    "0",
-				"trigger": map[string]interface{}{
-					"price":      strconv.FormatFloat(target, 'f', 1, 64),
-					"rule":       tpRule,
-					"expiration": 3600,
+				"initial": map[string]interface{}{
+					"contract":    contract,
+					"size":        -splits[i], // 平仓必须反向
+					"price":       "0",
+					"tif":         "ioc",
+					"reduce_only": true,
+					"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
 				},
-				"reduce_only": true,
-				"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
+				"trigger": map[string]interface{}{
+					"price":         strconv.FormatFloat(target, 'f', 1, 64),
+					"rule":          tpRule,
+					"expiration":    3600,
+					"strategy_type": 0,
+				},
 			})
 			if tpErr != nil {
 				log.Printf("⚠ 止盈单挂失败 %s: %v", cmd.Symbol, tpErr)
