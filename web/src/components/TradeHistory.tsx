@@ -109,12 +109,12 @@ export default function TradeHistory({ trades }: { trades: TradeRecord[] }) {
                 </span>
               </td>
               <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)' }}>
-                ${t.entry_price?.toFixed(4)}
+                {Number.isFinite(Number(t.entry_price)) && Number(t.entry_price) > 0 ? `$${t.entry_price.toFixed(4)}` : '--'}
               </td>
               <td style={{ textAlign: 'right', fontFamily: 'var(--font-mono)' }}>
-                ${t.exit_price?.toFixed(4)}
+                {Number.isFinite(Number(t.exit_price)) && Number(t.exit_price) > 0 ? `$${t.exit_price.toFixed(4)}` : '--'}
               </td>
-              <td style={{ textAlign: 'right' }}>{t.leverage}x</td>
+              <td style={{ textAlign: 'right' }}>{Number(t.leverage) > 0 ? `${t.leverage}x` : '--'}</td>
               <td style={{ textAlign: 'right' }} className={grossPnl(t) >= 0 ? 'pnl-up' : 'pnl-down'}>
                 {grossPnl(t) >= 0 ? '+' : ''}{grossPnl(t).toFixed(4)}
               </td>

@@ -15,18 +15,21 @@ def _finite_float(v, default: float = 0.0) -> float:
 def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float]) -> List[dict]:
     out: List[dict] = []
     for sym, pos in runner.positions.items():
-        px = float(pos.get("entry", 0) or 0)
+        display_entry = _finite_float(pos.get("display_entry", pos.get("entry", 0)))
+        display_margin = _finite_float(pos.get("display_margin", pos.get("margin", 0)))
+        display_leverage = _finite_float(pos.get("display_leverage", pos.get("leverage", 0)))
+        px = display_entry
         if sym in prices:
             px = _finite_float(prices[sym], px)
-        unrealized = runner._gross_pnl_usd(sym, pos, px)
-        pnl_pct = unrealized / max(pos["margin"], 1e-9) * 100
+        unrealized = _finite_float(pos.get("display_unrealized_pnl"), runner._gross_pnl_usd(sym, pos, px))
+        pnl_pct = unrealized / max(display_margin, 1e-9) * 100
         out.append({
             "symbol": sym,
             "side": pos["side"],
             "size": _finite_float(pos["size"]),
-            "entry_price": _finite_float(pos["entry"]),
-            "leverage": _finite_float(pos["leverage"]),
-            "margin": _finite_float(pos["margin"]),
+            "entry_price": display_entry,
+            "leverage": display_leverage,
+            "margin": display_margin,
             "unrealized_pnl": _finite_float(unrealized),
             "pnl_pct": _finite_float(pnl_pct),
             "current_price": px,
@@ -181,8 +184,9 @@ class StateMixin:
                 get_state()["free_cash"] = get_state()["live"]["balance"]
                 get_state()["unrealized_pnl"] = 0
                 get_state()["margin_locked"] = sum(
-                    p.get("margin", 0) for p in self._live.sync_positions().values()
+                    p.get("margin", 0) for p in self._live.sync_positions(update_timestamp=False).values()
                 ) if self._live else 0
+                get_state()["trade_history"] = self._live.get_close_history(limit=100)
 
         # 待审批的进化修改：get_state() 是唯一真相源，tick从get_state()同步
         self._pending_evo_changes = get_state().get("evo_pending", [])

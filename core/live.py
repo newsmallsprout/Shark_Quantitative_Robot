@@ -11,7 +11,7 @@ import hmac
 import hashlib
 import uuid
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List, Any
 from dataclasses import dataclass
 
 _log = logging.getLogger(__name__)
@@ -118,6 +118,8 @@ class LiveEngine:
         self._order_errors = 0
         self._consecutive_errors = 0
         self._last_sync = 0.0
+        self._history_cache: List[dict] = []
+        self._last_history_sync = 0.0
         self.active = False
         self._verify_credentials()  # 放到最后，不会被覆盖
 
@@ -269,7 +271,7 @@ class LiveEngine:
 
     # ── 持仓同步 + 对账恢复 ──
 
-    def sync_positions(self) -> Dict[str, dict]:
+    def sync_positions(self, update_timestamp: bool = True) -> Dict[str, dict]:
         """
         从交易所拉取实际持仓，返回 {sym: {size, entry_price, leverage, margin, unrealised_pnl}}
         """
@@ -289,11 +291,64 @@ class LiveEngine:
                     "margin": float(p.get("margin", 0) or 0),
                     "unrealised_pnl": float(p.get("unrealised_pnl", 0) or 0),
                 }
-            self._last_sync = time.time()
+            if update_timestamp:
+                self._last_sync = time.time()
             return positions
         except Exception as e:
             _log.error("持仓同步失败: %s", e)
             return {}
+
+    def get_close_history(self, limit: int = 50, cache_ttl: int = 5) -> List[dict]:
+        """获取实盘平仓历史，优先使用交易所 position_close 接口"""
+        now = time.time()
+        if self._history_cache and now - self._last_history_sync < cache_ttl:
+            return list(self._history_cache[:limit])
+
+        def _field(row: Dict[str, Any], snake: str, camel: str, default: Any = 0) -> Any:
+            return row.get(snake, row.get(camel, default))
+
+        try:
+            result = _api("GET", "/position_close", query=f"limit={max(1, min(int(limit), 100))}")
+            rows = result if isinstance(result, list) else []
+            history: List[dict] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                side = str(_field(row, "side", "side", "") or "")
+                contract = str(_field(row, "contract", "contract", "") or "")
+                long_price = float(_field(row, "long_price", "longPrice", 0) or 0)
+                short_price = float(_field(row, "short_price", "shortPrice", 0) or 0)
+                pnl = float(_field(row, "pnl", "pnl", 0) or 0)
+                pnl_fee = float(_field(row, "pnl_fee", "pnlFee", 0) or 0)
+                pnl_core = float(_field(row, "pnl_pnl", "pnlPnl", pnl) or 0)
+                closed_at = float(_field(row, "time", "time", 0) or 0)
+                opened_at = float(_field(row, "first_open_time", "firstOpenTime", closed_at) or closed_at)
+                entry_price = long_price if side == "long" else short_price
+                exit_price = short_price if side == "long" else long_price
+                history.append({
+                    "symbol": self._contract_to_sym(contract) if contract else "",
+                    "side": side,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "size": float(_field(row, "accum_size", "accumSize", 0) or 0),
+                    "leverage": 0,
+                    "margin": 0,
+                    "realized_pnl": pnl,
+                    "pnl_pct": 0,
+                    "reason": str(_field(row, "text", "text", "gate_live_close") or "gate_live_close"),
+                    "fee_open": 0.0,
+                    "fee_close": abs(pnl_fee),
+                    "gross_pnl": pnl_core,
+                    "opened_at": opened_at,
+                    "closed_at": closed_at,
+                })
+            history.sort(key=lambda x: float(x.get("closed_at", 0) or 0))
+            self._history_cache = history
+            self._last_history_sync = now
+            return list(history[:limit])
+        except Exception as e:
+            _log.error("实盘交易历史获取失败: %s", e)
+            return list(self._history_cache[:limit])
 
     def reconcile(self, memory_positions: dict) -> list:
         """对账：内存持仓 vs 交易所持仓，返回不一致列表"""

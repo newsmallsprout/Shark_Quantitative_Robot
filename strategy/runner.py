@@ -697,19 +697,23 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                                     send_order=False,
                                 )
                         else:
-                            # 内存有且交易所也有：同步真实的开仓均价/大小/杠杆/保证金，修正展示与PnL误差
+                            # 内存有且交易所也有：同步真实成交价与展示字段，但不污染内部风控杠杆/保证金
                             real_entry = exchange_positions[sym]["entry_price"]
                             if real_entry > 0:
                                 pos["entry"] = real_entry
+                                pos["display_entry"] = real_entry
                             real_size = exchange_positions[sym]["size"]
                             if real_size > 0:
                                 pos["size"] = real_size
                             real_lev = exchange_positions[sym].get("leverage", 0)
                             if real_lev > 0:
-                                pos["leverage"] = real_lev
+                                pos["display_leverage"] = real_lev
                             real_margin = exchange_positions[sym].get("margin", 0)
                             if real_margin > 0:
-                                pos["margin"] = real_margin
+                                pos["display_margin"] = real_margin
+                            pos["display_unrealized_pnl"] = float(
+                                exchange_positions[sym].get("unrealised_pnl", 0) or 0
+                            )
                     
                     # 交易所有但内存无
                     for sym in exchange_positions:
@@ -1751,6 +1755,10 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 "size": size,
                 "leverage": lev,
                 "margin": margin,
+                "display_entry": entry_price,
+                "display_leverage": lev,
+                "display_margin": margin,
+                "display_unrealized_pnl": 0.0,
                 "opened": now,
                 "fee_open": fee,
                 "vol_chg": chg_abs,
