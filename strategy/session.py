@@ -201,7 +201,7 @@ class SessionMixin:
                 "positions": self.positions,
                 "open_timestamps": self._open_timestamps,
             }
-            _r.set("shark:paper_state", json.dumps(state, ensure_ascii=False))
+            _r.set("shark:paper_state", json.dumps(state, ensure_ascii=False, default=str))
         except Exception as e:
             _log.warning("save paper state failed: %s", e)
 
