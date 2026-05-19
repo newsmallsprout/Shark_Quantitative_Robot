@@ -155,6 +155,31 @@ func roundPrice(price float64, tickSize float64) float64 {
 	return math.Round(price/tickSize) * tickSize
 }
 
+func tickDecimals(tickSize float64) int {
+	if tickSize <= 0 {
+		return 8
+	}
+	s := strconv.FormatFloat(tickSize, 'f', -1, 64)
+	if idx := strings.IndexByte(s, '.'); idx >= 0 {
+		return len(strings.TrimRight(s[idx+1:], "0"))
+	}
+	return 0
+}
+
+func normalizeTriggerPrice(price float64, tickSize float64) string {
+	if price <= 0 {
+		return ""
+	}
+	if tickSize <= 0 {
+		return strconv.FormatFloat(price, 'f', -1, 64)
+	}
+	decimals := tickDecimals(tickSize)
+	rounded := roundPrice(price, tickSize)
+	scale := math.Pow10(decimals)
+	rounded = math.Round(rounded*scale) / scale
+	return strconv.FormatFloat(rounded, 'f', decimals, 64)
+}
+
 func executeOpen(cmd TradeCmd) {
 	contract := strings.ReplaceAll(cmd.Symbol, "/", "_")
 
@@ -186,6 +211,10 @@ func executeOpen(cmd TradeCmd) {
 		slSize := size // 这里是开仓的size，带符号的（做多为正，做空为负）
 		// 平仓必须是相反的size
 		slReduceSize := -slSize
+		slTrigger := normalizeTriggerPrice(cmd.StopLoss, cmd.PriceRound)
+		if slTrigger == "" {
+			log.Printf("⚠ 止损单跳过 %s: invalid stop_loss=%v tick=%v", cmd.Symbol, cmd.StopLoss, cmd.PriceRound)
+		} else {
 
 		// 止损：stop-market
 		slRule := 2 // long: price<=trigger, short: price>=trigger
@@ -202,16 +231,17 @@ func executeOpen(cmd TradeCmd) {
 				"text":        fmt.Sprintf("t-sl-%d", time.Now().UnixMilli()),
 			},
 			"trigger": map[string]interface{}{
-				"price":         strconv.FormatFloat(roundPrice(cmd.StopLoss, cmd.PriceRound), 'f', -1, 64),
+				"price":         slTrigger,
 				"rule":          slRule,
 				"expiration":    86400 * 7, // 必须是 86400 的倍数
 				"strategy_type": 0,
 			},
 		})
 		if slErr != nil {
-			log.Printf("⚠ 止损单挂失败 %s: %v", cmd.Symbol, slErr)
+			log.Printf("⚠ 止损单挂失败 %s trigger=%s tick=%v: %v", cmd.Symbol, slTrigger, cmd.PriceRound, slErr)
 		} else {
-			log.Printf("🛑 止损 %s @%.1f status=%v", cmd.Symbol, cmd.StopLoss, slR["status"])
+			log.Printf("🛑 止损 %s @%s status=%v", cmd.Symbol, slTrigger, slR["status"])
+		}
 		}
 	}
 	tpLevels := cmd.TakeProfitLevels
@@ -236,6 +266,11 @@ func executeOpen(cmd TradeCmd) {
 			if target <= 0 || i >= len(splits) {
 				continue
 			}
+			tpTrigger := normalizeTriggerPrice(target, cmd.PriceRound)
+			if tpTrigger == "" {
+				log.Printf("⚠ 止盈单跳过 %s level=%d invalid target=%v tick=%v", cmd.Symbol, i, target, cmd.PriceRound)
+				continue
+			}
 
 			// 确定正确的反向 size
 			reduceSize := -splits[i]
@@ -252,16 +287,16 @@ func executeOpen(cmd TradeCmd) {
 					"text":        fmt.Sprintf("t-tp-%d", time.Now().UnixMilli()),
 				},
 				"trigger": map[string]interface{}{
-					"price":         strconv.FormatFloat(roundPrice(target, cmd.PriceRound), 'f', -1, 64),
+					"price":         tpTrigger,
 					"rule":          tpRule,
 					"expiration":    86400 * 7, // 必须是 86400 的倍数
 					"strategy_type": 0,
 				},
 			})
 			if tpErr != nil {
-				log.Printf("⚠ 止盈单挂失败 %s: %v", cmd.Symbol, tpErr)
+				log.Printf("⚠ 止盈单挂失败 %s level=%d trigger=%s tick=%v: %v", cmd.Symbol, i, tpTrigger, cmd.PriceRound, tpErr)
 			} else {
-				log.Printf("🎯 止盈 %s @%.1f size=%d status=%v", cmd.Symbol, target, splits[i], tpR["status"])
+				log.Printf("🎯 止盈 %s @%s size=%d status=%v", cmd.Symbol, tpTrigger, splits[i], tpR["status"])
 			}
 		}
 	}
