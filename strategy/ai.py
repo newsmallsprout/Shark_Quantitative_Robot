@@ -119,10 +119,17 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
         max_lev = spec.get('leverage_max', '20')
         max_size = spec.get('order_size_max', 0)
         min_size = spec.get('order_size_min', 0)
+        risk_limit = spec.get('risk_limit_base', 0)
         quanto = float(spec.get('quanto_multiplier', 1))
         
         # 计算成 USDT 金额给 AI 更直观
         max_usdt = float(max_size) * quanto * price if max_size else "未知"
+        # 实际最大开仓金额不仅受 max_size 限制，还受风险限额 risk_limit_base 限制
+        if risk_limit and isinstance(max_usdt, float):
+            max_usdt = min(max_usdt, float(risk_limit))
+        elif risk_limit:
+            max_usdt = float(risk_limit)
+
         min_usdt = float(min_size) * quanto * price if min_size else "未知"
         if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
         if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"

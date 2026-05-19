@@ -173,9 +173,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 max_lev = spec.get('leverage_max', '20')
                 max_size = spec.get('order_size_max', 0)
                 min_size = spec.get('order_size_min', 0)
+                risk_limit = spec.get('risk_limit_base', 0)
                 quanto = float(spec.get('quanto_multiplier', 1))
                 
                 max_usdt = float(max_size) * quanto * px if max_size else "未知"
+                if risk_limit and isinstance(max_usdt, float):
+                    max_usdt = min(max_usdt, float(risk_limit))
+                elif risk_limit:
+                    max_usdt = float(risk_limit)
+
                 min_usdt = float(min_size) * quanto * px if min_size else "未知"
                 if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
                 if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"
@@ -447,9 +453,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 max_lev = spec.get('leverage_max', '20')
                 max_size = spec.get('order_size_max', 0)
                 min_size = spec.get('order_size_min', 0)
+                risk_limit = spec.get('risk_limit_base', 0)
                 quanto = float(spec.get('quanto_multiplier', 1))
                 
                 max_usdt = float(max_size) * quanto * px if max_size else "未知"
+                if risk_limit and isinstance(max_usdt, float):
+                    max_usdt = min(max_usdt, float(risk_limit))
+                elif risk_limit:
+                    max_usdt = float(risk_limit)
+
                 min_usdt = float(min_size) * quanto * px if min_size else "未知"
                 if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
                 if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"
@@ -1505,9 +1517,19 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     size = spec.order_size_min
                     margin = (size * quanto * entry_price) / lev
                     bumped_for_min = True
-                if spec and spec.order_size_max > 0 and size > spec.order_size_max:
-                    size = spec.order_size_max
+                
+                # 双重拦截：交易所 order_size_max 和 risk_limit_base
+                actual_max_size = spec.order_size_max if spec else 0
+                if spec and spec.risk_limit_base > 0 and entry_price > 0:
+                    max_size_by_risk = int(spec.risk_limit_base / (entry_price * quanto))
+                    if max_size_by_risk > 0:
+                        if actual_max_size == 0 or max_size_by_risk < actual_max_size:
+                            actual_max_size = max_size_by_risk
+                
+                if actual_max_size > 0 and size > actual_max_size:
+                    size = actual_max_size
                     margin = (size * quanto * entry_price) / lev
+
                 if bumped_for_min and not is_stable(sym):
                     alt_ceiling = max(5.0, total_account_equity * 0.06)
                     if margin > alt_ceiling:

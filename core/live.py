@@ -165,9 +165,19 @@ class LiveEngine:
         contract_size = 0
         spec = self._get_contract_spec(sym)
 
-        # 检查最小/最大下单量
+        # 检查最小/最大下单量及风险限额兜底
         min_size = spec.get("order_size_min", 1)
         max_size = spec.get("order_size_max", 0)
+        risk_limit = spec.get("risk_limit_base", 0)
+        quanto = float(spec.get("quanto_multiplier", 1))
+
+        if risk_limit and px > 0:
+            # 风险限额换算成合约张数
+            max_size_by_risk = int(float(risk_limit) / (px * quanto))
+            if max_size_by_risk > 0:
+                if max_size == 0 or max_size_by_risk < max_size:
+                    max_size = max_size_by_risk
+
         if size < min_size:
             _log.warning("%s size=%d < min=%d, bump", sym, size, min_size)
             size = min_size
