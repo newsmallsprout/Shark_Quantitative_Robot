@@ -85,8 +85,16 @@ export default function TradingReportChart({ trades }: Props) {
       }
     })
 
-    // 简单按 sortKey 排序（如果是严格格式的话）
-    // 或者直接返回（假设已经有序）
+    // 根据 timeframe 决定排序的逻辑，保证时间是正序的（左边旧，右边新）
+    result.sort((a, b) => {
+      const partsA = a.sortKey.split('-').map(Number)
+      const partsB = b.sortKey.split('-').map(Number)
+      for (let i = 0; i < partsA.length; i++) {
+        if (partsA[i] !== partsB[i]) return partsA[i] - partsB[i]
+      }
+      return 0
+    })
+
     return result
   }, [trades, timeframe])
 
