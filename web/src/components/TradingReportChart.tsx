@@ -45,10 +45,11 @@ export default function TradingReportChart({ trades }: Props) {
     const grouped = new Map<string, { timeLabel: string; pnl: number; tradesCount: number }>()
 
     trades.forEach(t => {
-      // 忽略未平仓或无效时间
-      if (!t.closed_at) return
+      // 如果后端没有返回 closed_at，则使用 opened_at 作为降级（对于平仓记录通常至少有 opened_at）
+      const timestamp = t.closed_at || t.opened_at
+      if (!timestamp) return
       
-      const date = new Date(t.closed_at * 1000)
+      const date = new Date(timestamp * 1000)
       let key = ''
       let label = ''
 
