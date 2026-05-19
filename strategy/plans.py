@@ -141,7 +141,16 @@ class PlanMixin:
             plan["ai_model"] = "deepseek"
             plan["ai_confidence"] = 75
         else:
-            plan = self._build_alt_attack_plan(sym, px, change_abs, volume, funding)
+            if self._plan_gate:
+                self._plan_gate._plan_cache.pop(sym, None)
+                self._plan_gate._last_fetch.pop(sym, None)
+            try:
+                import redis as _redis
+                _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                _r.delete(f"shark:plan:{sym}")
+            except Exception:
+                pass
+            return None
         if reason:
             plan["ai_rationale"] = f"{reason}；" + str(plan.get("ai_rationale", ""))
         try:

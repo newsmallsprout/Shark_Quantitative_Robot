@@ -83,6 +83,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self._loss_replay_guard: Dict[str, dict] = {}
         self._price_replan_last: Dict[str, float] = {}
         self._symbol_cooldown_until: Dict[str, float] = {}
+        self._plan_review_cache: Dict[str, dict] = {}
         # 山寨币独立进化状态（动态币对，首次见到自动初始化）
         self._alt_evo: Dict[
             str, dict
@@ -596,6 +597,102 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             line = f"[交易暂停] {code}: {detail}"
             _log.info(line)
             _log.warning("%s", line)
+
+    async def _ai_review_trade_plan(
+        self,
+        sym: str,
+        plan: dict,
+        px: float,
+        change: float,
+        vol: float,
+        funding: float,
+    ) -> tuple[bool, str]:
+        """每个币对计划都必须单独通过 AI 二次复核。"""
+        if not isinstance(plan, dict) or not plan:
+            return False, "计划为空"
+        api_key = (
+            os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("QWEN_KEY")
+            or os.environ.get("VOLC_KEY")
+        )
+        if not api_key:
+            return False, "缺少AI复核密钥"
+
+        try:
+            review_sig = json.dumps(
+                {
+                    "sym": sym,
+                    "generated_at": plan.get("generated_at"),
+                    "valid_until": plan.get("valid_until"),
+                    "bias": plan.get("bias"),
+                    "macro_regime": plan.get("macro_regime") or plan.get("regime"),
+                    "leverage": plan.get("leverage"),
+                    "range_low": plan.get("range_low"),
+                    "range_high": plan.get("range_high"),
+                    "stop_loss": plan.get("stop_loss"),
+                    "take_profit": plan.get("take_profit"),
+                    "long_stop_loss": plan.get("long_stop_loss"),
+                    "short_stop_loss": plan.get("short_stop_loss"),
+                    "long_take_profit": plan.get("long_take_profit"),
+                    "short_take_profit": plan.get("short_take_profit"),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:
+            review_sig = f"{sym}:{plan.get('generated_at')}:{plan.get('valid_until')}"
+
+        cached = self._plan_review_cache.get(sym)
+        if cached and cached.get("sig") == review_sig and time.time() - float(cached.get("ts", 0)) < 300:
+            return bool(cached.get("approved")), str(cached.get("reason") or "")
+
+        import aiohttp
+
+        prompt = (
+            "你是交易计划复核AI。你只能做 PASS 或 REJECT，不要重写计划。\n"
+            f"币对: {sym}\n"
+            f"现价: {px:.8f}\n"
+            f"24h波动: {float(change or 0):+.2f}%\n"
+            f"24h成交量: {float(vol or 0):.0f}\n"
+            f"资金费率: {float(funding or 0) * 100:+.4f}%\n"
+            f"计划JSON: {json.dumps(plan, ensure_ascii=False, default=str)}\n"
+            "检查项: 方向是否清晰、止损止盈是否合理、风险收益比是否至少接近1:2、是否存在明显追涨杀跌/区间外开仓风险。\n"
+            "只输出JSON: {\"approved\": true/false, \"reason\": \"<=40字\", \"confidence\": 0-100}"
+        )
+        approved = False
+        reason = "AI复核失败"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.1,
+                    },
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data["choices"][0]["message"]["content"]
+                        result = json.loads(text) if isinstance(text, str) else text
+                        approved = bool(result.get("approved", False))
+                        reason = str(result.get("reason") or ("AI通过" if approved else "AI拒绝该计划"))[:80]
+                    else:
+                        reason = f"AI复核HTTP {resp.status}"
+        except Exception as e:
+            reason = f"AI复核异常:{e}"
+
+        self._plan_review_cache[sym] = {
+            "sig": review_sig,
+            "approved": approved,
+            "reason": reason,
+            "ts": time.time(),
+        }
+        return approved, reason
 
     async def tick(
         self,
@@ -1575,6 +1672,25 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     plan_lev = plan_cache.get("leverage", 0)
                     if plan_lev and 1 <= plan_lev <= 125:
                         lev = self._clamp_leverage_for_config(sym, int(plan_lev), cfg)
+            if not plan_cache:
+                _rej["no_plan"] += 1
+                continue
+            approved, review_reason = await self._ai_review_trade_plan(
+                sym,
+                plan_cache,
+                px,
+                change,
+                vol,
+                funding_rates.get(sym, 0),
+            )
+            if not approved:
+                _rej["gate_block"] += 1
+                self._note_tick_block(
+                    "ai_plan_review",
+                    f"{sym} 计划AI复核未通过: {review_reason}",
+                    log_every_sec=20.0,
+                )
+                continue
             if lev <= 0:
                 _rej["no_lev"] += 1
                 continue  # AI 未产出有效杠杆，不交易
