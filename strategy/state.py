@@ -35,6 +35,29 @@ def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float])
     return out
 
 
+def _live_position_list_for_state(exchange_positions: Dict[str, dict], prices: Dict[str, float]) -> List[dict]:
+    out: List[dict] = []
+    for sym, pos in exchange_positions.items():
+        entry_price = _finite_float(pos.get("entry_price"))
+        current_price = _finite_float(prices.get(sym), entry_price)
+        margin = _finite_float(pos.get("margin"))
+        unrealized = _finite_float(pos.get("unrealised_pnl"))
+        pnl_pct = unrealized / max(margin, 1e-9) * 100
+        out.append({
+            "symbol": sym,
+            "side": str(pos.get("side", "")),
+            "size": _finite_float(pos.get("size")),
+            "entry_price": entry_price,
+            "leverage": _finite_float(pos.get("leverage")),
+            "margin": margin,
+            "unrealized_pnl": unrealized,
+            "pnl_pct": _finite_float(pnl_pct),
+            "current_price": current_price,
+            "entry_risk_tag": "",
+        })
+    return out
+
+
 def _trade_history_for_state(runner: "StrategyRunner") -> List[dict]:
     rows: List[dict] = []
     for t in runner._trade_history:
@@ -88,6 +111,8 @@ class StateMixin:
         self._recalc_equity(prices)
         locked = sum(p["margin"] for p in self.positions.values())
         uc = self._initial_capital
+        live_positions = None
+        live_balance = None
         # 余额 = 可用资金 + 锁定保证金（真实总资金）
         total_balance = self.balance + locked
         unrealized = self.equity - self.balance - locked
@@ -173,18 +198,27 @@ class StateMixin:
             if _prev_trading is not None:
                 get_state()["live"]["trading_enabled"] = _prev_trading
             try:
-                get_state()["live"]["balance"] = self._live.get_balance()
+                live_balance = self._live.get_balance()
+                get_state()["live"]["balance"] = live_balance
             except Exception:
                 get_state()["live"]["balance"] = 0
             # 实盘模式：余额走交易所，但初始资金不变
             if self._live.active:
-                get_state()["balance"] = get_state()["live"]["balance"]
-                get_state()["equity"] = get_state()["live"]["balance"]
-                get_state()["free_cash"] = get_state()["live"]["balance"]
-                get_state()["unrealized_pnl"] = 0
-                get_state()["margin_locked"] = sum(
-                    p.get("margin", 0) for p in self._live.sync_positions().values()
-                ) if self._live else 0
+                try:
+                    live_positions = self._live.sync_positions()
+                except Exception:
+                    live_positions = {}
+                live_margin = sum(p.get("margin", 0) for p in live_positions.values())
+                live_unrealized = sum(p.get("unrealised_pnl", 0) for p in live_positions.values())
+                if live_balance is None:
+                    live_balance = _finite_float(get_state()["live"].get("balance"))
+                get_state()["balance"] = live_balance
+                get_state()["equity"] = live_balance + live_unrealized
+                get_state()["free_cash"] = max(live_balance - live_margin, 0)
+                get_state()["unrealized_pnl"] = live_unrealized
+                get_state()["margin_locked"] = live_margin
+                get_state()["positions"] = len(live_positions)
+                get_state()["position_list"] = _live_position_list_for_state(live_positions, prices)
 
         # 待审批的进化修改：get_state() 是唯一真相源，tick从get_state()同步
         self._pending_evo_changes = get_state().get("evo_pending", [])

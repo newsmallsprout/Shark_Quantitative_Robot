@@ -15,7 +15,7 @@ from character.voice import _schedule_loli_speech
 _log = logging.getLogger(__name__)
 
 class CloseMixin:
-    def _close_position(self, sym, px, reason, pnl_pct, prices=None):
+    def _close_position(self, sym, px, reason, pnl_pct, prices=None, send_order=True):
         # ── 统一平仓通道：实盘给 executor，纸盘给 matcher，避免撮合流只有 open 没有 close ──
         _live_close_ok = True
         _live_close_px = px
@@ -24,7 +24,7 @@ class CloseMixin:
         # 该开关会被立刻置为 False，随后触发 live_close_all，如果这里检查了开关，
         # 就会把实盘的平仓单错误地标记为 "paper" 导致执行器忽略，从而形成幽灵仓位。
         close_mode = "live" if (self._live and self._live.active) else "paper"
-        if lp:
+        if lp and send_order:
             cmd = build_order_command(
                 symbol=sym,
                 side=lp["side"],

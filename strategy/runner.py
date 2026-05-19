@@ -674,9 +674,10 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         "Emotion_Index": 5,
                     }
 
-        # ── 实盘：定期同步 + 对账（不因 API 熔断整段跳过；止盈止损仍按行情跑）──
+        # ── 实盘：定期同步 + 对账（持仓期间秒级同步，避免界面和APP长时间不一致）──
         if self._live and self._live.active:
-            if now - self._live._last_sync > 60:
+            reconcile_interval = 2 if self.positions else 15
+            if now - self._live._last_sync > reconcile_interval:
                 try:
                     exchange_positions = self._live.sync_positions()
                     mismatches = []
@@ -687,7 +688,14 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                             _log.warning(f"对账修正: {sym} 在APP端已平仓，系统自动同步平仓")
                             px = prices.get(sym, 0)
                             if px > 0:
-                                self._close_position(sym, px, "外部手动平仓(同步)", 0, prices)
+                                self._close_position(
+                                    sym,
+                                    px,
+                                    "外部手动平仓(同步)",
+                                    0,
+                                    prices,
+                                    send_order=False,
+                                )
                         else:
                             # 内存有且交易所也有：同步真实的开仓均价和持仓大小，修正 PnL 误差
                             real_entry = exchange_positions[sym]["entry_price"]
