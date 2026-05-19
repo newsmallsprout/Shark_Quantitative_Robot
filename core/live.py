@@ -44,11 +44,15 @@ def _api(method: str, path: str, body: dict = None, query: str = "", timeout: in
     """调用 Gate.io API，带指数退避重试"""
     import urllib.request
     import urllib.error
-    url = f"https://api.gateio.ws{prefix}{path}"
+    import urllib.parse
+    
+    # 针对路径中可能出现的非 ascii 字符（如中文币对名称）进行 URL 编码
+    safe_path = urllib.parse.quote(path)
+    url = f"https://api.gateio.ws{prefix}{safe_path}"
     if query:
         url += f"?{query}"
     data = json.dumps(body) if body else ""
-    full_path = f"{prefix}{path}"
+    full_path = f"{prefix}{safe_path}"
     headers = _gate_headers(method, full_path, query=query, body=data)
 
     last_err = None
@@ -94,10 +98,13 @@ _GLOBAL_CONTRACT_CACHE = {}
 
 def get_contract_spec(sym: str) -> dict:
     """全局获取合约规格（缓存）"""
+    import urllib.parse
     ct = sym.replace("/", "_")
     if ct not in _GLOBAL_CONTRACT_CACHE:
         try:
-            _GLOBAL_CONTRACT_CACHE[ct] = _api("GET", f"/contracts/{ct}")
+            # 同样在这里拦截并处理可能的中文币种名称
+            safe_ct = urllib.parse.quote(ct)
+            _GLOBAL_CONTRACT_CACHE[ct] = _api("GET", f"/contracts/{safe_ct}")
         except Exception:
             return {}
     return _GLOBAL_CONTRACT_CACHE.get(ct, {})
