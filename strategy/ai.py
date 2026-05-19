@@ -40,7 +40,7 @@ TOK_DEEPSEEK = 1536 if FULL_MODE else 900
 TOK_QWEN = 800 if FULL_MODE else 380
 TOK_DOUBAO = 600 if FULL_MODE else 280
 
-SYSTEM_ANALYST = "你是量化交易分析师。输出JSON：{\"direction\":\"LONG/SHORT/HOLD\",\"confidence\":0-100,\"entry_price\":数字,\"targets\":[{\"price\":数字,\"action\":\"take_profit/add_position\",\"ratio\":0-1}],\"stop_loss\":数字,\"supports\":[],\"resistances\":[],\"risk_reward\":数字}"
+SYSTEM_ANALYST = "你是量化交易分析师。输出JSON：{\"direction\":\"LONG/SHORT/HOLD\",\"confidence\":0-100,\"entry_price\":数字,\"targets\":[{\"price\":数字,\"action\":\"take_profit/add_position\",\"ratio\":0-1}],\"stop_loss\":数字,\"supports\":[],\"resistances\":[],\"risk_reward\":数字,\"leverage\":数字,\"position_size_pct\":0.01-1.0}"
 SYSTEM_REVIEW = "你是交易复核员。审查计划是否合理。输出JSON：{\"approved\":true/false,\"direction\":\"LONG/SHORT/HOLD\",\"reason\":\"简短原因\"}"
 SYSTEM_SENTIMENT = "你是市场情绪分析师。输出JSON：{\"sentiment\":\"BULLISH/BEARISH/NEUTRAL\",\"strength\":0-100,\"key_factors\":[]}"
 
@@ -113,6 +113,23 @@ async def get_ai_targets(symbol, price, change_24h, volume_24h, funding_rate, ob
     if not DEEPSEEK_KEY:
         return _local_fallback_plan(symbol, price, change_24h, funding_rate), 0, "local", {}
     
+    from core.live import get_contract_spec
+    spec = get_contract_spec(symbol)
+    if spec:
+        max_lev = spec.get('leverage_max', '20')
+        max_size = spec.get('order_size_max', 0)
+        min_size = spec.get('order_size_min', 0)
+        quanto = float(spec.get('quanto_multiplier', 1))
+        
+        # 计算成 USDT 金额给 AI 更直观
+        max_usdt = float(max_size) * quanto * price if max_size else "未知"
+        min_usdt = float(min_size) * quanto * price if min_size else "未知"
+        if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
+        if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"
+        
+        limits_text = f"交易所限制(务必遵守): 最大杠杆{max_lev}x, 最小开仓金额{min_usdt}, 最大开仓金额{max_usdt}。结合限制合理分配 leverage 和 position_size_pct。"
+        ob_text = f"{ob_text} {limits_text}".strip()
+
     analysis_prompt = f"{symbol} 现价{price} 24h{change_24h:+.2f}% 量{volume_24h:,.0f} 费率{funding_rate*100:+.4f}% {ob_text}"
     
     ds_result, ds_in, ds_out = await _call_llm(DEEPSEEK_URL, DEEPSEEK_KEY, "deepseek-chat", SYSTEM_ANALYST, analysis_prompt, TOK_DEEPSEEK, label=f"{symbol} DS")

@@ -20,13 +20,33 @@ class SessionMixin:
         mode = mode.strip().lower()
         if mode not in ("paper", "live"):
             return {"error": f"无效模式: {mode}"}
+        
+        current_is_live = bool(getattr(self, '_live', None))
+        target_is_live = (mode == "live")
+        if current_is_live == target_is_live:
+            return {"ok": True, "mode": mode, "balance": self.balance}
+
         if mode == "live":
             engine = create_live_engine(mode="live")
             if engine is None:
                 return {"error": "实盘引擎初始化失败，请检查 GATE_API_KEY/SECRET 和网络"}
-            self._clear_trading_session_state(clear_redis_history=True)
+            
+            # --- 备份模拟盘数据到内存 ---
+            self._paper_positions = dict(self.positions)
+            self._paper_trade_history = list(self._trade_history)
+            self._paper_open_timestamps = dict(self._open_timestamps)
             self._paper_balance = self.balance
             self._paper_equity = self.equity
+            self._paper_initial_capital = getattr(self, '_initial_capital', self.balance)
+            self._paper_realized_pnl = getattr(self, 'realized_pnl', 0.0)
+            self._paper_gross_realized = getattr(self, 'gross_realized', 0.0)
+            self._paper_total_fees = getattr(self, 'total_fees', 0.0)
+            self._paper_total_slippage = getattr(self, 'total_slippage', 0.0)
+            self._paper_trades = getattr(self, 'trades', 0)
+            self._paper_closed_trades = getattr(self, 'closed_trades', 0)
+            self._paper_wins = getattr(self, 'wins', 0)
+
+            self._clear_trading_session_state(clear_redis_history=False)
             self._live = engine
             self._live_trading_enabled = False
             try:
@@ -42,17 +62,40 @@ class SessionMixin:
         else:
             self._live = None
             self._live_trading_enabled = False
+            self._clear_trading_session_state(clear_redis_history=False)
+            
             if hasattr(self, '_paper_balance'):
                 self.balance = self._paper_balance
                 self.equity = self._paper_equity
-                self._initial_capital = self._paper_balance
-                self.gross_realized = 0.0
-                self.total_fees = 0.0
-                self.realized_pnl = 0.0
+                self._initial_capital = self._paper_initial_capital
+                self.realized_pnl = self._paper_realized_pnl
+                self.gross_realized = self._paper_gross_realized
+                self.total_fees = self._paper_total_fees
+                self.total_slippage = self._paper_total_slippage
+                self.trades = self._paper_trades
+                self.closed_trades = self._paper_closed_trades
+                self.wins = self._paper_wins
+                
+                self.positions = dict(getattr(self, '_paper_positions', {}))
+                self._trade_history = list(getattr(self, '_paper_trade_history', []))
+                self._open_timestamps = dict(getattr(self, '_paper_open_timestamps', {}))
+                
                 _state["balance"] = self.balance
                 _state["equity"] = self.equity
                 _state["free_cash"] = self.balance
-                _state["initial_capital"] = self._paper_balance
+                _state["initial_capital"] = self._initial_capital
+                _state["realized_pnl"] = self.realized_pnl
+                _state["gross_realized"] = self.gross_realized
+                _state["total_fees"] = self.total_fees
+                _state["total_slippage"] = self.total_slippage
+                _state["trades"] = self.trades
+                _state["wins"] = self.wins
+                _state["trade_history"] = self._trade_history
+                _state["positions"] = len(self.positions)
+                _state["position_list"] = list(self.positions.values())
+            else:
+                self._load_paper_state()
+            
             print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})")
         return {"ok": True, "mode": mode, "balance": self.balance}
 
@@ -155,6 +198,8 @@ class SessionMixin:
                 "closed_trades": self.closed_trades,
                 "wins": self.wins,
                 "trade_history": self._trade_history,
+                "positions": self.positions,
+                "open_timestamps": self._open_timestamps,
             }
             _r.set("shark:paper_state", json.dumps(state, ensure_ascii=False))
         except Exception as e:
@@ -185,9 +230,18 @@ class SessionMixin:
             saved_history = state.get("trade_history", [])
             if isinstance(saved_history, list):
                 self._trade_history = saved_history
-            _state["positions"] = 0
-            _state["position_list"] = []
-            _state["margin_locked"] = 0.0
+            
+            saved_positions = state.get("positions", {})
+            if isinstance(saved_positions, dict):
+                self.positions = saved_positions
+                
+            saved_open_ts = state.get("open_timestamps", {})
+            if isinstance(saved_open_ts, dict):
+                self._open_timestamps = saved_open_ts
+                
+            _state["positions"] = len(self.positions)
+            _state["position_list"] = list(self.positions.values())
+            _state["margin_locked"] = sum(p.get("margin", 0) for p in self.positions.values())
             _state["trade_history"] = self._trade_history
             _state["balance"] = self.balance
             _state["equity"] = self.equity

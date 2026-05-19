@@ -166,7 +166,23 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         """异步获取AI多层仓位计划（无限流；由上游信号与熔断控制开仓）"""
         now = time.time()
         try:
-            pack = await get_ai_targets(sym, px, change, vol, funding)
+            from core.live import get_contract_spec
+            spec = get_contract_spec(sym)
+            limits_text = ""
+            if spec:
+                max_lev = spec.get('leverage_max', '20')
+                max_size = spec.get('order_size_max', 0)
+                min_size = spec.get('order_size_min', 0)
+                quanto = float(spec.get('quanto_multiplier', 1))
+                
+                max_usdt = float(max_size) * quanto * px if max_size else "未知"
+                min_usdt = float(min_size) * quanto * px if min_size else "未知"
+                if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
+                if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"
+                
+                limits_text = f"交易所限制(务必遵守): 最大杠杆{max_lev}x, 最小开仓金额{min_usdt}, 最大开仓金额{max_usdt}。"
+            
+            pack = await get_ai_targets(sym, px, change, vol, funding, ob_text=limits_text)
             plan = pack[0] if isinstance(pack, (list, tuple)) and pack else None
             if isinstance(plan, dict) and plan.get("targets"):
                 # 存入信号缓存（开仓前用）
@@ -423,12 +439,29 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
             if not key:
                 return None
+            
+            from core.live import get_contract_spec
+            spec = get_contract_spec(sym)
+            limits_text = ""
+            if spec:
+                max_lev = spec.get('leverage_max', '20')
+                max_size = spec.get('order_size_max', 0)
+                min_size = spec.get('order_size_min', 0)
+                quanto = float(spec.get('quanto_multiplier', 1))
+                
+                max_usdt = float(max_size) * quanto * px if max_size else "未知"
+                min_usdt = float(min_size) * quanto * px if min_size else "未知"
+                if isinstance(max_usdt, float): max_usdt = f"{max_usdt:,.0f}U"
+                if isinstance(min_usdt, float): min_usdt = f"{min_usdt:,.1f}U"
+                
+                limits_text = f" 交易所限制:最大杠杆{max_lev}x,最小开仓金额{min_usdt},最大开仓金额{max_usdt}。"
+
             prompt = (
                 f"你是超短线山寨币交易员。{sym} 现价{px} 24h波动{change_abs:+.1f}% "
-                f"24h成交量{volume:,.0f} 资金费率{funding * 100:+.4f}%。"
+                f"24h成交量{volume:,.0f} 资金费率{funding * 100:+.4f}%。{limits_text}"
                 f"输出JSON: bias(both/long/short), long_entry_low, long_entry_high, "
                 f"long_sl, long_tp1, long_tp2, short_entry_low, short_entry_high, "
-                f"short_sl, short_tp1, short_tp2, leverage(20-50), rationale(≤25字)。"
+                f"short_sl, short_tp1, short_tp2, leverage(20-50), position_size_pct(0.01-1.0), rationale(≤25字)。"
                 f"默认bias=both双向区间，仅强单边(波动>12%+费率>0.020%)才用long/short。"
                 f"入场带≈现价±0.5%-1.2%，止盈≈止损的2倍(风险收益比≥1:2)。"
             )
@@ -1472,6 +1505,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     size = spec.order_size_min
                     margin = (size * quanto * entry_price) / lev
                     bumped_for_min = True
+                if spec and spec.order_size_max > 0 and size > spec.order_size_max:
+                    size = spec.order_size_max
+                    margin = (size * quanto * entry_price) / lev
                 if bumped_for_min and not is_stable(sym):
                     alt_ceiling = max(5.0, total_account_equity * 0.06)
                     if margin > alt_ceiling:

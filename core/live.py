@@ -90,6 +90,18 @@ class LivePosition:
     opened_at: float
 
 
+_GLOBAL_CONTRACT_CACHE = {}
+
+def get_contract_spec(sym: str) -> dict:
+    """全局获取合约规格（缓存）"""
+    ct = sym.replace("/", "_")
+    if ct not in _GLOBAL_CONTRACT_CACHE:
+        try:
+            _GLOBAL_CONTRACT_CACHE[ct] = _api("GET", f"/contracts/{ct}")
+        except Exception:
+            return {}
+    return _GLOBAL_CONTRACT_CACHE.get(ct, {})
+
 class LiveEngine:
     """Gate.io 实盘执行引擎"""
 
@@ -125,13 +137,7 @@ class LiveEngine:
 
     def _get_contract_spec(self, sym: str) -> dict:
         """获取合约规格（缓存）"""
-        ct = self._sym_to_contract(sym)
-        if ct not in self._contract_cache:
-            try:
-                self._contract_cache[ct] = _api("GET", f"/contracts/{ct}")
-            except Exception:
-                return {}
-        return self._contract_cache.get(ct, {})
+        return get_contract_spec(sym)
 
     # ── 杠杆设置 ──
 
@@ -159,11 +165,15 @@ class LiveEngine:
         contract_size = 0
         spec = self._get_contract_spec(sym)
 
-        # 检查最小下单量
+        # 检查最小/最大下单量
         min_size = spec.get("order_size_min", 1)
+        max_size = spec.get("order_size_max", 0)
         if size < min_size:
             _log.warning("%s size=%d < min=%d, bump", sym, size, min_size)
             size = min_size
+        if max_size and size > max_size:
+            _log.warning("%s size=%d > max=%d, cap", sym, size, max_size)
+            size = max_size
 
         # 设置杠杆
         self.set_leverage(sym, leverage)
