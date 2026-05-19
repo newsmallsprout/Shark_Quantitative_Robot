@@ -46,8 +46,8 @@ def _api(method: str, path: str, body: dict = None, query: str = "", timeout: in
     import urllib.error
     import urllib.parse
     
-    # 针对路径中可能出现的非 ascii 字符（如中文币对名称）进行 URL 编码
-    safe_path = urllib.parse.quote(path)
+    # 针对路径中可能出现的非 ascii 字符（如中文币对名称）进行 URL 编码，但需要保留 / 等路径字符
+    safe_path = urllib.parse.quote(path, safe="/")
     url = f"https://api.gateio.ws{prefix}{safe_path}"
     if query:
         url += f"?{query}"
