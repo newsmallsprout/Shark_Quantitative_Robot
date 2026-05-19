@@ -60,7 +60,9 @@ class RiskValidator:
         gross_usd: float,
         est_fee: float,
         is_stable: bool,
-        take_profit_net_ok: bool
+        take_profit_net_ok: bool,
+        trail_trigger: float,
+        trail_ratio: float,
     ) -> Tuple[bool, str]:
         """
         检查平仓条件，返回 (是否平仓, 平仓原因)
@@ -71,9 +73,9 @@ class RiskValidator:
             return True, "止损"
             
         # 2. 移动止盈 (从最高点回撤)
-        trail_trigger = max(cfg.get("trail_trigger", 2.0), 2.0)
-        if not pos.get("plan_stick") and best_pnl > trail_trigger:
-            trail_pct = abs(dyn_sl) * cfg.get("trail_pct", 0.3)
+        trail_trigger = max(float(trail_trigger or 0), 2.0)
+        if best_pnl > trail_trigger:
+            trail_pct = abs(dyn_sl) * max(float(trail_ratio or 0), 0.1)
             if pnl_pct < best_pnl - trail_pct and pnl_pct > 0:
                 if take_profit_net_ok:
                     return True, "移动止盈"
@@ -85,8 +87,8 @@ class RiskValidator:
         # 4. 山寨微利止盈 (用户设计的逻辑，从 runner 解耦到这里显式管理)
         if not pos.get("plan_stick") and not is_stable:
             margin = pos.get("margin", 4)
-            min_profit = max(0.30, margin * 0.075)
-            if gross_usd > max(est_fee * 5, min_profit):
+            min_profit = max(0.60, margin * 0.12)
+            if gross_usd > max(est_fee * 8, min_profit) and take_profit_net_ok:
                 return True, "山寨微利止盈"
                 
         return False, ""

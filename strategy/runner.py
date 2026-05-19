@@ -18,7 +18,7 @@ from strategy.state import StateMixin
 from persistence.bridge import PersistenceBridge
 from execution.plan_gate import PlanGate
 from execution.order_command import build_rl_order_command, build_order_command
-from market.data import ContractSpec, TAKER_FEE, MAKER_FEE, MAX_TOTAL_EXPOSURE
+from market.data import ContractSpec, TAKER_FEE, MAKER_FEE, MAX_TOTAL_EXPOSURE, SLIPPAGE_MAX
 from strategy.dual import get_config, is_stable, is_high_vol_alt, get_capital_limit, trading_track_allows_open
 
 try:
@@ -82,6 +82,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self._plan_gate = None  # FastLoop 门禁，由 main() 注入
         self._loss_replay_guard: Dict[str, dict] = {}
         self._price_replan_last: Dict[str, float] = {}
+        self._symbol_cooldown_until: Dict[str, float] = {}
         # 山寨币独立进化状态（动态币对，首次见到自动初始化）
         self._alt_evo: Dict[
             str, dict
@@ -101,6 +102,13 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         if spec:
             return spec.maker_fee
         return MAKER_FEE
+
+    def _get_taker_fee(self, sym: str) -> float:
+        """实盘 IOC 市价单更接近 taker 费用口径。"""
+        spec = self._contract_specs.get(sym)
+        if spec and spec.taker_fee > 0:
+            return spec.taker_fee
+        return TAKER_FEE
 
     async def _ai_reflect(self, sym, pos, realized, pnl_pct, reason, px, local_tags):
         """AI深度诊断亏损原因 → 多维度调整策略"""
@@ -509,19 +517,26 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
     def _est_fee_usd(
         self, sym: str, pos: dict, px: float, fee_rounds: float = 3.0
     ) -> float:
-        """按当前名义估算平仓侧手续费倍数（与止盈里原 *3 口径一致）。"""
+        """按真实成交口径估算开平双边成本 + 退出滑点缓冲。"""
         q = self._quanto_for(sym)
-        fee_r = self._get_maker_fee(sym)
-        return pos["size"] * q * px * fee_r * fee_rounds
+        size = float(pos.get("size") or 0)
+        entry = float(pos.get("entry") or px or 0)
+        taker_fee = self._get_taker_fee(sym)
+        fee_open = float(pos.get("fee_open") or 0)
+        if fee_open <= 0 and entry > 0:
+            fee_open = size * q * entry * taker_fee
+        fee_close = size * q * px * taker_fee
+        slip_buffer = size * q * px * max(SLIPPAGE_MAX, 0.0003)
+        return fee_open + fee_close + slip_buffer
 
     def _take_profit_net_ok(
         self, sym: str, pos: dict, px: float, fee_rounds: float = 3.0
     ) -> bool:
-        """毛利扣估算手续费后仍有意义，避免 net > est_fee 的翻倍门槛锁死大单止盈。"""
+        """止盈后至少要覆盖真实成本，并留下足够净利。"""
         gross = self._gross_pnl_usd(sym, pos, px)
         est = self._est_fee_usd(sym, pos, px, fee_rounds)
         net = gross - est
-        return net >= max(0.05, 0.25 * est)
+        return net >= max(0.08, 0.35 * est)
 
     def _planned_stop_pnl_pct(self, pos: dict, stop_price: float) -> float:
         """Convert a planned stop price into leveraged PnL%, matching pnl_pct comparisons."""
@@ -818,7 +833,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     if 0.5 <= plan_tp_pct <= 500:
                         dyn_tp = plan_tp_pct
 
-            # 移动止盈：主流中长线更慢，山寨短线更贴
+            # 移动止盈：主流中长线更慢，山寨短线更贴；趋势锁定单也启用，但更宽
             trail_trigger = max(atr_pct * 1.5, 2.0)  # 超短线：更低阈值
             trail_ratio = 0.3
             try:
@@ -826,6 +841,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 trail_ratio = float(cfg.get("trail_pct") or trail_ratio)
             except Exception:
                 pass
+            if pos.get("plan_stick"):
+                trail_trigger *= 1.25
+                trail_ratio *= 1.15
 
             # 更新最高盈利
             if pnl_pct > pos.get("best_pnl", -999):
@@ -848,7 +866,9 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 gross_usd=self._gross_pnl_usd(sym, pos, px),
                 est_fee=self._est_fee_usd(sym, pos, px, fee_rounds=3.0),
                 is_stable=is_stable(sym),
-                take_profit_net_ok=self._take_profit_net_ok(sym, pos, px)
+                take_profit_net_ok=self._take_profit_net_ok(sym, pos, px),
+                trail_trigger=trail_trigger,
+                trail_ratio=trail_ratio,
             )
             
             if should_close:
@@ -1145,17 +1165,15 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 breakeven_trigger = float(cfg.get("breakeven_trigger") or 3.0)
             except Exception:
                 breakeven_trigger = 3.0
-            if (
-                not pos.get("plan_stick")
-                and pnl_pct >= breakeven_trigger
-                and not pos.get("_breakeven_set")
-            ):
+            if pos.get("plan_stick"):
+                breakeven_trigger *= 1.25
+            if pnl_pct >= breakeven_trigger and not pos.get("_breakeven_set"):
                 pos["_breakeven_set"] = True
-                # 把计划止损价提升到 entry（相当于 dyn_sl = -0.01%，留手续费空间）
+                # 把计划止损价提升到 entry 附近，留出手续费与滑点空间
                 if pos["side"] == "long":
-                    pos["plan_sl"] = pos["entry"] * 1.0005
+                    pos["plan_sl"] = pos["entry"] * 1.0008
                 else:
-                    pos["plan_sl"] = pos["entry"] * 0.9995
+                    pos["plan_sl"] = pos["entry"] * 0.9992
 
             # 超时平仓已禁用
 
@@ -1385,8 +1403,11 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
         from strategy.risk import RiskValidator
         scored = []
+        _open_scan_now = time.time()
         for sym in prices:
             if sym in self.positions:
+                continue
+            if _open_scan_now < float(self._symbol_cooldown_until.get(sym, 0) or 0):
                 continue
 
             cfg = get_config(sym)

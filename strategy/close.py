@@ -2,7 +2,7 @@ from character.dialogue import pop_line, trade_category_for_close
 from execution.order_command import build_order_command
 """Position close logic."""
 from api.routes import get_state
-from strategy.dual import is_stable, is_high_vol_alt
+from strategy.dual import is_stable, is_high_vol_alt, get_config
 import time
 from api.routes import get_state
 import uuid
@@ -10,6 +10,7 @@ import json
 import os
 import logging
 from character.voice import _schedule_loli_speech
+from market.data import TAKER_FEE
 
 # character sequence state removed
 _log = logging.getLogger(__name__)
@@ -42,15 +43,25 @@ class CloseMixin:
                 if close_mode == "live":
                     _live_close_ok = False
                     _log.error("🔥 实盘平仓失败 %s, 人工介入!", sym)
+            if close_mode == "live" and not _live_close_ok:
+                return False
 
         pos = self.positions.pop(sym)
+        try:
+            cfg = get_config(sym)
+            cooldown_sec = float(cfg.get("cooldown") or 10)
+        except Exception:
+            cooldown_sec = 10.0
+        if "止损" in str(reason):
+            cooldown_sec = max(cooldown_sec, 30.0)
+        self._symbol_cooldown_until[sym] = time.time() + max(cooldown_sec, 2.0)
         oid = pos.get("order_id")
         bal_before = self.balance
         spec = self._contract_specs.get(sym)
         q = self._quanto_for(sym)
         gross = self._gross_pnl_usd(sym, pos, px)
-        fee_rate_maker = abs(spec.maker_fee) if spec and spec.maker_fee < 0 else TAKER_FEE * 0.2
-        fee_close = pos["size"] * q * px * fee_rate_maker
+        fee_rate_close = self._get_taker_fee(sym) if hasattr(self, "_get_taker_fee") else TAKER_FEE
+        fee_close = pos["size"] * q * px * fee_rate_close
         fee_open = pos.get("fee_open", 0)
         gross_pnl = gross  # 毛利（不含手续费）
         realized = gross - fee_open - fee_close  # 含全部手续费的净利
