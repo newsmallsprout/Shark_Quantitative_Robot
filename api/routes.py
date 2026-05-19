@@ -227,10 +227,12 @@ async def set_shark_mode(request: Request, _: None = Depends(require_api_token))
             _state["live_trading"] = True
             _state["live"]["trading_enabled"] = True
         else:
-            _state["paper_trading"] = _default_paper_trading_enabled()
+            # 手动切到模拟盘时，不要自动开交易；是否开始交易应由用户显式点开
+            _state["paper_trading"] = False
             _state["live_trading"] = False
             if "live" in _state:
                 _state["live"]["active"] = False
+                _state["live"]["trading_enabled"] = False
     return {"ok": True, "mode": new_mode}
 
 

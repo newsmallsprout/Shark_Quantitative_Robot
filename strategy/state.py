@@ -14,6 +14,8 @@ def _finite_float(v, default: float = 0.0) -> float:
 
 def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float]) -> List[dict]:
     out: List[dict] = []
+    current_mode = str(get_state().get("shark_mode", "paper") or "paper").lower()
+    is_live_view = bool(current_mode == "live" and getattr(runner, "_live", None) and runner._live.active)
     for sym, pos in runner.positions.items():
         display_entry = _finite_float(pos.get("display_entry", pos.get("entry", 0)))
         display_margin = _finite_float(pos.get("display_margin", pos.get("margin", 0)))
@@ -21,7 +23,10 @@ def _position_list_for_state(runner: "StrategyRunner", prices: Dict[str, float])
         px = display_entry
         if sym in prices:
             px = _finite_float(prices[sym], px)
-        unrealized = _finite_float(pos.get("display_unrealized_pnl"), runner._gross_pnl_usd(sym, pos, px))
+        if is_live_view and "display_unrealized_pnl" in pos:
+            unrealized = _finite_float(pos.get("display_unrealized_pnl"), runner._gross_pnl_usd(sym, pos, px))
+        else:
+            unrealized = _finite_float(runner._gross_pnl_usd(sym, pos, px))
         pnl_pct = unrealized / max(display_margin, 1e-9) * 100
         out.append({
             "symbol": sym,

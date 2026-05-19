@@ -70,6 +70,8 @@ class SessionMixin:
         else:
             self._live = None
             self._live_trading_enabled = False
+            # 手动切回模拟盘时只切模式，不自动恢复交易开关
+            self._paper_trading_enabled = False
             self._clear_trading_session_state(clear_redis_history=False)
             
             if hasattr(self, '_paper_balance'):
@@ -101,8 +103,12 @@ class SessionMixin:
                 _state["trade_history"] = self._trade_history
                 _state["positions"] = len(self.positions)
                 _state["position_list"] = list(self.positions.values())
+                _state["paper_trading"] = False
+                _state["live_trading"] = False
             else:
                 self._load_paper_state()
+                _state["paper_trading"] = False
+                _state["live_trading"] = False
             
             print(f"📋 已切换到模拟盘模式 (余额=${self.balance:.2f})")
         return {"ok": True, "mode": mode, "balance": self.balance}
