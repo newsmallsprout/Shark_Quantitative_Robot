@@ -159,9 +159,9 @@ func executeOpen(cmd TradeCmd) {
 		size = -size
 	}
 	r, err := gateAPI("POST", "/orders", map[string]interface{}{
-		"contract": contract, "size": size, "price": "0", "tif": "ioc",
-		"text": fmt.Sprintf("t-shark-%d", time.Now().UnixNano()),
-	})
+            "contract": contract, "size": size, "price": "0", "tif": "ioc",
+            "text": fmt.Sprintf("t-op-%d", time.Now().UnixMilli()),
+    })
 	if err != nil {
 		log.Printf("❌ 开仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
 		rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "failed", 0)
@@ -187,12 +187,12 @@ func executeOpen(cmd TradeCmd) {
 				"price":       "0",
 				"tif":         "ioc",
 				"reduce_only": true,
-				"text":        fmt.Sprintf("t-shark-sl-%d", time.Now().UnixNano()),
+				"text":        fmt.Sprintf("t-sl-%d", time.Now().UnixMilli()),
 			},
 			"trigger": map[string]interface{}{
 				"price":         strconv.FormatFloat(cmd.StopLoss, 'f', 1, 64),
 				"rule":          slRule,
-				"expiration":    3600,
+				"expiration":    86400 * 7, // 必须是 86400 的倍数
 				"strategy_type": 0,
 			},
 		})
@@ -228,12 +228,12 @@ func executeOpen(cmd TradeCmd) {
 					"price":       "0",
 					"tif":         "ioc",
 					"reduce_only": true,
-					"text":        fmt.Sprintf("t-shark-tp-%d", time.Now().UnixNano()),
+					"text":        fmt.Sprintf("t-tp-%d", time.Now().UnixMilli()),
 				},
 				"trigger": map[string]interface{}{
 					"price":         strconv.FormatFloat(target, 'f', 1, 64),
 					"rule":          tpRule,
-					"expiration":    3600,
+					"expiration":    86400 * 7, // 必须是 86400 的倍数
 					"strategy_type": 0,
 				},
 			})
@@ -275,10 +275,10 @@ func executeClose(cmd TradeCmd) {
 		size = -size
 	}
 	r, err := gateAPI("POST", "/orders", map[string]interface{}{
-		"contract": contract, "size": size, "price": "0", "tif": "ioc",
-		"reduce_only": true,
-		"text":        fmt.Sprintf("t-shark-close-%d", time.Now().UnixNano()),
-	})
+            "contract": contract, "size": size, "price": "0", "tif": "ioc",
+            "reduce_only": true,
+            "text":        fmt.Sprintf("t-cl-%d", time.Now().UnixMilli()),
+    })
 	if err != nil {
 		log.Printf("❌ 平仓失败 %s %s: %v", cmd.Symbol, cmd.Side, err)
 		rdb.Set(ctx, "shark:orders:status:"+cmd.Symbol, "close_failed", 0)
