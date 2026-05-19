@@ -1407,8 +1407,13 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     import os
                     os._exit(0)
             
-            # 测试检查
-            test_status = getattr(self, "_live_test_status", "completed")
+            # 测试检查：进程重启后属性丢失时，默认跑测试单（而非跳过）
+            test_status = getattr(self, "_live_test_status", None)
+            if test_status is None:
+                self._live_test_status = "pending"
+                test_status = "pending"
+
+
             if test_status == "running":
                 _can_open = False
                 test_sym = getattr(self, "_live_test_symbol", None)

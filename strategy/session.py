@@ -13,6 +13,22 @@ _log = logging.getLogger(__name__)
 class SessionMixin:
     """Mixin: 需要宿主类提供 balance, equity, positions, _trade_history, _persistence, _initial_capital 等属性。"""
 
+    def _purge_all_cached_plans(self) -> None:
+        try:
+            if getattr(self, "_plan_gate", None):
+                self._plan_gate._plan_cache.clear()
+                self._plan_gate._last_fetch.clear()
+                if hasattr(self._plan_gate, "_fuse_per_symbol"):
+                    self._plan_gate._fuse_per_symbol.clear()
+            if hasattr(self, "_plan_review_cache"):
+                self._plan_review_cache.clear()
+            import redis as _redis
+            _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+            for key in _r.scan_iter(match="shark:plan:*", count=100):
+                _r.delete(key)
+        except Exception as e:
+            _log.warning("purge cached plans failed: %s", e)
+
     def switch_mode(self, mode: str) -> dict:
         from core.live import create_live_engine
         from api.routes import get_state
@@ -48,13 +64,33 @@ class SessionMixin:
 
             # --- 实盘初始化测试与提现变量 ---
             self._live_test_status = "pending"
+            self._live_test_symbol = None
+            self._live_test_order_id = None
+            self._live_test_started_at = 0.0
             self._last_transfer_pnl = getattr(self, 'realized_pnl', 0.0)
+            self._live_plan_required_after = __import__("time").time()
+            self._macro_selected_alts = []
+            self._last_macro_review_ts = 0.0
+            self._purge_all_cached_plans()
+            # 通知 Go planner 立即为稳定币重建计划（避免等30分钟周期）
+            try:
+                import redis as _redis2
+                _r2 = _redis2.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                for _sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+                    _r2.publish("shark:plan:replan", json.dumps({"symbol": _sym}))
+            except Exception:
+                pass
 
-            # --- 自动开启实盘交易（继承当前配置或强制开启） ---
-            self._live_trading_enabled = True
+            # --- 切到实盘只切模式，不自动开启交易 ---
+            self._live_trading_enabled = False
 
             self._clear_trading_session_state(clear_redis_history=False)
             self._live = engine
+            _state["paper_trading"] = False
+            _state["live_trading"] = False
+            _state.setdefault("live", {"active": False, "trading_enabled": False})
+            _state["live"]["active"] = True
+            _state["live"]["trading_enabled"] = False
             try:
                 exchange_total = engine.get_balance()
                 locked = sum(p.get("margin", 0) for p in self.positions.values())
@@ -70,6 +106,11 @@ class SessionMixin:
         else:
             self._live = None
             self._live_trading_enabled = False
+            self._live_test_status = "completed"
+            self._live_test_symbol = None
+            self._live_test_order_id = None
+            self._live_test_started_at = 0.0
+            self._live_plan_required_after = 0.0
             # 手动切回模拟盘时只切模式，不自动恢复交易开关
             self._paper_trading_enabled = False
             self._clear_trading_session_state(clear_redis_history=False)
