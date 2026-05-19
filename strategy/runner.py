@@ -1286,11 +1286,12 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     )
                     try:
                         import redis as _redis
+                        import os
+                        import uuid
                         _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
                         _r.publish("shark:orders:new", cmd)
                         _log.info(f"🚀 发送实盘测试订单 {test_sym} size={_ct_size}...")
                         
-                        import uuid
                         self.positions[test_sym] = {
                             "side": side,
                             "entry": px,
@@ -1672,7 +1673,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             )
             try:
                 import redis as _redis
-
+                import os
                 _r = _redis.from_url(
                     os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0")
                 )
@@ -1683,6 +1684,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 if mode == "live":
                     continue  # 实盘失败必须跳过
 
+            import uuid
             self.positions[sym] = {
                 "side": side,
                 "entry": entry_price,
@@ -1706,6 +1708,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 else None,
                 "entry_risk_tag": entry_risk_tag,
                 "plan_stick": plan_stick,
+                "defense_used": False,
             }
 
             # AI分析（异步，不阻塞开仓）
