@@ -46,9 +46,15 @@ class SessionMixin:
             self._paper_closed_trades = getattr(self, 'closed_trades', 0)
             self._paper_wins = getattr(self, 'wins', 0)
 
+            # --- 实盘初始化测试与提现变量 ---
+            self._live_test_status = "pending"
+            self._last_transfer_pnl = getattr(self, 'realized_pnl', 0.0)
+
+            # --- 自动开启实盘交易（继承当前配置或强制开启） ---
+            self._live_trading_enabled = True
+
             self._clear_trading_session_state(clear_redis_history=False)
             self._live = engine
-            self._live_trading_enabled = False
             try:
                 self.balance = engine.get_balance()
                 self._initial_capital = self.balance

@@ -61,6 +61,8 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
         self._trade_history: List[dict] = []
         self._contract_specs: Dict[str, ContractSpec] = {}
         self._ai_signal_cache: Dict[str, dict] = {}  # sym -> {plan, timestamp}
+        self._live_test_status = "completed"
+        self._last_transfer_pnl = 0.0
         self._open_timestamps: list = []  # 开仓时间戳
         self._regime_cache: Dict[str, dict] = {}  # sym → {regime, diag, cfg} 行情上下文
         self._reflector = Reflector() if KLINE_ENABLED else None  # 止损反思器
@@ -1232,7 +1234,91 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
             _can_open = self._warmup_allows_open(
                 has_kline=bool(kc), has_detector=bool(detector)
             )
-        
+
+        # ── 实盘测试及盈利划转检查 ──
+        if _is_live_mode and self._live_trading_enabled:
+            # 划转检查
+            realized = getattr(self, "realized_pnl", 0.0)
+            last_transfer = getattr(self, "_last_transfer_pnl", 0.0)
+            if realized - last_transfer >= 100.0:
+                _log.info("🎯 实盘盈利达到 100U，开始自动划转...")
+                if self._live.transfer_to_spot(100.0):
+                    self._last_transfer_pnl += 100.0
+                    _log.info("🎯 划转完成，准备重启服务...")
+                    import os
+                    os._exit(0)
+            
+            # 测试检查
+            test_status = getattr(self, "_live_test_status", "completed")
+            if test_status == "running":
+                _can_open = False
+                test_sym = getattr(self, "_live_test_symbol", None)
+                if test_sym and test_sym not in self.positions:
+                    self._live_test_status = "completed"
+                    _log.info("✅ 实盘测试流程通过，正式开启交易！")
+                    _can_open = True
+            elif test_status == "pending" and _can_open and prices:
+                # 寻找一个可以下单的币对
+                test_sym = "BTC/USDT" if "BTC/USDT" in prices else list(prices.keys())[0]
+                if prices.get(test_sym, 0) > 0 and test_sym not in self.positions:
+                    px = prices[test_sym]
+                    spec = self._contract_specs.get(test_sym)
+                    quanto = spec.quanto_multiplier if spec else 1.0
+                    min_size = spec.order_size_min if spec else 1.0
+                    
+                    side = "long"
+                    lev = 5
+                    margin = (min_size * quanto * px) / lev
+                    # 极小止盈止损以便快速结束测试流程
+                    _plan_sl = px * 0.999
+                    _plan_tp = px * 1.001
+                    _ct_size = max(1, int(min_size))
+                    
+                    cmd = build_order_command(
+                        symbol=test_sym,
+                        side=side,
+                        size=_ct_size,
+                        leverage=lev,
+                        action="open",
+                        mode="live",
+                        stop_loss=_plan_sl,
+                        take_profit=_plan_tp,
+                    )
+                    try:
+                        import redis as _redis
+                        _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
+                        _r.publish("shark:orders:new", cmd)
+                        _log.info(f"🚀 发送实盘测试订单 {test_sym} size={_ct_size}...")
+                        
+                        import uuid
+                        self.positions[test_sym] = {
+                            "side": side,
+                            "entry": px,
+                            "size": _ct_size,
+                            "leverage": lev,
+                            "margin": margin,
+                            "opened": time.time(),
+                            "fee_open": 0,
+                            "vol_chg": 0,
+                            "best_pnl": -999,
+                            "pyramid_count": 0,
+                            "ai_targets": None,
+                            "order_id": uuid.uuid4(),
+                            "signal_src": "live_test",
+                            "ai_confidence": 100,
+                            "_learner_feat": [],
+                            "plan_sl": _plan_sl,
+                            "plan_tp": _plan_tp,
+                            "plan_signature": None,
+                            "defense_used": False,
+                        }
+                        self._open_timestamps[test_sym] = time.time()
+                        self._live_test_status = "running"
+                        self._live_test_symbol = test_sym
+                        _can_open = False
+                    except Exception as e:
+                        _log.error("Redis publish failed: %s", e)
+
         from strategy.risk import RiskValidator
         scored = []
         for sym in prices:

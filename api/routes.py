@@ -224,6 +224,8 @@ async def set_shark_mode(request: Request, _: None = Depends(require_api_token))
                 _state["live"] = {"active": False, "trading_enabled": False}
             _state["live"]["active"] = True
             _state["paper_trading"] = False
+            _state["live_trading"] = True
+            _state["live"]["trading_enabled"] = True
         else:
             _state["paper_trading"] = _default_paper_trading_enabled()
             _state["live_trading"] = False

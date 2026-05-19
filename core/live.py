@@ -40,15 +40,15 @@ def _gate_headers(method: str, path: str, query: str = "", body: str = "") -> di
 
 
 def _api(method: str, path: str, body: dict = None, query: str = "", timeout: int = 10,
-        retries: int = 3) -> dict:
+        retries: int = 3, prefix: str = "/api/v4/futures/usdt") -> dict:
     """调用 Gate.io API，带指数退避重试"""
     import urllib.request
     import urllib.error
-    url = f"{GATE_BASE}{path}"
+    url = f"https://api.gateio.ws{prefix}{path}"
     if query:
         url += f"?{query}"
     data = json.dumps(body) if body else ""
-    full_path = f"/api/v4/futures/usdt{path}"
+    full_path = f"{prefix}{path}"
     headers = _gate_headers(method, full_path, query=query, body=data)
 
     last_err = None
@@ -313,7 +313,7 @@ class LiveEngine:
             _log.error("持仓对账不一致: %s", "; ".join(mismatches))
         return mismatches
 
-    # ── 账户余额 ──
+    # ── 账户余额及划转 ──
 
     def get_balance(self) -> float:
         """获取 USDT 可用余额"""
@@ -327,6 +327,23 @@ class LiveEngine:
         except Exception as e:
             _log.error("获取余额失败: %s", e)
         return 0.0
+
+    def transfer_to_spot(self, amount: float) -> bool:
+        """将资金从合约账户划转至现货（统一）账户"""
+        try:
+            body = {
+                "currency": "USDT",
+                "from": "futures",
+                "to": "spot",
+                "amount": str(amount),
+                "settle": "usdt"
+            }
+            _api("POST", "/transfers", body=body, prefix="/api/v4/wallet")
+            _log.info("✅ 成功划转 %s USDT 到现货账户", amount)
+            return True
+        except Exception as e:
+            _log.error("❌ 划转失败: %s", e)
+            return False
 
     # ── 熔断状态 ──
 
