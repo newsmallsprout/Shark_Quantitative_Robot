@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -104,17 +105,18 @@ func getBalance() float64 {
 // ═══════════════════════════════════════════════
 
 type TradeCmd struct {
-	Symbol           string    `json:"symbol"`
-	Side             string    `json:"side"`
-	Size             int       `json:"size"`
-	Leverage         int       `json:"leverage"`
-	Action           string    `json:"action"` // "open" or "close"
-	Mode             string    `json:"mode"`   // "paper" or "live"
-	StopLoss         float64   `json:"stop_loss,omitempty"`
-	TakeProfit       float64   `json:"take_profit,omitempty"`
-	TakeProfitLevels []float64 `json:"take_profit_levels,omitempty"`
-	Source           string    `json:"source,omitempty"`
-	Token            string    `json:"token,omitempty"`
+    Symbol           string    `json:"symbol"`
+    Side             string    `json:"side"`
+    Size             int       `json:"size"`
+    Leverage         int       `json:"leverage"`
+    Action           string    `json:"action"` // "open" or "close"
+    Mode             string    `json:"mode"`   // "paper" or "live"
+    StopLoss         float64   `json:"stop_loss,omitempty"`
+    TakeProfit       float64   `json:"take_profit,omitempty"`
+    TakeProfitLevels []float64 `json:"take_profit_levels,omitempty"`
+    PriceRound       float64   `json:"price_round,omitempty"`
+    Source           string    `json:"source,omitempty"`
+    Token            string    `json:"token,omitempty"`
 }
 
 func validateTradeCmd(cmd TradeCmd) error {
@@ -144,6 +146,13 @@ func validateTradeCmd(cmd TradeCmd) error {
 		return fmt.Errorf("invalid order token")
 	}
 	return nil
+}
+
+func roundPrice(price float64, tickSize float64) float64 {
+	if tickSize <= 0 {
+		return price
+	}
+	return math.Round(price/tickSize) * tickSize
 }
 
 func executeOpen(cmd TradeCmd) {
@@ -193,7 +202,7 @@ func executeOpen(cmd TradeCmd) {
 				"text":        fmt.Sprintf("t-sl-%d", time.Now().UnixMilli()),
 			},
 			"trigger": map[string]interface{}{
-				"price":         strconv.FormatFloat(cmd.StopLoss, 'f', -1, 64),
+				"price":         strconv.FormatFloat(roundPrice(cmd.StopLoss, cmd.PriceRound), 'f', -1, 64),
 				"rule":          slRule,
 				"expiration":    86400 * 7, // 必须是 86400 的倍数
 				"strategy_type": 0,
@@ -243,7 +252,7 @@ func executeOpen(cmd TradeCmd) {
 					"text":        fmt.Sprintf("t-tp-%d", time.Now().UnixMilli()),
 				},
 				"trigger": map[string]interface{}{
-					"price":         strconv.FormatFloat(target, 'f', -1, 64),
+					"price":         strconv.FormatFloat(roundPrice(target, cmd.PriceRound), 'f', -1, 64),
 					"rule":          tpRule,
 					"expiration":    86400 * 7, // 必须是 86400 的倍数
 					"strategy_type": 0,

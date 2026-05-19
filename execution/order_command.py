@@ -27,6 +27,7 @@ def build_order_command(
     leverage: int,
     stop_loss: Optional[float] = None,
     take_profit: Any = None,
+    price_round: Optional[float] = None,
     source: str = "strategy",
 ) -> str:
     symbol = str(symbol).strip()
@@ -58,6 +59,8 @@ def build_order_command(
         "mode": mode,
         "source": source,
     }
+    if price_round:
+        cmd["price_round"] = float(price_round)
     if stop_loss:
         cmd["stop_loss"] = float(stop_loss)
     first_tp = _first_take_profit(take_profit)
@@ -81,5 +84,6 @@ def build_rl_order_command(action: Mapping[str, Any], *, mode: str) -> str:
         leverage=int(action.get("leverage") or 0),
         stop_loss=action.get("stop_loss"),
         take_profit=action.get("take_profit"),
+        price_round=action.get("price_round"),
         source="rl-agent",
     )

@@ -1311,6 +1311,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                         mode="live",
                         stop_loss=_plan_sl,
                         take_profit=_plan_tp,
+                        price_round=spec.order_price_round if spec else 0.001,
                     )
                     try:
                         import redis as _redis
@@ -1715,6 +1716,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                 mode=mode,
                 stop_loss=_plan_sl,
                 take_profit=_plan_tp,
+                price_round=spec.order_price_round if spec else 0.001,
             )
             try:
                 import redis as _redis
