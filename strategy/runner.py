@@ -1282,6 +1282,7 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
                     spec = self._contract_specs.get(test_sym)
                     quanto = spec.quanto_multiplier if spec else 1.0
                     min_size = spec.order_size_min if spec else 1.0
+                    max_lev = spec.leverage_max if spec else 20.0
                     
                     side = "long"
                     lev = min(5, int(max_lev))
