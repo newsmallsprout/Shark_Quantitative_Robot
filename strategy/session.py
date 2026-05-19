@@ -189,10 +189,16 @@ class SessionMixin:
 
     def _save_paper_state(self) -> None:
         try:
+            from api.routes import get_state
+            _state = get_state()
+            current_mode = str(_state.get("shark_mode", "paper") or "paper").lower()
+            if current_mode == "live" or bool(getattr(self, "_live_trading_enabled", False)):
+                return
             import redis as _redis
             _r = _redis.from_url(os.environ.get("SHARK_REDIS_URL", "redis://redis:6379/0"))
             locked = sum(p["margin"] for p in self.positions.values())
             state = {
+                "source_mode": "paper",
                 "balance": self.balance + locked,
                 "equity": self.equity,
                 "static_equity": self.static_equity,
@@ -223,6 +229,9 @@ class SessionMixin:
             if not raw:
                 return False
             state = json.loads(raw)
+            if state.get("source_mode") != "paper":
+                _log.warning("skip restoring legacy/ambiguous paper_state: source_mode=%s", state.get("source_mode"))
+                return False
             self.balance = float(state.get("balance", self._initial_capital))
             self.equity = float(state.get("equity", self._initial_capital))
             self.static_equity = float(state.get("static_equity", self._initial_capital))

@@ -86,6 +86,8 @@ class StateMixin:
         }
 
     def _update_state(self, prices):
+        current_mode = str(get_state().get("shark_mode", "paper") or "paper").lower()
+        is_live_view = bool(current_mode == "live" and self._live and self._live.active)
         self._recalc_equity(prices)
         locked = sum(p["margin"] for p in self.positions.values())
         uc = self._initial_capital
@@ -114,8 +116,9 @@ class StateMixin:
                 save_snapshot(get_state())
             except Exception:
                 pass
-            # 持久化模拟盘状态到 Redis
-            self._save_paper_state()
+            # 仅在模拟盘视图下持久化模拟盘状态，防止实盘数据污染 paper_state
+            if not is_live_view:
+                self._save_paper_state()
         get_state()["total_slippage"] = self.total_slippage
         get_state()["trade_history"] = _trade_history_for_state(self)
         get_state()["margin_locked"] = locked
@@ -177,8 +180,8 @@ class StateMixin:
                 get_state()["live"]["balance"] = self._live.get_balance()
             except Exception:
                 get_state()["live"]["balance"] = 0
-            # 实盘模式：余额走交易所，但初始资金不变
-            if self._live.active:
+            # 只有当前界面/状态明确处于 live 模式时，才允许用交易所数据覆盖展示
+            if is_live_view:
                 get_state()["balance"] = get_state()["live"]["balance"]
                 get_state()["equity"] = get_state()["live"]["balance"]
                 get_state()["free_cash"] = get_state()["live"]["balance"]
