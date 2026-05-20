@@ -1753,15 +1753,20 @@ class StrategyRunner(SessionMixin, PlanMixin, RiskMixin, CloseMixin, StateMixin)
 
             # 使用缓存计划（已在杠杆阶段读取）
             if plan_cache:
+                # 提取价格动量信号：从 PlanGate 历史找 ~30 秒前价格
+                fr = funding_rates.get(sym, 0) if funding_rates else 0
+                px_30s = 0.0
+                if self._plan_gate:
+                    hist = self._plan_gate._price_history.get(sym, [])
+                    for t, p in reversed(hist):
+                        if now - t >= 25:
+                            px_30s = p
+                            break
+
                 side, signal_src, _plan_sl, _plan_tp = self._side_from_plan(
-                    plan_cache, px
+                    plan_cache, px, funding_rate=fr, px_30s_ago=px_30s
                 )
                 
-                # ── 主流币严格方向卡死 ──
-                # 如果是主流币，且计划给出的偏好是双向（模糊不清），宁可不开仓
-                if is_stable(sym) and plan_cache.get("bias") not in ("long", "short"):
-                    side = ""
-                    
                 ai_confidence = int(plan_cache.get("ai_confidence", 0))
                 if ai_confidence > 0:
                     ai_use = True

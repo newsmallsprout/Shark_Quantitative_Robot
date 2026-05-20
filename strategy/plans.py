@@ -286,7 +286,9 @@ class PlanMixin:
         return (plan.get("generated_at"), plan.get("macro_regime") or plan.get("regime"),
                 side, low, high)
 
-    def _side_from_plan(self, plan: dict, px: float) -> tuple:
+    def _side_from_plan(self, plan: dict, px: float,
+                        funding_rate: float = 0.0,
+                        px_30s_ago: float = 0.0) -> tuple:
         if not plan:
             return "", "", None, None
         bias = plan.get("bias", "")
@@ -307,15 +309,59 @@ class PlanMixin:
             return "long", "计划震荡命中多头入场带", plan.get("long_stop_loss"), plan.get("long_take_profit")
         if short_ok and not long_ok:
             return "short", "计划震荡命中空头入场带", plan.get("short_stop_loss"), plan.get("short_take_profit")
+
+        # ── 多信号融合方向判定 ──
+        score_long = 0.0
+        score_short = 0.0
+        reasons = []
+
+        # 信号1: 资金费率——极端费率反向押注
+        if abs(funding_rate) >= 0.0001:
+            if funding_rate < -0.0005:
+                score_long += 2.0; reasons.append(f"费率{funding_rate*100:.2f}%极负利多")
+            elif funding_rate < 0:
+                score_long += 1.0; reasons.append(f"费率{funding_rate*100:.2f}%负偏多")
+            elif funding_rate > 0.0005:
+                score_short += 2.0; reasons.append(f"费率{funding_rate*100:.2f}%极正利空")
+            elif funding_rate > 0:
+                score_short += 1.0; reasons.append(f"费率{funding_rate*100:.2f}%正偏空")
+
+        # 信号2: 30秒短时动量——趋势跟随
+        if px_30s_ago > 0 and px > 0:
+            momentum = (px - px_30s_ago) / px_30s_ago
+            if momentum > 0.003:
+                score_long += 1.5; reasons.append(f"30s动量{momentum*100:.1f}%↑")
+            elif momentum > 0.001:
+                score_long += 0.5
+            elif momentum < -0.003:
+                score_short += 1.5; reasons.append(f"30s动量{momentum*100:.1f}%↓")
+            elif momentum < -0.001:
+                score_short += 0.5
+
+        # 信号3: 入场带匹配——哪个方向更接近
         if long_ok and short_ok:
-            mid = (plan.get("range_low", 0) + plan.get("range_high", 0)) / 2
-            if px < mid:
-                return "long", f"计划震荡重叠区 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
-            return "short", f"计划震荡重叠区 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+            low, high = self._plan_entry_zone(plan, "long")
+            long_dist = abs(px - (float(low or 0) + float(high or 0)) / 2) if low and high else 999
+            low_s, high_s = self._plan_entry_zone(plan, "short")
+            short_dist = abs(px - (float(low_s or 0) + float(high_s or 0)) / 2) if low_s and high_s else 999
+            if long_dist < short_dist:
+                score_long += 0.5
+            else:
+                score_short += 0.5
+
+        # 信号4: 价格偏位——价低偏多，价高偏空
         mid = (plan.get("range_low", 0) + plan.get("range_high", 0)) / 2
-        if px < mid:
-            return "long", f"计划震荡激进 价{px:.0f}<中{mid:.0f}→多", plan.get("long_stop_loss"), plan.get("long_take_profit")
-        return "short", f"计划震荡激进 价{px:.0f}>中{mid:.0f}→空", plan.get("short_stop_loss"), plan.get("short_take_profit")
+        if mid > 0:
+            if px < mid * 0.97:
+                score_long += 0.5
+            elif px > mid * 1.03:
+                score_short += 0.5
+
+        if score_long > score_short:
+            return "long", f"多信号融合({';'.join(reasons)})", plan.get("long_stop_loss"), plan.get("long_take_profit")
+        if score_short > score_long:
+            return "short", f"空信号融合({';'.join(reasons)})", plan.get("short_stop_loss"), plan.get("short_take_profit")
+        return "", "多空信号均衡·不开仓", None, None
 
     def _request_symbol_replan(self, sym: str, reason: str) -> None:
         if trading_track() != "stable" and (not is_stable(sym)) and is_high_vol_alt(sym):
